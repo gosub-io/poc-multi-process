@@ -1,0 +1,18 @@
+[package]
+name = "gosub-proc-iso-poc"
+version = "0.1.0"
+edition = "2021"
+description = "Proof of concept for gosub-engine issue #1080: multi-process architecture for security"
+
+[features]
+default = ["multi-process"]
+# Compiles in the process-isolation architecture (child process spawning,
+# Unix-domain-socket transport). Without it the engine is single-process
+# only: components run as threads over in-process channels, with the same
+# protocol and policy checks. With it, `--single-process` still selects the
+# thread setup at run time.
+multi-process = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
