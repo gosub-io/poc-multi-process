@@ -1,97 +1,135 @@
 # Process Isolation PoC — gosub-engine issue #1080
 
-Runnable proof of concept for
+Proof of concept for
 [gosub-io/gosub-engine#1080](https://github.com/gosub-io/gosub-engine/issues/1080)
-*"Process Isolation for Security: Multi-Process Architecture"*.
+*"Process Isolation for Security: Multi-Process Architecture"*: an
+**event-driven engine** (commands in, events out — shaped like the real gosub
+engine) whose components run either as **isolated child processes** (the
+issue's architecture) or as **threads in a single process** (classic engine),
+over the same component code, IPC protocol, and policy checks.
 
 ```sh
-cargo run --release                      # multi-process (the issue's architecture)
+cargo run --release                      # multi-process (default)
 cargo run --release -- --single-process  # same engine, components as threads
+cargo build --no-default-features        # single-process-only binary
 ```
 
-No external services needed; the network daemon synthesizes HTTP responses so
-the demo is offline and deterministic.
+## Event-driven engine
+
+Mirroring gosub-engine's `EngineCommand`/`TabCommand`/`EngineEvent` shape
+(`src/events.rs`): you send commands through an `EngineHandle` and react to
+events from a channel — nothing blocks, and frames from different tabs arrive
+in whatever order the renderers finish.
+
+```rust
+let (engine, events) = engine::start(mode);
+engine.open_tab("https://example.com")?;
+
+for event in events {
+    match event {
+        EngineEvent::TabOpened { tab_id, origin } => engine.navigate(tab_id, url)?,
+        EngineEvent::FrameReady { tab_id, tile } => { /* composite */ }
+        EngineEvent::TabCrashed { tab_id }       => { /* only that tab died */ }
+        ...
+    }
+}
+```
+
+Commands: `OpenTab`, `Tab { Navigate | Close }`, `SetCookie`, `Shutdown`.
+Events: `TabOpened`, `FrameReady`, `NavigationFailed`, `TabCrashed`,
+`TabClosed`, `EngineShutdown`, …
+
+Internally (`src/engine.rs`) the engine is one event-loop thread with a
+single inbox — the std-only equivalent of the real engine's `tokio::select!`
+worker loop. Cheap reader threads forward every message source into it:
+
+```text
+EngineHandle ── EngineCommand ──▶ ┌────────────┐ ──▶ EngineEvent
+                                  │ event loop │
+renderer/net reader threads ────▶ └────────────┘ ──▶ replies to components
+```
+
+Because the loop never blocks on any one component, fetches for many tabs are
+multiplexed over the single net link with **request ids** (`pending_fetches`
+maps each reply back to the tab that asked).
+
+## Isolation architecture
+
+```
+engine event loop (broker — owns cookie jar & policy)
+├── net component            Phase 1: sole owner of network capability
+├── renderer origin A        Phase 2: per-origin, unprivileged
+└── renderer origin B        Phase 2: per-origin, unprivileged
+```
+
+- Renderers hold no secrets: cookies and network access live in the engine
+  and net component. A renderer can only send IPC messages, and every message
+  is policy-checked in the event loop (`tab_request`).
+- Identity is ambient, not claimed: the engine knows which origin each tab's
+  renderer belongs to because *it* spawned the component; origin fields inside
+  messages are never trusted. Navigation is same-origin per renderer (site
+  isolation) — a real engine would swap renderer processes on cross-origin
+  navigation.
+- SSRF policy is centralized in the net component (the one place allowed to
+  open sockets), so no renderer bug can bypass it.
+- A crashed renderer surfaces as `EngineEvent::TabCrashed` for that tab only;
+  the engine and all other tabs keep running (in multi-process mode).
 
 ## Single- vs multi-process: two-level selection
 
-The engine supports both setups over the **same component code and broker
-protocol** — only the transport and spawning differ (this is how Chromium's
-`--single-process` works too):
+The same trick as Chromium's `--single-process`: components are written once,
+only transport and spawning differ.
 
 - **Compile time** — the `multi-process` cargo feature (default on) gates all
-  process-spawning and Unix-socket code. `cargo build --no-default-features`
-  produces a single-process-only engine, e.g. for platforms without
-  fork/UDS (WASM would be the real motivation in gosub).
-- **Run time** — when the feature is compiled in, `--single-process` still
-  selects the thread-based setup (debugging, constrained targets), and
-  `--multi-process`/no flag selects isolation.
+  process-spawning and Unix-socket code. `--no-default-features` produces a
+  single-process-only engine, e.g. for platforms without fork/UDS (WASM would
+  be the real motivation in gosub).
+- **Run time** — when the feature is compiled in, `--single-process` selects
+  the thread-based setup; `--multi-process`/no flag selects isolation.
 
-The seam is `ipc::Endpoint` (`src/ipc.rs`): an enum over
-`Socket(UnixStream)` and `Local(mpsc channels)`. Components (`renderer.rs`,
-`net_daemon.rs`) expose a transport-agnostic `serve(Endpoint, ...)` loop; the
-feature-gated `run()` wrappers are only the process entry points. The parent's
-`Spawner` either spawns a thread with a `local_pair()` or re-execs the binary
-and accepts the socket connection. Every policy check (`drive_render`) is
-shared, so behavior is identical in both modes — except where a process
-boundary is the point:
+The seam is `ipc::Endpoint`: send/receive halves (`EndpointTx`/`EndpointRx`,
+splittable so the event loop can hand the receive half to a reader thread)
+over either `UnixStream` or in-process channels, both carrying identical
+length-framed bincode messages (with a max-frame check so a corrupt length
+prefix can't force an unbounded allocation). Components expose a
+transport-agnostic `serve(Endpoint, ...)` loop; the feature-gated `run()`
+wrappers are only the child-process entry points. The engine's `Spawner`
+either spawns a thread wired with `local_pair()` or re-execs the binary and
+accepts the socket connection — it is the only code that knows which mode is
+active.
 
-- **Demo 2** in single-process mode prints a caveat: the policy holds at the
-  IPC layer, but a real exploit in a renderer *thread* reads the cookie jar
-  straight out of shared memory. The checks only become a boundary with
-  processes behind them.
-- **Demo 4** (crash containment) is skipped in single-process mode, because
-  the simulated exploit's `abort()` would kill the entire browser — exactly
-  the failure mode the issue eliminates.
+Note: in single-process mode the policy checks still run, but a compromised
+renderer *thread* shares the engine's address space — the checks only become
+a real security boundary with a process behind them.
 
-## What it demonstrates
+## Layout
 
-One binary re-execs itself into the process tree from the issue (or spawns
-the same components as threads in single-process mode):
-
-```
-engine (parent, broker — owns cookie jar & policy)
-├── net-daemon               Phase 1: sole owner of network capability
-├── renderer example.com     Phase 2: per-origin, unprivileged
-└── renderer attacker.com    Phase 2: per-origin, unprivileged
-```
-
-All IPC is **length-framed bincode** (`src/ipc.rs`) — over Unix domain
-sockets in multi-process mode, over in-process channels in single-process
-mode — with a max-frame check so a corrupt/malicious length prefix can't
-force an unbounded allocation.
-
-| Demo | Issue claim exercised |
-|------|----------------------|
-| 1. Normal render | Renderer fetches subresources and reads its *own* cookies only via the broker; ships a rasterized tile back (the ~1 MB texture/frame budget). |
-| 2. Compromised renderer | `attacker.com`'s renderer tries to read `example.com` cookies (denied — the broker checks the request against the **socket's identity**, never the message contents) and tries SSRF to `169.254.169.254` (denied by the net daemon's centralized policy). |
-| 3. Latency | 100 full frames (brokered fetch + cookie lookup + 1 MiB tile transfer) measured against the issue's **<10 ms/frame** acceptance criterion. On this machine: ~3.4 ms avg multi-process, ~1.5 ms single-process — i.e. the isolation tax is ~2 ms/frame here. |
-| 4. Crash containment | The compromised renderer aborts (stand-in for the rasterizer buffer overflow in the issue's threat model). The engine reaps it via SIGABRT and re-renders `example.com` to show the rest of the browser is unaffected. |
-
-## Key design points carried over from the issue
-
-- **Renderers hold no secrets.** Cookies, DOM-of-record, and network access
-  live in the parent/net-daemon. A renderer that is fully code-exec'd can only
-  send IPC messages, and every message is policy-checked.
-- **Identity is ambient, not claimed.** The broker knows which origin each
-  socket belongs to because *it* spawned the process; an origin field inside a
-  message is never trusted.
-- **SSRF policy is centralized** in the one process that can open sockets,
-  so no renderer bug can bypass it.
+| File | Contents |
+|------|----------|
+| `src/events.rs` | Public vocabulary: `EngineCommand`, `TabCommand`, `EngineEvent`, `TabId`, `Tile` |
+| `src/engine.rs` | `start(mode)`, `EngineHandle`, the event loop (broker + policy), `Spawner` |
+| `src/ipc.rs` | `Endpoint` tx/rx halves (socket/local transports), wire messages, bincode framing |
+| `src/net_daemon.rs` | Net component: `serve` loop, SSRF policy, (synthesized) fetching |
+| `src/renderer.rs` | Per-origin renderer: `serve` loop, placeholder render pipeline |
+| `src/main.rs` | Child-role dispatch for re-exec + minimal event-driven usage |
 
 ## Shortcuts taken (what a real implementation needs instead)
 
 - **Rendezvous**: children connect to a socket path and authenticate with an
-  argv token. Real implementation: inherit one end of `socketpair(2)` — 
+  argv token. Real implementation: inherit one end of `socketpair(2)` —
   unforgeable, nothing on disk.
 - **Sandboxing**: the renderer merely *doesn't* do network/file I/O; nothing
   stops it. Real implementation: seccomp-BPF/Landlock (Linux) so the syscalls
   are actually denied, plus namespaces/pledge equivalents per platform.
-- **Fetching**: synthesized responses instead of real HTTP.
-- **Concurrency**: the broker drives one renderer at a time, synchronously. A
-  real engine needs an async broker loop (or a thread per child) and
-  request IDs for multiplexing.
+- **Fetching**: synthesized responses instead of real HTTP; the net component
+  handles one request at a time (the engine doesn't block on it, but a real
+  daemon would fetch concurrently).
+- **Event loop**: std threads + mpsc instead of tokio; the real engine's
+  worker loops are `select!`-based async tasks.
 - **Tile transport**: tiles are copied through the socket. At real frame rates
   you'd use shared memory (`memfd` + fd-passing over the socket) and only send
   the handle.
+- **Origins**: `scheme://host` string prefix, not a real URL parser/origin
+  tuple; cross-origin navigation is refused instead of swapping renderers.
 - Phase 3 (GPU process) is not modeled — structurally it's the same pattern as
-  the net daemon.
+  the net component.

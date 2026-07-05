@@ -6,11 +6,7 @@
 //! single-process mode the very same `serve` loop runs as a thread: the
 //! policy checks still apply, but there is no hard boundary behind them.
 
-use crate::ipc::{Endpoint, NetRequest, NetResponse};
-
-fn log(msg: &str) {
-    eprintln!("\x1b[1;33m[net    ]\x1b[0m {msg}");
-}
+use crate::ipc::{Endpoint, FetchOutcome, NetRequest, NetResponse};
 
 /// Multi-process entry point: connect back to the engine, authenticate, serve.
 #[cfg(feature = "multi-process")]
@@ -18,18 +14,13 @@ pub fn run(socket_path: &str, token: &str) {
     use crate::ipc::{self, Hello};
     use std::os::unix::net::UnixStream;
 
-    let mut stream = UnixStream::connect(socket_path).expect("net-daemon: connect to engine");
+    let mut stream = UnixStream::connect(socket_path).expect("net: connect to engine");
     ipc::send_msg(&mut stream, &Hello { token: token.to_string() }).unwrap();
-    serve(Endpoint::Socket(stream));
+    serve(Endpoint::from_stream(stream).expect("net: split stream"));
 }
 
-/// The actual daemon loop — transport-agnostic, identical in both modes.
+/// The component loop — transport-agnostic, identical in both modes.
 pub fn serve(mut ep: Endpoint) {
-    log(&format!(
-        "up (pid {}) — sole owner of network capability",
-        std::process::id()
-    ));
-
     loop {
         let req: NetRequest = match ep.recv() {
             Ok(req) => req,
@@ -37,28 +28,30 @@ pub fn serve(mut ep: Endpoint) {
         };
         match req {
             NetRequest::Shutdown => break,
-            NetRequest::Fetch { for_origin, url, quiet } => {
-                let resp = handle_fetch(&for_origin, &url, quiet);
-                ep.send(&resp).unwrap();
+            NetRequest::Fetch { request_id, for_origin, url } => {
+                // The request id travels with the reply so the engine can
+                // route it back to the tab that asked, even with many
+                // fetches in flight.
+                let resp = NetResponse { request_id, outcome: handle_fetch(&for_origin, &url) };
+                if ep.send(&resp).is_err() {
+                    break;
+                }
             }
         }
     }
 }
 
-fn handle_fetch(for_origin: &str, url: &str, quiet: bool) -> NetResponse {
+/// `for_origin` is the requesting renderer's identity as recorded by the
+/// engine; a real implementation uses it for per-origin network policy
+/// (CORS, cookie attachment, request headers).
+fn handle_fetch(_for_origin: &str, url: &str) -> FetchOutcome {
     if let Some(reason) = ssrf_block_reason(url) {
-        log(&format!(
-            "\x1b[1;31mDENIED\x1b[0m fetch of {url} (for {for_origin}): {reason}"
-        ));
-        return NetResponse::Denied { reason };
+        return FetchOutcome::Denied { reason };
     }
-    if !quiet {
-        log(&format!("fetching {url} on behalf of {for_origin}"));
-    }
-    // A real daemon performs the HTTP request here; the PoC synthesizes the
-    // response so it runs offline and deterministically.
+    // A real implementation performs the HTTP request here; the PoC
+    // synthesizes the response so it runs offline and deterministically.
     let body = format!("<html><!-- 200 OK, served for {url} --></html>").into_bytes();
-    NetResponse::Ok { status: 200, body }
+    FetchOutcome::Ok { status: 200, body }
 }
 
 /// The centralized SSRF policy the issue calls for: requests to loopback,

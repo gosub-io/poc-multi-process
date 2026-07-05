@@ -1,6 +1,15 @@
-//! Length-framed bincode messaging over Unix domain sockets, as proposed in
-//! gosub-engine issue #1080: every frame is a little-endian u32 payload length
-//! followed by the bincode-encoded message.
+//! Length-framed bincode messaging, per gosub-engine issue #1080: every frame
+//! is a little-endian u32 payload length followed by the bincode-encoded
+//! message.
+//!
+//! The [`Endpoint`] abstraction carries the same frames over two transports:
+//! Unix domain sockets (multi-process mode) or in-process channels
+//! (single-process mode), so components are written once against `Endpoint`
+//! and run unchanged in either mode. An `Endpoint` can be [`split`] into its
+//! send/receive halves so the engine's event loop can hand the receive half
+//! to a reader thread while keeping the send half for replies.
+//!
+//! [`split`]: Endpoint::split
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -12,12 +21,12 @@ use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 /// A corrupted (or malicious) length prefix must not make the peer allocate
-/// unbounded memory — one of the issue's acceptance criteria is graceful
-/// handling of IPC message corruption.
+/// unbounded memory.
 pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
-/// First message on any connection: the child proves it is the process the
-/// parent just spawned by echoing the one-time token it received on argv.
+/// First message on any child-process connection: the child proves it is the
+/// process the engine just spawned by echoing the one-time token it received
+/// on argv.
 ///
 /// A production implementation would instead inherit one end of a
 /// `socketpair(2)` so no rendezvous path or token exists at all; the
@@ -28,73 +37,77 @@ pub struct Hello {
     pub token: String,
 }
 
-/// Renderer -> parent engine.
+/// Renderer -> engine.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum FromRenderer {
-    /// Renderers have no network access at all (Phase 1). They must ask the
-    /// parent, which brokers the request to the net daemon.
+    /// Renderers have no network access; they must ask the engine, which
+    /// brokers the request to the net component (Phase 1).
     NeedFetch { url: String },
-    /// Renderers hold no cookie jar (Phase 2). The parent enforces
-    /// same-origin using the *socket identity*, never this field.
+    /// Renderers hold no cookie jar (Phase 2). The engine enforces
+    /// same-origin using the *endpoint identity*, never this field.
     NeedCookies { origin: String },
     /// The final product of a `RenderPage` command: a rasterized tile.
     Tile { width: u32, height: u32, pixels: Vec<u8> },
 }
 
-/// Parent engine -> renderer.
+/// Engine -> renderer.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ToRenderer {
-    /// `quiet` suppresses log chatter during the latency benchmark.
-    RenderPage { url: String, quiet: bool },
+    RenderPage { url: String },
     FetchResult { status: u16, body: Vec<u8> },
     FetchDenied { reason: String },
     /// `None` means the broker refused to hand the cookies over.
     Cookies(Option<Vec<(String, String)>>),
-    /// Pretend a malicious payload achieved code execution and corrupted
-    /// memory in this renderer (the issue's rasterizer-exploit scenario).
-    SimulateCompromise,
     Shutdown,
 }
 
-/// Parent engine -> net daemon.
+/// Engine -> net component. `request_id` lets the engine multiplex fetches
+/// for many tabs over one link and route each reply back to its requester.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum NetRequest {
     Fetch {
-        /// Stamped by the *parent* from its own bookkeeping, so a compromised
+        request_id: u64,
+        /// Stamped by the *engine* from its own bookkeeping, so a compromised
         /// renderer cannot spoof another origin's identity.
         for_origin: String,
         url: String,
-        quiet: bool,
     },
     Shutdown,
 }
 
-/// Net daemon -> parent engine.
+/// Net component -> engine.
 #[derive(Serialize, Deserialize, Debug)]
-pub enum NetResponse {
+pub struct NetResponse {
+    pub request_id: u64,
+    pub outcome: FetchOutcome,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum FetchOutcome {
     Ok { status: u16, body: Vec<u8> },
     Denied { reason: String },
 }
 
-/// One end of a duplex IPC link. Components are written against this type
-/// only, so the exact same renderer/net-daemon code runs either as a child
-/// *process* (Socket) or as an in-process *thread* (Local). Both variants
-/// carry identical bincode frames, so the protocol — and every policy check
-/// built on it — behaves the same in both modes.
-pub enum Endpoint {
-    /// Multi-process mode: length-framed bincode over a Unix domain socket.
+/// Send half of an IPC link.
+pub enum EndpointTx {
     #[cfg(feature = "multi-process")]
     Socket(UnixStream),
-    /// Single-process mode: the same bincode frames over in-process channels.
-    Local { tx: Sender<Vec<u8>>, rx: Receiver<Vec<u8>> },
+    Local(Sender<Vec<u8>>),
 }
 
-impl Endpoint {
+/// Receive half of an IPC link.
+pub enum EndpointRx {
+    #[cfg(feature = "multi-process")]
+    Socket(UnixStream),
+    Local(Receiver<Vec<u8>>),
+}
+
+impl EndpointTx {
     pub fn send<T: Serialize>(&mut self, msg: &T) -> io::Result<()> {
         match self {
             #[cfg(feature = "multi-process")]
-            Endpoint::Socket(stream) => send_msg(stream, msg),
-            Endpoint::Local { tx, .. } => {
+            EndpointTx::Socket(stream) => send_msg(stream, msg),
+            EndpointTx::Local(tx) => {
                 let payload = bincode::serialize(msg)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 if payload.len() > MAX_FRAME_LEN as usize {
@@ -105,12 +118,14 @@ impl Endpoint {
             }
         }
     }
+}
 
+impl EndpointRx {
     pub fn recv<T: DeserializeOwned>(&mut self) -> io::Result<T> {
         match self {
             #[cfg(feature = "multi-process")]
-            Endpoint::Socket(stream) => recv_msg(stream),
-            Endpoint::Local { rx, .. } => {
+            EndpointRx::Socket(stream) => recv_msg(stream),
+            EndpointRx::Local(rx) => {
                 let payload = rx
                     .recv()
                     .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "peer gone"))?;
@@ -121,12 +136,49 @@ impl Endpoint {
     }
 }
 
+/// One end of a duplex IPC link. Components are written against this type
+/// only, so the exact same renderer/net code runs either as a child *process*
+/// (Socket) or as an in-process *thread* (Local). Both variants carry
+/// identical bincode frames, so the protocol — and every policy check built
+/// on it — behaves the same in both modes.
+pub struct Endpoint {
+    pub tx: EndpointTx,
+    pub rx: EndpointRx,
+}
+
+impl Endpoint {
+    /// Wrap a connected Unix stream (the stream is cloned so the two halves
+    /// can be used independently).
+    #[cfg(feature = "multi-process")]
+    pub fn from_stream(stream: UnixStream) -> io::Result<Endpoint> {
+        let write_half = stream.try_clone()?;
+        Ok(Endpoint { tx: EndpointTx::Socket(write_half), rx: EndpointRx::Socket(stream) })
+    }
+
+    pub fn send<T: Serialize>(&mut self, msg: &T) -> io::Result<()> {
+        self.tx.send(msg)
+    }
+
+    pub fn recv<T: DeserializeOwned>(&mut self) -> io::Result<T> {
+        self.rx.recv()
+    }
+
+    /// Split into independent send/receive halves (e.g. reader thread +
+    /// event-loop writer).
+    pub fn split(self) -> (EndpointTx, EndpointRx) {
+        (self.tx, self.rx)
+    }
+}
+
 /// A connected pair of in-process endpoints (single-process mode's stand-in
 /// for `socketpair(2)`).
 pub fn local_pair() -> (Endpoint, Endpoint) {
     let (tx_a, rx_b) = mpsc::channel();
     let (tx_b, rx_a) = mpsc::channel();
-    (Endpoint::Local { tx: tx_a, rx: rx_a }, Endpoint::Local { tx: tx_b, rx: rx_b })
+    (
+        Endpoint { tx: EndpointTx::Local(tx_a), rx: EndpointRx::Local(rx_a) },
+        Endpoint { tx: EndpointTx::Local(tx_b), rx: EndpointRx::Local(rx_b) },
+    )
 }
 
 #[cfg(feature = "multi-process")]
