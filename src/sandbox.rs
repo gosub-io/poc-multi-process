@@ -95,15 +95,19 @@ const BASELINE: &[libc::c_long] = &[
 /// The network syscalls the net component additionally needs. A real net
 /// daemon would also need `openat` (resolv.conf/hosts) and DNS plumbing; the
 /// PoC synthesizes responses so the socket family alone models the intent.
+///
+/// Deliberately **outbound only**: `bind`/`listen`/`accept`/`accept4` are NOT
+/// granted, so a compromised net component cannot open a listening socket and
+/// become a local backdoor/C2 — it can only originate connections, which is
+/// all a fetcher does. (Egress destinations still can't be constrained by
+/// seccomp — `connect` takes a pointer argument seccomp can't dereference — so
+/// a real deployment additionally confines egress with a network namespace +
+/// firewall rules rather than trusting the in-process SSRF check alone.)
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 const NET_EXTRA: &[libc::c_long] = &[
     libc::SYS_socket,
     libc::SYS_socketpair,
     libc::SYS_connect,
-    libc::SYS_bind,
-    libc::SYS_listen,
-    libc::SYS_accept,
-    libc::SYS_accept4,
     libc::SYS_getsockopt,
     libc::SYS_setsockopt,
     libc::SYS_getsockname,
@@ -199,6 +203,24 @@ pub fn apply_child_rlimits() -> std::io::Result<()> {
     set_rlimit(libc::RLIMIT_NOFILE, 128)?;
     // No core dumps — a crash must not spill page contents (cookies, tokens).
     set_rlimit(libc::RLIMIT_CORE, 0)?;
+    // Deprioritize: content processes should yield to the trusted engine/UI, so
+    // a compromised child spinning in a busy loop can't starve them of CPU. A
+    // hard RLIMIT_CPU is unusable here — it counts *cumulative* CPU time and
+    // would eventually kill a legitimately long-lived renderer — so we lower
+    // scheduling priority instead. Raising the nice value is always permitted
+    // and needs no privilege, so a child can't undo it either.
+    set_priority(10)?;
+    Ok(())
+}
+
+/// Lower the calling process's scheduling priority (higher nice = lower
+/// priority). Async-signal-safe (a single syscall), so usable pre-exec.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+fn set_priority(nice: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: PRIO_PROCESS with pid 0 targets the calling process.
+    if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
