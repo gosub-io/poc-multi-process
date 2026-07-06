@@ -8,6 +8,7 @@ engine) whose components run either as **isolated child processes** (the
 issue's architecture) or as **threads in a single process** (classic engine),
 over the same component code, IPC protocol, and policy checks.
 
+
 ```sh
 cargo run --release                      # multi-process (default)
 cargo run --release -- --single-process  # same engine, components as threads
