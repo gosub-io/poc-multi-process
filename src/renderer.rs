@@ -14,17 +14,22 @@ use std::io;
 const TILE_W: u32 = 512;
 const TILE_H: u32 = 512;
 
-/// Multi-process entry point: connect back to the engine, authenticate, serve.
+/// Multi-process entry point: adopt the inherited IPC fd, sandbox, serve.
+///
+/// `fd` is the number of the `socketpair(2)` end the engine handed us at
+/// spawn. Possessing it *is* our authentication — an inherited fd cannot be
+/// forged — so there is no connect step and no token to check.
 #[cfg(feature = "multi-process")]
-pub fn run(socket_path: &str, origin: &str, token: &str) {
-    use crate::ipc::{self, Hello};
+pub fn run(origin: &str, fd: &str) {
+    use std::os::fd::FromRawFd;
     use std::os::unix::net::UnixStream;
 
-    let mut stream = UnixStream::connect(socket_path).expect("renderer: connect to engine");
-    ipc::send_msg(&mut stream, &Hello { token: token.to_string() }).unwrap();
+    let fd: std::os::fd::RawFd = fd.parse().expect("renderer: bad fd arg");
+    // SAFETY: the engine passed us sole ownership of this inherited fd.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
     // Split the endpoint *before* sandboxing: try_clone() does a dup, which
     // the allowlist deliberately does not permit at run time.
-    let ep = Endpoint::from_stream(stream).expect("renderer: split stream");
+    let ep = Endpoint::from_stream(stream).expect("renderer: wrap fd");
     // Drop privileges now that the IPC link is established: from here on the
     // renderer can only push pixels, not open sockets, files, or programs.
     crate::sandbox::lock_down_renderer();

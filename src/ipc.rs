@@ -24,19 +24,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 /// unbounded memory.
 pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
-/// First message on any child-process connection: the child proves it is the
-/// process the engine just spawned by echoing the one-time token it received
-/// on argv.
-///
-/// A production implementation would instead inherit one end of a
-/// `socketpair(2)` so no rendezvous path or token exists at all; the
-/// path+token dance keeps this PoC dependency-free.
-#[cfg(feature = "multi-process")]
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Hello {
-    pub token: String,
-}
-
 /// Renderer -> engine.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum FromRenderer {

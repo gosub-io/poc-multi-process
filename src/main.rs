@@ -51,11 +51,13 @@ fn main() {
                 std::process::exit(2);
             }
         }
-        // Internal child roles, used by the engine to re-exec itself.
+        // Internal child roles, used by the engine to re-exec itself. The
+        // trailing argument is the inherited IPC fd number (see engine.rs).
+        // net-daemon <fd> ; renderer <origin> <fd>
         #[cfg(feature = "multi-process")]
-        Some("net-daemon") => net_daemon::run(&args[2], &args[3]),
+        Some("net-daemon") => net_daemon::run(&args[2]),
         #[cfg(feature = "multi-process")]
-        Some("renderer") => renderer::run(&args[3], &args[2], &args[4]),
+        Some("renderer") => renderer::run(&args[2], &args[3]),
         Some(other) => {
             eprintln!("unknown argument: {other}");
             eprintln!("usage: gosub-proc-iso-poc [--single-process | --multi-process]");

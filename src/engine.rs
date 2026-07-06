@@ -349,7 +349,6 @@ impl EngineLoop {
         }
         let _ = self.net_tx.send(&NetRequest::Shutdown);
         join(std::mem::replace(&mut self.net_handle, ChildHandle::Thread(dummy_thread())));
-        self.spawner.cleanup();
         self.emit(EngineEvent::EngineShutdown);
     }
 }
@@ -389,12 +388,7 @@ fn origin_of(url: &str) -> Option<String> {
 enum Spawner {
     Single,
     #[cfg(feature = "multi-process")]
-    Multi {
-        exe: std::path::PathBuf,
-        listener: std::os::unix::net::UnixListener,
-        sock_path: String,
-        sock_dir: std::path::PathBuf,
-    },
+    Multi { exe: std::path::PathBuf },
 }
 
 impl Spawner {
@@ -402,19 +396,7 @@ impl Spawner {
         match mode {
             Mode::Single => Spawner::Single,
             #[cfg(feature = "multi-process")]
-            Mode::Multi => {
-                let sock_dir =
-                    std::env::temp_dir().join(format!("gosub-poc-{}", std::process::id()));
-                std::fs::create_dir_all(&sock_dir).unwrap();
-                let sock_path = sock_dir.join("broker.sock");
-                let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
-                Spawner::Multi {
-                    exe: std::env::current_exe().unwrap(),
-                    listener,
-                    sock_path: sock_path.to_str().unwrap().to_string(),
-                    sock_dir,
-                }
-            }
+            Mode::Multi => Spawner::Multi { exe: std::env::current_exe().unwrap() },
         }
     }
 
@@ -433,43 +415,57 @@ impl Spawner {
                 };
                 (ChildHandle::Thread(handle), mine)
             }
-            // Multi-process: re-exec ourselves in the child role; the child
-            // connects back and authenticates with a one-time token.
+            // Multi-process: re-exec ourselves in the child role, handing it
+            // one end of a `socketpair(2)` as an *inherited file descriptor*.
             //
-            // Production note: the real implementation should pass one end of
-            // a `socketpair(2)` as an inherited fd instead of a filesystem
-            // rendezvous path plus token — unforgeable, nothing on disk.
+            // This is the whole authentication story: an inherited fd is
+            // unforgeable, so there is no rendezvous path on disk, no auth
+            // token on argv (which any local user could read via
+            // /proc/<pid>/cmdline), and no accept() race for a local attacker
+            // to win. Only the fd *number* travels on argv, and that is not a
+            // secret.
             #[cfg(feature = "multi-process")]
-            Spawner::Multi { exe, listener, sock_path, .. } => {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                let (role_args, label): (Vec<&str>, &str) = match role {
-                    Role::Net => (vec!["net-daemon"], "net"),
-                    Role::Renderer(origin) => (vec!["renderer", origin], origin),
+            Spawner::Multi { exe } => {
+                use std::os::fd::IntoRawFd;
+                use std::os::unix::process::CommandExt;
+
+                let role_args: Vec<&str> = match role {
+                    Role::Net => vec!["net-daemon"],
+                    Role::Renderer(origin) => vec!["renderer", origin],
                 };
-                let nonce =
-                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
-                let token = format!("tok-{label}-{}-{nonce}", std::process::id());
 
-                let child = std::process::Command::new(exe)
-                    .args(&role_args)
-                    .arg(sock_path)
-                    .arg(&token)
-                    .spawn()
-                    .expect("spawn child process");
+                let (parent_end, child_end) =
+                    std::os::unix::net::UnixStream::pair().expect("socketpair");
+                let child_fd = child_end.into_raw_fd();
 
-                let (mut stream, _) = listener.accept().expect("accept child connection");
-                let hello: ipc::Hello = ipc::recv_msg(&mut stream).expect("child hello");
-                assert_eq!(hello.token, token, "child failed authentication");
-                let ep = Endpoint::from_stream(stream).expect("split child stream");
+                let mut cmd = std::process::Command::new(exe);
+                cmd.args(&role_args).arg(child_fd.to_string());
+                // Clear FD_CLOEXEC on the child's end (post-fork, pre-exec) so
+                // it survives the exec. Every other fd the engine holds keeps
+                // CLOEXEC and is therefore NOT leaked into the child — so one
+                // renderer never inherits another's channel.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        let flags = libc::fcntl(child_fd, libc::F_GETFD);
+                        if flags < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let child = cmd.spawn().expect("spawn child process");
+                // The engine keeps only its own end; drop its copy of the
+                // child's end so the socket reports EOF (→ TabCrashed) once the
+                // child dies.
+                unsafe { libc::close(child_fd) };
+
+                let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
                 (ChildHandle::Process(child), ep)
             }
         }
     }
 
-    fn cleanup(&self) {
-        #[cfg(feature = "multi-process")]
-        if let Spawner::Multi { sock_dir, .. } = self {
-            let _ = std::fs::remove_dir_all(sock_dir);
-        }
-    }
 }

@@ -8,16 +8,19 @@
 
 use crate::ipc::{Endpoint, FetchOutcome, NetRequest, NetResponse};
 
-/// Multi-process entry point: connect back to the engine, authenticate, serve.
+/// Multi-process entry point: adopt the inherited IPC fd, sandbox, serve.
+/// `fd` is the `socketpair(2)` end the engine handed us — possessing it is our
+/// authentication (see [`crate::renderer::run`]).
 #[cfg(feature = "multi-process")]
-pub fn run(socket_path: &str, token: &str) {
-    use crate::ipc::{self, Hello};
+pub fn run(fd: &str) {
+    use std::os::fd::FromRawFd;
     use std::os::unix::net::UnixStream;
 
-    let mut stream = UnixStream::connect(socket_path).expect("net: connect to engine");
-    ipc::send_msg(&mut stream, &Hello { token: token.to_string() }).unwrap();
+    let fd: std::os::fd::RawFd = fd.parse().expect("net: bad fd arg");
+    // SAFETY: the engine passed us sole ownership of this inherited fd.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
     // Split before sandboxing (try_clone's dup is not on the allowlist).
-    let ep = Endpoint::from_stream(stream).expect("net: split stream");
+    let ep = Endpoint::from_stream(stream).expect("net: wrap fd");
     // The net component keeps network access (it is the one process that has
     // it) but still drops exec/io_uring/openat/etc.
     crate::sandbox::lock_down_net();

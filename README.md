@@ -97,6 +97,12 @@ engine event loop (broker — owns cookie jar & policy)
   baseline plus the socket family.
 - A crashed renderer surfaces as `EngineEvent::TabCrashed` for that tab only;
   the engine and all other tabs keep running (in multi-process mode).
+- Children are reached via an **inherited `socketpair(2)` fd**, not a socket on
+  disk. Possessing the fd is the authentication — it cannot be forged — so
+  there is no rendezvous path, no auth token on argv (which any local user
+  could read from `/proc/<pid>/cmdline`), and no `accept()` race. Every other
+  fd the engine holds stays `CLOEXEC`, so one renderer never inherits another's
+  channel.
 
 ## Single- vs multi-process: two-level selection
 
@@ -139,9 +145,9 @@ a real security boundary with a process behind them.
 
 ## Shortcuts taken (what a real implementation needs instead)
 
-- **Rendezvous**: children connect to a socket path and authenticate with an
-  argv token. Real implementation: inherit one end of `socketpair(2)` —
-  unforgeable, nothing on disk.
+- **Rendezvous**: children inherit one end of a `socketpair(2)` — unforgeable,
+  nothing on disk, no token on argv. (Earlier revisions used a socket path +
+  argv token; that leaked the token through `/proc/<pid>/cmdline` and is gone.)
 - **Sandboxing**: seccomp-BPF with a default-deny allowlist
   (`src/sandbox.rs`). Production would go a bit further still — `KillProcess`
   instead of `EPERM` (a denied syscall should be fatal, not merely fail), a
