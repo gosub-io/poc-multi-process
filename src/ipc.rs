@@ -212,3 +212,41 @@ pub fn recv_msg<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<T> {
     r.read_exact(&mut payload)?;
     bincode::deserialize(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_pair_roundtrip() {
+        let (mut a, mut b) = local_pair();
+        a.send(&NetRequest::Shutdown).unwrap();
+        assert!(matches!(b.recv::<NetRequest>().unwrap(), NetRequest::Shutdown));
+    }
+
+    #[cfg(feature = "multi-process")]
+    #[test]
+    fn frame_roundtrip() {
+        let msg = NetResponse {
+            request_id: 42,
+            outcome: FetchOutcome::Ok { status: 200, body: vec![9, 9, 9] },
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        send_msg(&mut buf, &msg).unwrap();
+        let mut cur = std::io::Cursor::new(buf);
+        let back: NetResponse = recv_msg(&mut cur).unwrap();
+        assert_eq!(back.request_id, 42);
+        assert!(matches!(back.outcome, FetchOutcome::Ok { status: 200, .. }));
+    }
+
+    #[cfg(feature = "multi-process")]
+    #[test]
+    fn oversized_length_prefix_rejected() {
+        // A corrupt/malicious length prefix must not force an allocation.
+        let mut buf: Vec<u8> = (MAX_FRAME_LEN + 1).to_le_bytes().to_vec();
+        buf.extend_from_slice(&[0u8; 8]);
+        let mut cur = std::io::Cursor::new(buf);
+        let r: io::Result<NetResponse> = recv_msg(&mut cur);
+        assert!(r.is_err(), "should reject an oversized frame");
+    }
+}
