@@ -33,6 +33,7 @@ use crate::{net_daemon, renderer};
 use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -130,6 +131,72 @@ enum ChildHandle {
 /// this bounds how many can be in flight at once.
 const MAX_INFLIGHT_FETCHES: usize = 32;
 
+/// Per-source cap on messages queued-but-unprocessed in the shared inbox. All
+/// sources funnel into one inbox, so without this a single renderer flooding
+/// *any* message type would grow it without bound. See [`Gate`].
+const MAX_QUEUED_PER_SOURCE: usize = 64;
+
+/// A tiny counting semaphore with a terminal `close`, giving each message
+/// source (a renderer, or the net component) its own bounded slice of the
+/// shared inbox. A source's reader thread must `acquire` a permit before
+/// forwarding a message, and the event loop `release`s one after handling it.
+/// When a source's permits run out its reader blocks — it stops draining that
+/// component's socket, so the OS backpressures the component itself. So one
+/// compromised renderer can pin at most `MAX_QUEUED_PER_SOURCE` messages of
+/// engine memory and, because the bound is per-source rather than a shared
+/// queue limit, it cannot crowd the inbox against other tabs or the net
+/// component. This is the std-only stand-in for the real engine's per-channel
+/// bounded async queues.
+struct Gate {
+    state: Mutex<GateState>,
+    ready: Condvar,
+}
+
+struct GateState {
+    permits: usize,
+    closed: bool,
+}
+
+impl Gate {
+    fn new(cap: usize) -> Arc<Gate> {
+        Arc::new(Gate {
+            state: Mutex::new(GateState { permits: cap, closed: false }),
+            ready: Condvar::new(),
+        })
+    }
+
+    /// Take a permit, blocking while none are free. Returns `false` if the gate
+    /// was closed (its tab is gone), signalling the reader thread to stop.
+    fn acquire(&self) -> bool {
+        let mut s = self.state.lock().unwrap();
+        loop {
+            if s.closed {
+                return false;
+            }
+            if s.permits > 0 {
+                s.permits -= 1;
+                return true;
+            }
+            s = self.ready.wait(s).unwrap();
+        }
+    }
+
+    /// Return a permit after the loop has processed the message it guarded.
+    fn release(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.permits += 1;
+        self.ready.notify_one();
+    }
+
+    /// Permanently unblock the reader (its tab was torn down); further
+    /// `acquire`s fail so the thread exits instead of leaking.
+    fn close(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.closed = true;
+        self.ready.notify_all();
+    }
+}
+
 struct Tab {
     /// The `(zone, origin)` this tab's renderer was created for. This pair is
     /// the *authoritative* identity — policy decisions use it, never claims
@@ -141,6 +208,8 @@ struct Tab {
     handle: ChildHandle,
     /// Number of this tab's fetches awaiting a reply from the net component.
     inflight_fetches: usize,
+    /// Bounds this renderer's queued-but-unprocessed messages in the inbox.
+    gate: Arc<Gate>,
 }
 
 enum Role<'a> {
@@ -164,6 +233,8 @@ struct EngineLoop {
     events: Sender<EngineEvent>,
     net_tx: EndpointTx,
     net_handle: ChildHandle,
+    /// Bounds the net component's queued-but-unprocessed replies in the inbox.
+    net_gate: Arc<Gate>,
     tabs: HashMap<TabId, Tab>,
     /// The engine's private state, keyed by `(zone, origin)` so the same
     /// origin has independent cookies per zone (the profile/container
@@ -182,14 +253,19 @@ impl EngineLoop {
         let mut spawner = Spawner::new(mode);
 
         // Bring up the net component and a reader thread that forwards its
-        // replies into the inbox.
+        // replies into the inbox, bounded by the net component's gate.
         let (net_handle, ep) = spawner.spawn(Role::Net);
         let (net_tx, mut net_rx) = ep.split();
+        let net_gate = Gate::new(MAX_QUEUED_PER_SOURCE);
         {
             let inbox = inbox.clone();
+            let net_gate = Arc::clone(&net_gate);
             std::thread::spawn(move || loop {
                 match net_rx.recv::<NetResponse>() {
                     Ok(resp) => {
+                        if !net_gate.acquire() {
+                            break;
+                        }
                         if inbox.send(LoopMsg::NetReply(resp)).is_err() {
                             break;
                         }
@@ -205,6 +281,7 @@ impl EngineLoop {
             events,
             net_tx,
             net_handle,
+            net_gate,
             tabs: HashMap::new(),
             cookies: HashMap::new(),
             pending_fetches: HashMap::new(),
@@ -237,17 +314,30 @@ impl EngineLoop {
                     self.shutdown();
                     return;
                 }
-                LoopMsg::FromTab { tab_id, msg } => self.tab_request(tab_id, msg),
+                LoopMsg::FromTab { tab_id, msg } => {
+                    // Release the permit this message consumed *after* handling
+                    // it, so the source can queue one more (grab the gate up
+                    // front in case handling ends up touching the tab).
+                    let gate = self.tabs.get(&tab_id).map(|t| Arc::clone(&t.gate));
+                    self.tab_request(tab_id, msg);
+                    if let Some(gate) = gate {
+                        gate.release();
+                    }
+                }
                 LoopMsg::TabGone { tab_id } => {
                     // Only a crash if we didn't remove the tab ourselves
                     // (close/shutdown also end the link, after removal).
                     if let Some(tab) = self.tabs.remove(&tab_id) {
+                        tab.gate.close();
                         join(tab.handle);
                         self.pending_fetches.retain(|_, t| *t != tab_id);
                         self.emit(EngineEvent::TabCrashed { tab_id });
                     }
                 }
-                LoopMsg::NetReply(resp) => self.net_reply(resp),
+                LoopMsg::NetReply(resp) => {
+                    self.net_reply(resp);
+                    self.net_gate.release();
+                }
             }
         }
     }
@@ -269,15 +359,24 @@ impl EngineLoop {
         // that zone's partition.
         let (handle, ep) = self.spawner.spawn(Role::Renderer(&origin));
         let (tx, mut rx) = ep.split();
+        let gate = Gate::new(MAX_QUEUED_PER_SOURCE);
 
         // Reader thread: forward everything this renderer says into the
         // inbox, tagged with the tab it belongs to; report EOF as TabGone.
+        // Acquiring a gate permit before each forward bounds how many of this
+        // renderer's messages can sit unprocessed — and blocks (backpressuring
+        // the renderer's socket) if it floods. A closed gate means the tab was
+        // torn down, so the thread exits without a spurious TabGone.
         {
             let inbox = self.inbox.clone();
+            let gate = Arc::clone(&gate);
             std::thread::spawn(move || {
                 loop {
                     match rx.recv::<FromRenderer>() {
                         Ok(msg) => {
+                            if !gate.acquire() {
+                                return;
+                            }
                             if inbox.send(LoopMsg::FromTab { tab_id, msg }).is_err() {
                                 return;
                             }
@@ -289,8 +388,10 @@ impl EngineLoop {
             });
         }
 
-        self.tabs
-            .insert(tab_id, Tab { zone, origin: origin.clone(), tx, handle, inflight_fetches: 0 });
+        self.tabs.insert(
+            tab_id,
+            Tab { zone, origin: origin.clone(), tx, handle, inflight_fetches: 0, gate },
+        );
         self.emit(EngineEvent::TabOpened { tab_id, zone, origin });
     }
 
@@ -316,6 +417,7 @@ impl EngineLoop {
             }
             TabCommand::Close => {
                 let mut tab = self.tabs.remove(&tab_id).unwrap();
+                tab.gate.close(); // unblock the reader thread if it's flooding
                 let _ = tab.tx.send(&ToRenderer::Shutdown);
                 join(tab.handle);
                 self.pending_fetches.retain(|_, t| *t != tab_id);
@@ -416,9 +518,11 @@ impl EngineLoop {
 
     fn shutdown(&mut self) {
         for (_, mut tab) in self.tabs.drain() {
+            tab.gate.close();
             let _ = tab.tx.send(&ToRenderer::Shutdown);
             join(tab.handle);
         }
+        self.net_gate.close();
         let _ = self.net_tx.send(&NetRequest::Shutdown);
         join(std::mem::replace(&mut self.net_handle, ChildHandle::Thread(dummy_thread())));
         self.spawner.shutdown_forkserver();

@@ -119,9 +119,16 @@ engine event loop (broker — owns cookie jar & policy)
   seccomp caps *what* a child may do; these cap *how much*, so a compromised
   renderer can't exhaust host memory/fds — an over-allocation aborts that
   process, not the machine — and a crash won't dump a core full of secrets.
-  On the IPC side, in-flight fetches are bounded per tab
-  (`MAX_INFLIGHT_FETCHES`) so a renderer can't grow the engine unbounded by
-  flooding `NeedFetch`.
+- On the IPC side, the shared event-loop inbox is **bounded per source**. Every
+  component (each renderer, the net process) may have at most
+  `MAX_QUEUED_PER_SOURCE` messages queued-but-unprocessed: its reader thread
+  takes a permit before forwarding a message and the loop returns one after
+  handling it. When a source runs out of permits its reader stops draining that
+  socket, so the OS backpressures the component itself. Because the bound is
+  *per source*, one compromised renderer flooding any message type pins a fixed
+  slice of engine memory and can't crowd out other tabs — without it, a flood
+  grows the engine ~90 MB/s to OOM; with it, engine RSS stays flat. In-flight
+  fetches are *additionally* bounded per tab (`MAX_INFLIGHT_FETCHES`).
 - A crashed renderer surfaces as `EngineEvent::TabCrashed` for that tab only;
   the engine and all other tabs keep running (in multi-process mode).
 - Children are reached via an **inherited `socketpair(2)` fd**, not a socket on
