@@ -30,8 +30,9 @@ pub enum EngineCommand {
     /// A command addressed to one tab.
     Tab { tab_id: TabId, cmd: TabCommand },
     /// Store a cookie in the engine's jar (stand-in for `Set-Cookie`
-    /// arriving via the net component).
-    SetCookie { origin: String, name: String, value: String },
+    /// arriving via the net component). `http_only` cookies are never exposed
+    /// to a renderer — only the net component sees their values.
+    SetCookie { origin: String, name: String, value: String, http_only: bool },
     /// Gracefully shut down all components and the event loop; answered by
     /// [`EngineEvent::EngineShutdown`].
     Shutdown,

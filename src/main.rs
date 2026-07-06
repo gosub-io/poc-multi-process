@@ -70,7 +70,10 @@ fn main() {
 fn run(mode: Mode) {
     let (engine, events) = engine::start(mode);
 
-    engine.set_cookie("example.com", "session", "abc123").unwrap();
+    // A session token (HttpOnly — never exposed to the renderer) and a
+    // script-visible preference cookie.
+    engine.set_cookie("example.com", "session", "abc123", true).unwrap();
+    engine.set_cookie("example.com", "theme", "dark", false).unwrap();
     engine.open_tab("https://example.com").unwrap();
     engine.open_tab("https://gosub.io").unwrap();
 

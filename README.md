@@ -86,6 +86,12 @@ engine event loop (broker — owns cookie jar & policy)
   messages are never trusted. Navigation is same-origin per renderer (site
   isolation) — a real engine would swap renderer processes on cross-origin
   navigation.
+- **HttpOnly cookies never reach a renderer.** Cookies carry an `http_only`
+  flag; the net component receives all of a request's cookies to attach to the
+  outbound fetch (it must — that's how authenticated requests work), but a
+  renderer asking for `document.cookie` gets only the non-HttpOnly ones. So an
+  exploited `example.com` renderer never sees `example.com`'s session token —
+  it travels engine → net and skips the renderer's address space entirely.
 - SSRF policy is centralized in the net component (the one place allowed to
   open sockets), so no renderer bug can bypass it.
 - Renderers are **sandboxed at the OS level** (Linux): after connecting their

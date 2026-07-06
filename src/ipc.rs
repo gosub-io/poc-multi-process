@@ -58,6 +58,10 @@ pub enum NetRequest {
         /// renderer cannot spoof another origin's identity.
         for_origin: String,
         url: String,
+        /// The origin's cookies (name, value) for the net component to attach
+        /// to the request — *including* HttpOnly ones. These reach the
+        /// network process but never the renderer.
+        cookies: Vec<(String, String)>,
     },
     Shutdown,
 }

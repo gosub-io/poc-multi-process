@@ -73,11 +73,13 @@ impl EngineHandle {
         origin: impl Into<String>,
         name: impl Into<String>,
         value: impl Into<String>,
+        http_only: bool,
     ) -> io::Result<()> {
         self.send(EngineCommand::SetCookie {
             origin: origin.into(),
             name: name.into(),
             value: value.into(),
+            http_only,
         })
     }
 
@@ -138,6 +140,15 @@ enum Role<'a> {
     Renderer(&'a str),
 }
 
+/// A cookie in the engine's jar. `http_only` cookies are attached to network
+/// requests by the net component but withheld from renderers — the browser
+/// property that keeps session tokens out of a compromised renderer.
+struct Cookie {
+    name: String,
+    value: String,
+    http_only: bool,
+}
+
 struct EngineLoop {
     spawner: Spawner,
     /// Cloned into every reader thread so all sources feed one inbox.
@@ -148,8 +159,8 @@ struct EngineLoop {
     tabs: HashMap<TabId, Tab>,
     /// The engine's private state. Renderers can only get at this through
     /// the broker protocol — in multi-process mode it never even lives in
-    /// their address space.
-    cookies: HashMap<String, Vec<(String, String)>>,
+    /// their address space, and HttpOnly cookies never reach it at all.
+    cookies: HashMap<String, Vec<Cookie>>,
     /// In-flight fetches: request id -> the tab awaiting the reply.
     pending_fetches: HashMap<u64, TabId>,
     next_tab_id: u64,
@@ -204,8 +215,8 @@ impl EngineLoop {
                 LoopMsg::Command(EngineCommand::Tab { tab_id, cmd }) => {
                     self.tab_command(tab_id, cmd)
                 }
-                LoopMsg::Command(EngineCommand::SetCookie { origin, name, value }) => {
-                    self.cookies.entry(origin).or_default().push((name, value));
+                LoopMsg::Command(EngineCommand::SetCookie { origin, name, value, http_only }) => {
+                    self.cookies.entry(origin).or_default().push(Cookie { name, value, http_only });
                 }
                 LoopMsg::Command(EngineCommand::Shutdown) => {
                     self.shutdown();
@@ -315,10 +326,22 @@ impl EngineLoop {
                 // it. The reply is matched back via the request id.
                 let request_id = self.next_request_id;
                 self.next_request_id += 1;
+                // Attach the origin's cookies — *including HttpOnly* — for the
+                // net component to put on the request. These values go to the
+                // network process, never back to the renderer.
+                let cookies: Vec<(String, String)> = self
+                    .cookies
+                    .get(&tab.origin)
+                    .map(|cs| cs.iter().map(|c| (c.name.clone(), c.value.clone())).collect())
+                    .unwrap_or_default();
                 self.pending_fetches.insert(request_id, tab_id);
                 tab.inflight_fetches += 1;
-                let req =
-                    NetRequest::Fetch { request_id, for_origin: tab.origin.clone(), url };
+                let req = NetRequest::Fetch {
+                    request_id,
+                    for_origin: tab.origin.clone(),
+                    url,
+                    cookies,
+                };
                 if self.net_tx.send(&req).is_err() {
                     self.pending_fetches.remove(&request_id);
                     tab.inflight_fetches -= 1;
@@ -329,9 +352,17 @@ impl EngineLoop {
             }
             FromRenderer::NeedCookies { origin: requested } => {
                 // Same-origin check against the tab's authoritative identity,
-                // not the message contents.
+                // not the message contents. The renderer receives only the
+                // *non-HttpOnly* cookies — the `document.cookie` view — so an
+                // exploited renderer never sees its origin's session token.
                 let reply = if requested == tab.origin {
-                    ToRenderer::Cookies(self.cookies.get(&requested).cloned())
+                    let visible = self.cookies.get(&requested).map(|cs| {
+                        cs.iter()
+                            .filter(|c| !c.http_only)
+                            .map(|c| (c.name.clone(), c.value.clone()))
+                            .collect::<Vec<_>>()
+                    });
+                    ToRenderer::Cookies(visible)
                 } else {
                     ToRenderer::Cookies(None)
                 };

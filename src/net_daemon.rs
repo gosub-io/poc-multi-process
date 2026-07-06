@@ -36,11 +36,12 @@ pub fn serve(mut ep: Endpoint) {
         };
         match req {
             NetRequest::Shutdown => break,
-            NetRequest::Fetch { request_id, for_origin, url } => {
+            NetRequest::Fetch { request_id, for_origin, url, cookies } => {
                 // The request id travels with the reply so the engine can
                 // route it back to the tab that asked, even with many
                 // fetches in flight.
-                let resp = NetResponse { request_id, outcome: handle_fetch(&for_origin, &url) };
+                let outcome = handle_fetch(&for_origin, &url, &cookies);
+                let resp = NetResponse { request_id, outcome };
                 if ep.send(&resp).is_err() {
                     break;
                 }
@@ -50,15 +51,22 @@ pub fn serve(mut ep: Endpoint) {
 }
 
 /// `for_origin` is the requesting renderer's identity as recorded by the
-/// engine; a real implementation uses it for per-origin network policy
-/// (CORS, cookie attachment, request headers).
-fn handle_fetch(_for_origin: &str, url: &str) -> FetchOutcome {
+/// engine; a real implementation uses it for per-origin network policy.
+/// `cookies` are the origin's cookies (including HttpOnly) the engine wants
+/// attached to this request — the net component is the only process outside
+/// the engine that sees their values.
+fn handle_fetch(_for_origin: &str, url: &str, cookies: &[(String, String)]) -> FetchOutcome {
     if let Some(reason) = ssrf_block_reason(url) {
         return FetchOutcome::Denied { reason };
     }
-    // A real implementation performs the HTTP request here; the PoC
+    // A real implementation would set `Cookie: name=value; ...` on the
+    // outbound request from `cookies` and perform the HTTP fetch here; the PoC
     // synthesizes the response so it runs offline and deterministically.
-    let body = format!("<html><!-- 200 OK, served for {url} --></html>").into_bytes();
+    let body = format!(
+        "<html><!-- 200 OK for {url}; {} cookie(s) attached --></html>",
+        cookies.len()
+    )
+    .into_bytes();
     FetchOutcome::Ok { status: 200, body }
 }
 
