@@ -24,6 +24,16 @@ use std::sync::mpsc::{self, Receiver, Sender};
 /// unbounded memory.
 pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
+/// Engine -> fork server (Linux). The engine asks the fork server to `fork()`
+/// a renderer for `origin`; the renderer's IPC fd is passed alongside this
+/// message via `SCM_RIGHTS` (see `fork_server`).
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ForkRequest {
+    Renderer { origin: String },
+    Shutdown,
+}
+
 /// Renderer -> engine.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum FromRenderer {

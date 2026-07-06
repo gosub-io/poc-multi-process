@@ -118,6 +118,10 @@ enum ChildHandle {
     Thread(std::thread::JoinHandle<()>),
     #[cfg(feature = "multi-process")]
     Process(std::process::Child),
+    /// A renderer `fork()`ed by the fork server, which owns and reaps it. The
+    /// engine has no `Child` for it; it detects death via IPC-socket EOF.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    ForkServed,
 }
 
 /// Per-tab cap on outstanding brokered fetches. Bounds the engine memory a
@@ -175,7 +179,7 @@ struct EngineLoop {
 
 impl EngineLoop {
     fn new(mode: Mode, inbox: Sender<LoopMsg>, events: Sender<EngineEvent>) -> EngineLoop {
-        let spawner = Spawner::new(mode);
+        let mut spawner = Spawner::new(mode);
 
         // Bring up the net component and a reader thread that forwards its
         // replies into the inbox.
@@ -417,6 +421,7 @@ impl EngineLoop {
         }
         let _ = self.net_tx.send(&NetRequest::Shutdown);
         join(std::mem::replace(&mut self.net_handle, ChildHandle::Thread(dummy_thread())));
+        self.spawner.shutdown_forkserver();
         self.emit(EngineEvent::EngineShutdown);
     }
 }
@@ -436,6 +441,9 @@ fn join(handle: ChildHandle) {
         ChildHandle::Process(mut child) => {
             let _ = child.wait();
         }
+        // Reaped by the fork server; the engine has nothing to wait on.
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        ChildHandle::ForkServed => {}
     }
 }
 
@@ -456,19 +464,40 @@ fn origin_of(url: &str) -> Option<String> {
 enum Spawner {
     Single,
     #[cfg(feature = "multi-process")]
-    Multi { exe: std::path::PathBuf },
+    Multi {
+        exe: std::path::PathBuf,
+        /// The engine's end of the control channel to the fork server, and the
+        /// fork-server process itself. Renderers are `fork()`ed from it; the
+        /// net component is still spawned directly (it's a one-off).
+        #[cfg(target_os = "linux")]
+        fork_control: std::os::unix::net::UnixStream,
+        #[cfg(target_os = "linux")]
+        fork_child: std::process::Child,
+    },
 }
 
 impl Spawner {
     fn new(mode: Mode) -> Spawner {
         match mode {
             Mode::Single => Spawner::Single,
-            #[cfg(feature = "multi-process")]
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            Mode::Multi => {
+                let exe = std::env::current_exe().unwrap();
+                // Bring up the fork server now — before the engine loads the
+                // cookie jar — so it starts secret-free. It is itself spawned
+                // via fork+exec (one exec); renderers are then fork()ed from it
+                // without exec.
+                let (fork_control, fs_end) =
+                    std::os::unix::net::UnixStream::pair().expect("socketpair");
+                let fork_child = spawn_inherited(&exe, &["fork-server"], fs_end);
+                Spawner::Multi { exe, fork_control, fork_child }
+            }
+            #[cfg(all(feature = "multi-process", not(target_os = "linux")))]
             Mode::Multi => Spawner::Multi { exe: std::env::current_exe().unwrap() },
         }
     }
 
-    fn spawn(&self, role: Role) -> (ChildHandle, Endpoint) {
+    fn spawn(&mut self, role: Role) -> (ChildHandle, Endpoint) {
         match self {
             // Single-process: the component's serve loop runs on a thread,
             // wired up with an in-process channel pair.
@@ -483,60 +512,104 @@ impl Spawner {
                 };
                 (ChildHandle::Thread(handle), mine)
             }
-            // Multi-process: re-exec ourselves in the child role, handing it
-            // one end of a `socketpair(2)` as an *inherited file descriptor*.
-            //
-            // This is the whole authentication story: an inherited fd is
-            // unforgeable, so there is no rendezvous path on disk, no auth
-            // token on argv (which any local user could read via
-            // /proc/<pid>/cmdline), and no accept() race for a local attacker
-            // to win. Only the fd *number* travels on argv, and that is not a
-            // secret.
-            #[cfg(feature = "multi-process")]
-            Spawner::Multi { exe } => {
-                use std::os::fd::IntoRawFd;
-                use std::os::unix::process::CommandExt;
 
+            // Multi-process on Linux: the net component is spawned directly
+            // (fork+exec), but renderers are requested from the fork server,
+            // which fork()s them without exec.
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            Spawner::Multi { exe, fork_control, .. } => match role {
+                Role::Net => {
+                    let (parent_end, child_end) =
+                        std::os::unix::net::UnixStream::pair().expect("socketpair");
+                    let child = spawn_inherited(exe, &["net-daemon"], child_end);
+                    let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
+                    (ChildHandle::Process(child), ep)
+                }
+                Role::Renderer(origin) => {
+                    use std::os::fd::AsRawFd;
+                    // The engine creates the renderer's socketpair, keeps one
+                    // end, and hands the other to the fork server via
+                    // SCM_RIGHTS — so the renderer talks straight to the engine
+                    // even though the fork server is its OS parent.
+                    let (parent_end, child_end) =
+                        std::os::unix::net::UnixStream::pair().expect("socketpair");
+                    ipc::send_msg(fork_control, &ipc::ForkRequest::Renderer { origin: origin.to_string() })
+                        .expect("fork request");
+                    // SCM_RIGHTS duplicates the fd into the fork server; the
+                    // engine then drops its copy of the child's end so it sees
+                    // EOF (→ TabCrashed) when the renderer dies.
+                    unsafe { crate::fork_server::send_fd(fork_control.as_raw_fd(), child_end.as_raw_fd()) }
+                        .expect("send fd");
+                    drop(child_end);
+                    let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
+                    (ChildHandle::ForkServed, ep)
+                }
+            },
+
+            // Multi-process elsewhere: no fork server; both roles are spawned
+            // directly via fork+exec of an inherited-fd child.
+            #[cfg(all(feature = "multi-process", not(target_os = "linux")))]
+            Spawner::Multi { exe } => {
                 let role_args: Vec<&str> = match role {
                     Role::Net => vec!["net-daemon"],
                     Role::Renderer(origin) => vec!["renderer", origin],
                 };
-
                 let (parent_end, child_end) =
                     std::os::unix::net::UnixStream::pair().expect("socketpair");
-                let child_fd = child_end.into_raw_fd();
-
-                let mut cmd = std::process::Command::new(exe);
-                cmd.args(&role_args).arg(child_fd.to_string());
-                // Clear FD_CLOEXEC on the child's end (post-fork, pre-exec) so
-                // it survives the exec. Every other fd the engine holds keeps
-                // CLOEXEC and is therefore NOT leaked into the child — so one
-                // renderer never inherits another's channel.
-                unsafe {
-                    cmd.pre_exec(move || {
-                        // Impose resource ceilings before the child runs a line
-                        // of its own code (inherited across exec).
-                        crate::sandbox::apply_child_rlimits()?;
-                        let flags = libc::fcntl(child_fd, libc::F_GETFD);
-                        if flags < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        if libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
-                let child = cmd.spawn().expect("spawn child process");
-                // The engine keeps only its own end; drop its copy of the
-                // child's end so the socket reports EOF (→ TabCrashed) once the
-                // child dies.
-                unsafe { libc::close(child_fd) };
-
+                let child = spawn_inherited(exe, &role_args, child_end);
                 let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
                 (ChildHandle::Process(child), ep)
             }
         }
     }
 
+    /// Shut down the fork server (Linux). No-op otherwise.
+    fn shutdown_forkserver(&mut self) {
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        if let Spawner::Multi { fork_control, fork_child, .. } = self {
+            let _ = ipc::send_msg(fork_control, &ipc::ForkRequest::Shutdown);
+            let _ = fork_child.wait();
+        }
+    }
+}
+
+/// Spawn a child role via fork+exec, handing it one end of a `socketpair(2)`
+/// as an *inherited file descriptor*.
+///
+/// An inherited fd is unforgeable, so there is no rendezvous path on disk, no
+/// auth token on argv (which any local user could read via
+/// `/proc/<pid>/cmdline`), and no `accept()` race. Only the fd *number*
+/// travels on argv, which is not a secret. Resource ceilings are imposed in
+/// `pre_exec`, before the child runs its own code, and are inherited across
+/// exec (and, for the fork server, across its later `fork()`s).
+#[cfg(feature = "multi-process")]
+fn spawn_inherited(
+    exe: &std::path::Path,
+    args: &[&str],
+    child_end: std::os::unix::net::UnixStream,
+) -> std::process::Child {
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let child_fd = child_end.into_raw_fd();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args).arg(child_fd.to_string());
+    // Clear FD_CLOEXEC on the child's end so it survives exec. Every other fd
+    // the engine holds keeps CLOEXEC and is NOT leaked into the child.
+    unsafe {
+        cmd.pre_exec(move || {
+            crate::sandbox::apply_child_rlimits()?;
+            let flags = libc::fcntl(child_fd, libc::F_GETFD);
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("spawn child process");
+    unsafe { libc::close(child_fd) };
+    child
 }

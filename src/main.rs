@@ -23,6 +23,8 @@
 
 mod engine;
 mod events;
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+mod fork_server;
 mod ipc;
 mod net_daemon;
 mod renderer;
@@ -53,11 +55,13 @@ fn main() {
         }
         // Internal child roles, used by the engine to re-exec itself. The
         // trailing argument is the inherited IPC fd number (see engine.rs).
-        // net-daemon <fd> ; renderer <origin> <fd>
+        // net-daemon <fd> ; renderer <origin> <fd> ; fork-server <control-fd>
         #[cfg(feature = "multi-process")]
         Some("net-daemon") => net_daemon::run(&args[2]),
         #[cfg(feature = "multi-process")]
         Some("renderer") => renderer::run(&args[2], &args[3]),
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        Some("fork-server") => fork_server::run(&args[2]),
         Some(other) => {
             eprintln!("unknown argument: {other}");
             eprintln!("usage: gosub-proc-iso-poc [--single-process | --multi-process]");

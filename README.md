@@ -74,8 +74,9 @@ maps each reply back to the tab that asked).
 ```
 engine event loop (broker — owns cookie jar & policy)
 ├── net component            Phase 1: sole owner of network capability
-├── renderer origin A        Phase 2: per-origin, unprivileged
-└── renderer origin B        Phase 2: per-origin, unprivileged
+└── fork server (Linux)      minimal, single-threaded, secret-free
+    ├── renderer (zone, A)   Phase 2: per-(zone,origin), unprivileged
+    └── renderer (zone, B)   Phase 2: per-(zone,origin), unprivileged
 ```
 
 - Renderers hold no secrets: cookies and network access live in the engine
@@ -121,6 +122,35 @@ engine event loop (broker — owns cookie jar & policy)
   could read from `/proc/<pid>/cmdline`), and no `accept()` race. Every other
   fd the engine holds stays `CLOEXEC`, so one renderer never inherits another's
   channel.
+- Renderers are created by a **fork server** (Linux), the way Firefox (a
+  "fork server") and Chromium/Android (a "zygote") do it — see below.
+
+### Fork server (Linux)
+
+Renderers are not `exec`'d from scratch; they are **`fork()`ed without `exec`**
+from a dedicated *fork server* process, so each new renderer inherits an
+already-initialized runtime copy-on-write instead of re-running full process
+startup. Two reasons drive it, one speed and one safety:
+
+- **Speed** — `fork()` without `exec()` skips re-linking and re-initializing the
+  runtime for every content process (the dominant win in a real browser).
+- **Safety** — you fork from a *minimal, single-threaded, secret-free* snapshot.
+  The engine can't be that snapshot: it is multithreaded (forking it would
+  strand locks other threads hold) and it owns the cookie jar (a fork would
+  inherit it). So the fork server exists solely to be a clean thing to fork
+  from. It is brought up before the engine loads any cookies.
+
+The engine still creates each renderer's `socketpair`, keeps one end, and passes
+the other to the fork server via **`SCM_RIGHTS`** fd-passing — so the renderer
+talks straight to the engine even though the fork server is its OS parent. The
+forked child then drops privileges (its own seccomp filter; rlimits inherited
+from the fork server) and serves. Crash detection is unchanged: the engine holds
+the renderer's socket end, so a dead renderer still surfaces as `TabCrashed`
+regardless of which process is its OS parent; the fork server reaps the corpse.
+
+You can see it in a syscall trace: only `fork-server` and `net-daemon` are ever
+`execve`'d — the renderers appear only as `clone()`/`fork()` from the fork
+server, with no exec. The net component (a one-off) is still spawned directly.
 
 ## Single- vs multi-process: two-level selection
 
@@ -141,9 +171,10 @@ length-framed bincode messages (with a max-frame check so a corrupt length
 prefix can't force an unbounded allocation). Components expose a
 transport-agnostic `serve(Endpoint, ...)` loop; the feature-gated `run()`
 wrappers are only the child-process entry points. The engine's `Spawner`
-either spawns a thread wired with `local_pair()` or re-execs the binary and
-accepts the socket connection — it is the only code that knows which mode is
-active.
+either spawns a thread wired with `local_pair()`, or (multi-process) hands the
+child one end of a `socketpair(2)` — the net component by fork+exec, renderers
+by asking the fork server to `fork()` them. It is the only code that knows
+which mode is active.
 
 Note: in single-process mode the policy checks still run, but a compromised
 renderer *thread* shares the engine's address space — the checks only become
@@ -157,7 +188,8 @@ a real security boundary with a process behind them.
 | `src/engine.rs` | `start(mode)`, `EngineHandle`, the event loop (broker + policy), `Spawner` |
 | `src/ipc.rs` | `Endpoint` tx/rx halves (socket/local transports), wire messages, bincode framing |
 | `src/net_daemon.rs` | Net component: `serve` loop, SSRF policy, (synthesized) fetching |
-| `src/renderer.rs` | Per-origin renderer: `serve` loop, placeholder render pipeline |
+| `src/renderer.rs` | Per-`(zone,origin)` renderer: `serve` loop, placeholder render pipeline |
+| `src/fork_server.rs` | Fork server (Linux): `fork()`s renderers without exec; `SCM_RIGHTS` fd-passing |
 | `src/sandbox.rs` | seccomp-BPF privilege capping for the child processes (Linux) |
 | `src/main.rs` | Child-role dispatch for re-exec + minimal event-driven usage |
 
@@ -185,3 +217,10 @@ a real security boundary with a process behind them.
   tuple; cross-origin navigation is refused instead of swapping renderers.
 - Phase 3 (GPU process) is not modeled — structurally it's the same pattern as
   the net component.
+- **Fork server**: it is `exec`'d fresh (one exec) rather than forked from the
+  engine early to inherit the *engine's* warm libraries; the modeled behavior
+  is renderers fork-without-exec from a warm process. It is unsandboxed
+  (minimal, trusted, holds no secrets) and reaps its renderers on shutdown; a
+  real one would also seccomp-confine itself around the `fork()`/fd-passing
+  path. Linux only — `fork()`-without-exec + the Rust runtime relies on
+  `fork()` semantics. Elsewhere renderers fall back to direct fork+exec.
