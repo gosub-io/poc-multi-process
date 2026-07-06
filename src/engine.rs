@@ -116,6 +116,12 @@ enum ChildHandle {
     Process(std::process::Child),
 }
 
+/// Per-tab cap on outstanding brokered fetches. Bounds the engine memory a
+/// single (possibly compromised) renderer can pin by spamming `NeedFetch`
+/// without waiting for replies. The 16 MiB frame cap only bounds one message;
+/// this bounds how many can be in flight at once.
+const MAX_INFLIGHT_FETCHES: usize = 32;
+
 struct Tab {
     /// The origin this tab's renderer was created for. This is the
     /// *authoritative* identity — policy decisions use this, never claims
@@ -123,6 +129,8 @@ struct Tab {
     origin: String,
     tx: EndpointTx,
     handle: ChildHandle,
+    /// Number of this tab's fetches awaiting a reply from the net component.
+    inflight_fetches: usize,
 }
 
 enum Role<'a> {
@@ -252,7 +260,7 @@ impl EngineLoop {
             });
         }
 
-        self.tabs.insert(tab_id, Tab { origin: origin.clone(), tx, handle });
+        self.tabs.insert(tab_id, Tab { origin: origin.clone(), tx, handle, inflight_fetches: 0 });
         self.emit(EngineEvent::TabOpened { tab_id, origin });
     }
 
@@ -294,16 +302,26 @@ impl EngineLoop {
         };
         match msg {
             FromRenderer::NeedFetch { url } => {
+                // Backpressure: refuse a renderer that floods fetches without
+                // consuming replies, so it can't grow the engine unbounded.
+                if tab.inflight_fetches >= MAX_INFLIGHT_FETCHES {
+                    let _ = tab.tx.send(&ToRenderer::FetchDenied {
+                        reason: "too many in-flight fetches".into(),
+                    });
+                    return;
+                }
                 // Forward to the net component, stamped with the identity
                 // the engine knows for this tab — the renderer cannot spoof
                 // it. The reply is matched back via the request id.
                 let request_id = self.next_request_id;
                 self.next_request_id += 1;
                 self.pending_fetches.insert(request_id, tab_id);
+                tab.inflight_fetches += 1;
                 let req =
                     NetRequest::Fetch { request_id, for_origin: tab.origin.clone(), url };
                 if self.net_tx.send(&req).is_err() {
                     self.pending_fetches.remove(&request_id);
+                    tab.inflight_fetches -= 1;
                     let _ = tab.tx.send(&ToRenderer::FetchDenied {
                         reason: "net component unavailable".into(),
                     });
@@ -335,6 +353,7 @@ impl EngineLoop {
         let Some(tab) = self.tabs.get_mut(&tab_id) else {
             return;
         };
+        tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1);
         let reply = match resp.outcome {
             FetchOutcome::Ok { status, body } => ToRenderer::FetchResult { status, body },
             FetchOutcome::Denied { reason } => ToRenderer::FetchDenied { reason },
@@ -446,6 +465,9 @@ impl Spawner {
                 // renderer never inherits another's channel.
                 unsafe {
                     cmd.pre_exec(move || {
+                        // Impose resource ceilings before the child runs a line
+                        // of its own code (inherited across exec).
+                        crate::sandbox::apply_child_rlimits()?;
                         let flags = libc::fcntl(child_fd, libc::F_GETFD);
                         if flags < 0 {
                             return Err(std::io::Error::last_os_error());

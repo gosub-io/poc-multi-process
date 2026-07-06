@@ -145,6 +145,36 @@ fn install(allowed: Vec<libc::c_long>) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+/// Resource ceilings the engine imposes on a child at spawn time. seccomp caps
+/// *what* syscalls a child may run; this caps *how much* it may consume, so a
+/// compromised child cannot exhaust host memory or fd tables. rlimits can only
+/// ever be lowered, never raised, so the child cannot undo them.
+///
+/// Called from the post-fork/pre-exec context, so it must stay
+/// async-signal-safe: nothing but `setrlimit` syscalls here.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn apply_child_rlimits() -> std::io::Result<()> {
+    // Address space: enough for legitimate rendering, but a renderer that
+    // tries to allocate the host to death instead hits a failed mmap → Rust's
+    // alloc-error path aborts *that process*, not the machine.
+    set_rlimit(libc::RLIMIT_AS, 512 * 1024 * 1024)?;
+    // A child needs only a handful of fds (its IPC socket + std streams).
+    set_rlimit(libc::RLIMIT_NOFILE, 128)?;
+    // No core dumps — a crash must not spill page contents (cookies, tokens).
+    set_rlimit(libc::RLIMIT_CORE, 0)?;
+    Ok(())
+}
+
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+fn set_rlimit(resource: libc::__rlimit_resource_t, limit: libc::rlim_t) -> std::io::Result<()> {
+    let rl = libc::rlimit { rlim_cur: limit, rlim_max: limit };
+    // SAFETY: valid resource id and a valid rlimit pointer.
+    if unsafe { libc::setrlimit(resource, &rl) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 // On non-Linux (multi-process still builds over Unix sockets on e.g. macOS)
 // there is no seccomp; the caps are no-ops with a note.
 #[cfg(all(feature = "multi-process", not(target_os = "linux")))]
@@ -154,3 +184,8 @@ pub fn lock_down_renderer() {
 
 #[cfg(all(feature = "multi-process", not(target_os = "linux")))]
 pub fn lock_down_net() {}
+
+#[cfg(all(feature = "multi-process", not(target_os = "linux")))]
+pub fn apply_child_rlimits() -> std::io::Result<()> {
+    Ok(())
+}

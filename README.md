@@ -95,6 +95,14 @@ engine event loop (broker — owns cookie jar & policy)
   open a socket, an io_uring instance, a file, or a subprocess; the kernel
   returns `EPERM`. See `src/sandbox.rs`. The net component gets the same
   baseline plus the socket family.
+- Children run under **OS resource caps** the engine sets at spawn (Linux):
+  `RLIMIT_AS` (512 MiB address space), `RLIMIT_NOFILE`, and `RLIMIT_CORE=0`.
+  seccomp caps *what* a child may do; these cap *how much*, so a compromised
+  renderer can't exhaust host memory/fds — an over-allocation aborts that
+  process, not the machine — and a crash won't dump a core full of secrets.
+  On the IPC side, in-flight fetches are bounded per tab
+  (`MAX_INFLIGHT_FETCHES`) so a renderer can't grow the engine unbounded by
+  flooding `NeedFetch`.
 - A crashed renderer surfaces as `EngineEvent::TabCrashed` for that tab only;
   the engine and all other tabs keep running (in multi-process mode).
 - Children are reached via an **inherited `socketpair(2)` fd**, not a socket on
