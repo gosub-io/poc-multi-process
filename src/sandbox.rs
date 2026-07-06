@@ -6,9 +6,17 @@
 //! renderers.
 //!
 //! The filter is a default-deny **allowlist**: we enumerate the syscalls a
-//! component legitimately needs and reject everything else with `EPERM`. This
-//! is fail-closed — a syscall we never considered (a new one, or an obscure
-//! bypass such as io_uring-based networking) is denied for free.
+//! component legitimately needs and everything else is a fatal `SIGSYS`
+//! (`KillProcess`). This is fail-closed — a syscall we never considered (a new
+//! one, or an obscure bypass such as io_uring-based networking) is denied for
+//! free — and killing on violation, rather than returning `EPERM`, denies an
+//! exploit the chance to probe the sandbox and adapt.
+//!
+//! A handful of allowed syscalls are additionally **argument-filtered**:
+//! `mmap`/`mprotect` are permitted only when `PROT_EXEC` is clear, so a
+//! renderer can never turn writable memory executable (the W^X property that
+//! blocks the final step of most memory-corruption exploit chains). An empty
+//! rule for a syscall matches any arguments; these two carry a real condition.
 //!
 //! Installing it is safe here because the child has already connected and
 //! split its endpoint (the `socket`/`connect`/`dup` for that happened *before*
@@ -16,15 +24,20 @@
 //! in memory. seccomp filters only ever remove privileges, and a process may
 //! always restrict itself — no root needed.
 //!
+//! Startup is **fail-closed**: if the filter cannot be installed the component
+//! aborts rather than run unconfined (a sandbox that silently fails to apply is
+//! worse than an honest none). So multi-process mode requires seccomp support;
+//! environments without it use `--single-process` / `--no-default-features`.
+//!
 //! This applies only in multi-process mode: in single-process mode the
 //! components are threads inside the engine, which needs network and exec, so
 //! there is nothing to drop.
 //!
-//! Production would go further: `KillProcess` instead of `EPERM` (a denied
-//! syscall should be fatal, not merely fail), a per-arch baseline tested across
-//! libc/kernel versions, filesystem restriction (Landlock), namespaces, and
-//! fail-closed startup (refuse to run if the filter cannot be installed). Here
-//! we warn and continue so the PoC still runs in restricted containers/CI.
+//! Production would go further still: a per-arch baseline tested across
+//! libc/kernel versions, filesystem restriction (Landlock), and namespaces.
+//! A real JS JIT needs executable memory, so it would relax the `PROT_EXEC`
+//! rule for a dedicated JIT region (or use a dual-mapping/`memfd` scheme)
+//! rather than the blanket denial that suits this JIT-less renderer.
 
 /// Syscalls any confined child needs after startup: I/O on already-open fds
 /// (its IPC socket + stderr), memory management, synchronization, signals,
@@ -46,7 +59,9 @@ const BASELINE: &[libc::c_long] = &[
     libc::SYS_close,
     libc::SYS_fstat,
     libc::SYS_lseek,
-    // memory
+    // memory — mmap/mprotect are argument-filtered in `install` to forbid
+    // PROT_EXEC (mremap preserves an existing mapping's protection, so it can't
+    // introduce exec).
     libc::SYS_mmap,
     libc::SYS_munmap,
     libc::SYS_mremap,
@@ -98,31 +113,38 @@ const NET_EXTRA: &[libc::c_long] = &[
 /// Cap a renderer: pixels only — the baseline, no network, files, or exec.
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 pub fn lock_down_renderer() {
-    announce("renderer", install(BASELINE.to_vec()));
+    enforce("renderer", install(BASELINE.to_vec()));
 }
 
 /// Cap the net component: the baseline plus the socket family.
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 pub fn lock_down_net() {
     let allowed: Vec<libc::c_long> = BASELINE.iter().chain(NET_EXTRA).copied().collect();
-    announce("net", install(allowed));
+    enforce("net", install(allowed));
 }
 
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
-fn announce(role: &str, result: Result<(), Box<dyn std::error::Error>>) {
+fn enforce(role: &str, result: Result<(), Box<dyn std::error::Error>>) {
     match result {
-        Ok(()) => eprintln!("[{role}] seccomp allowlist active (default-deny)"),
+        Ok(()) => eprintln!("[{role}] seccomp allowlist active (default-deny, KillProcess)"),
         Err(e) => {
-            eprintln!("[{role}] WARNING: could not install seccomp sandbox ({e}); running unconfined")
+            // Fail closed: never run a component that was meant to be confined
+            // as if it were unconfined.
+            eprintln!("[{role}] FATAL: could not install seccomp sandbox: {e}");
+            std::process::exit(1);
         }
     }
 }
 
-/// Build and apply a default-deny allowlist: syscalls in `allowed` pass, every
-/// other syscall returns `EPERM`.
+/// Build and apply a default-deny allowlist: syscalls in `allowed` pass (subject
+/// to any argument filter), every other syscall — and any allowed syscall whose
+/// arguments fail its filter — is a fatal `SIGSYS`.
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 fn install(allowed: Vec<libc::c_long>) -> Result<(), Box<dyn std::error::Error>> {
-    use seccompiler::{apply_filter, BpfProgram, SeccompAction, SeccompFilter};
+    use seccompiler::{
+        apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
+        SeccompFilter, SeccompRule,
+    };
     use std::collections::BTreeMap;
 
     #[cfg(target_arch = "x86_64")]
@@ -130,14 +152,29 @@ fn install(allowed: Vec<libc::c_long>) -> Result<(), Box<dyn std::error::Error>>
     #[cfg(target_arch = "aarch64")]
     let arch = seccompiler::TargetArch::aarch64;
 
-    // Empty rule vec = match the syscall unconditionally (any args).
-    let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
+    // Most syscalls match unconditionally: an empty rule vec = any arguments.
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
         allowed.iter().map(|&nr| (nr as i64, Vec::new())).collect();
+
+    // …except mmap/mprotect, which are allowed only when PROT_EXEC is clear.
+    // `prot` is argument index 2 of both. `MaskedEq(PROT_EXEC)` against value 0
+    // means "(prot & PROT_EXEC) == 0" — so a mapping can be made writable or
+    // readable, but never executable (W^X). A request that sets PROT_EXEC
+    // matches no rule and hits the KillProcess default.
+    for nr in [libc::SYS_mmap, libc::SYS_mprotect] {
+        let no_exec = SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::MaskedEq(libc::PROT_EXEC as u64),
+            0,
+        )?;
+        rules.insert(nr as i64, vec![SeccompRule::new(vec![no_exec])?]);
+    }
 
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::Errno(libc::EPERM as u32), // default: deny
-        SeccompAction::Allow,                     // listed: allow
+        SeccompAction::KillProcess, // default & argument-mismatch: fatal SIGSYS
+        SeccompAction::Allow,       // matched: allow
         arch,
     )?;
     let program: BpfProgram = filter.try_into()?;

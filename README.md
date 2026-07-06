@@ -18,10 +18,18 @@ cargo build --no-default-features        # single-process-only binary
 
 Each child installs a seccomp-BPF filter after connecting its IPC link. It is
 a default-deny **allowlist**: the component's legitimate syscalls are
-enumerated and everything else returns `EPERM`. This is fail-closed — a
+enumerated and everything else is a fatal `SIGSYS` (`KillProcess`, not `EPERM`
+— a killed process can't probe the sandbox and adapt). This is fail-closed — a
 syscall we never considered (a new one, or a bypass such as io_uring-based
 networking) is denied for free — which is what real renderer sandboxes
 (Chromium, Firefox) do. `src/sandbox.rs` holds the curated baseline.
+
+A few allowed syscalls are **argument-filtered**: `mmap`/`mprotect` are
+permitted only when `PROT_EXEC` is clear, so a renderer can never turn writable
+memory executable (**W^X**) — the step most memory-corruption exploits need to
+run injected code. Startup is fail-closed too: if the filter can't be
+installed, the component aborts rather than run unconfined, so multi-process
+mode requires seccomp support (use `--single-process` where it's unavailable).
 
 The renderer gets the baseline only: no `socket`/`connect` (no network), no
 `openat` (no file opens — so the filesystem is capped without Landlock), no
@@ -198,13 +206,14 @@ a real security boundary with a process behind them.
 - **Rendezvous**: children inherit one end of a `socketpair(2)` — unforgeable,
   nothing on disk, no token on argv. (Earlier revisions used a socket path +
   argv token; that leaked the token through `/proc/<pid>/cmdline` and is gone.)
-- **Sandboxing**: seccomp-BPF with a default-deny allowlist
-  (`src/sandbox.rs`). Production would go a bit further still — `KillProcess`
-  instead of `EPERM` (a denied syscall should be fatal, not merely fail), a
-  per-arch baseline tested across libc/kernel versions, and truly *fail-closed*
-  startup (refuse to run if the filter can't be installed, rather than warn and
-  continue). Namespaces/`pivot_root` add defense in depth. macOS/Windows need
-  their own mechanisms (Seatbelt, AppContainer).
+- **Sandboxing**: seccomp-BPF with a fail-closed default-deny allowlist
+  (`src/sandbox.rs`) — `KillProcess` on violation, `PROT_EXEC` argument-filtered
+  out of `mmap`/`mprotect` (W^X), and abort-if-uninstallable startup. Production
+  would go further still — a per-arch baseline tested across libc/kernel
+  versions, filesystem restriction (Landlock), and namespaces/`pivot_root` for
+  defense in depth. A real JS JIT needs executable memory, so it would carve out
+  a dedicated JIT exception rather than deny `PROT_EXEC` outright. macOS/Windows
+  need their own mechanisms (Seatbelt, AppContainer).
 - **Fetching**: synthesized responses instead of real HTTP; the net component
   handles one request at a time (the engine doesn't block on it, but a real
   daemon would fetch concurrently).
