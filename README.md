@@ -106,7 +106,13 @@ engine event loop (broker — owns cookie jar & policy)
   exploited `example.com` renderer never sees `example.com`'s session token —
   it travels engine → net and skips the renderer's address space entirely.
 - SSRF policy is centralized in the net component (the one place allowed to
-  open sockets), so no renderer bug can bypass it.
+  open sockets), so no renderer bug can bypass it. It classifies the *numeric*
+  address (loopback, private incl. `172.16/12`, link-local/cloud-metadata,
+  CGNAT, `0.0.0.0/8`, and the IPv6 equivalents), so it isn't fooled by
+  alternate IP encodings (`http://2130706433/`, `0x7f.1`, octal), IPv4-mapped
+  IPv6, userinfo confusion (`http://real.com@127.0.0.1/`), or a trailing dot.
+  It can't resolve *hostnames* offline; a real one resolves DNS, re-checks the
+  resolved IPs, and pins that IP for the connection to defeat DNS rebinding.
 - Renderers are **sandboxed at the OS level** (Linux): after connecting their
   IPC link, they install a default-deny seccomp-BPF **allowlist** permitting
   only a curated baseline (I/O on existing fds, memory, futex, signals, time).
@@ -223,7 +229,9 @@ a real security boundary with a process behind them.
   need their own mechanisms (Seatbelt, AppContainer).
 - **Fetching**: synthesized responses instead of real HTTP; the net component
   handles one request at a time (the engine doesn't block on it, but a real
-  daemon would fetch concurrently).
+  daemon would fetch concurrently). The SSRF filter classifies IP literals but
+  can't resolve hostnames offline — production resolves DNS, re-checks the
+  result, and pins the IP against rebinding (see the isolation section).
 - **Event loop**: std threads + mpsc instead of tokio; the real engine's
   worker loops are `select!`-based async tasks.
 - **Tile transport**: tiles are copied through the socket. At real frame rates
