@@ -208,3 +208,56 @@ fn blocked_v4(v4: Ipv4Addr) -> Option<&'static str> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocks_internal_ranges_and_encoding_bypasses() {
+        for u in [
+            // Standard internal ranges (incl. the previously-missed 172.16/12).
+            "http://127.0.0.1/", "http://10.0.0.5/", "http://172.16.0.1/",
+            "http://172.31.255.9/", "http://192.168.1.1/", "http://169.254.169.254/",
+            "http://0.0.0.0/", "http://100.64.0.1/", "http://255.255.255.255/",
+            // Names that resolve to loopback.
+            "http://localhost/", "http://api.localhost/",
+            // Alternate IPv4 encodings for 127.0.0.1.
+            "http://2130706433/", "http://0x7f000001/", "http://017700000001/", "http://127.1/",
+            // IPv6 internal + IPv4-mapped.
+            "http://[::1]/", "http://[::ffff:169.254.169.254]/", "http://[fc00::1]/", "http://[fe80::1]/",
+            // Parser-confusion: userinfo and trailing dot.
+            "http://real.com@127.0.0.1/", "http://127.0.0.1.:80/",
+        ] {
+            assert!(ssrf_block_reason(u).is_some(), "should block {u}: {:?}", ssrf_block_reason(u));
+        }
+    }
+
+    #[test]
+    fn allows_public_addresses() {
+        for u in [
+            "http://93.184.216.34/", "http://example.com/", "http://8.8.8.8/",
+            "http://172.32.0.1/",   // just outside 172.16/12
+            "http://100.128.0.1/",  // just outside 100.64/10
+            "http://[2606:2800:220:1::1]/",
+        ] {
+            assert!(ssrf_block_reason(u).is_none(), "should allow {u}: {:?}", ssrf_block_reason(u));
+        }
+    }
+
+    #[test]
+    fn host_extraction_sees_the_real_host() {
+        assert_eq!(host_of("http://real.com@127.0.0.1/x").as_deref(), Some("127.0.0.1"));
+        assert_eq!(host_of("http://[::1]:8080/").as_deref(), Some("::1"));
+        assert_eq!(host_of("http://example.com:443/a?b#c").as_deref(), Some("example.com"));
+        assert_eq!(host_of("http://127.0.0.1.:80/").as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn alternate_ipv4_encodings_parse_to_loopback() {
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        for h in ["2130706433", "0x7f000001", "017700000001", "127.1"] {
+            assert_eq!(parse_ip_literal(h), Some(loopback), "{h}");
+        }
+    }
+}

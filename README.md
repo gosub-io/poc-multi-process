@@ -12,6 +12,7 @@ over the same component code, IPC protocol, and policy checks.
 cargo run --release                      # multi-process (default)
 cargo run --release -- --single-process  # same engine, components as threads
 cargo build --no-default-features        # single-process-only binary
+cargo test                               # unit + integration suite (see Tests)
 ```
 
 ### Sandbox: allowlist by default (fail-closed)
@@ -201,6 +202,31 @@ Note: in single-process mode the policy checks still run, but a compromised
 renderer *thread* shares the engine's address space — the checks only become
 a real security boundary with a process behind them.
 
+## Tests
+
+`cargo test` runs two layers:
+
+- **Unit tests** (in `src/`) cover the pure policy/logic deterministically: the
+  SSRF classifier (internal ranges, alternate IP encodings, IPv6,
+  userinfo/trailing-dot bypasses), the cookie broker (`(zone, origin)`
+  partitioning + HttpOnly hiding), IPC frame round-trip and oversized-length
+  rejection, the per-source backpressure `Gate`, and origin parsing. The
+  single-process engine is also driven end to end (open → navigate → frame →
+  close → shutdown, cross-origin refusal, unparseable URL) — the broker/policy
+  code is identical in both modes, so this exercises the real thing.
+- **Integration tests** (`tests/integration.rs`) run the actual built binary:
+  multi- and single-process runs render and shut down cleanly, unknown args are
+  rejected, and (Linux) the children both *announce* and *enforce* their seccomp
+  sandbox — the `selftest` probes confirm that making memory executable
+  (`PROT_EXEC`) and opening a socket are each killed by `SIGSYS`.
+
+Two properties are checked by hand rather than in `cargo test`, as they need
+external tooling: the fork server forking renderers *without* exec (an `execve`
+strace shows only `fork-server`/`net-daemon`, never `renderer`) and the
+per-source inbox bound holding engine RSS flat under a message flood (RSS
+sampling: ~2.8 MB steady vs. ~90 MB/s growth without it). The `Gate` unit test
+covers the bounding mechanism itself deterministically.
+
 ## Layout
 
 | File | Contents |
@@ -212,7 +238,9 @@ a real security boundary with a process behind them.
 | `src/renderer.rs` | Per-`(zone,origin)` renderer: `serve` loop, placeholder render pipeline |
 | `src/fork_server.rs` | Fork server (Linux): `fork()`s renderers without exec; `SCM_RIGHTS` fd-passing |
 | `src/sandbox.rs` | seccomp-BPF privilege capping for the child processes (Linux) |
+| `src/selftest.rs` | Sandbox-enforcement probes spawned by the integration tests (Linux) |
 | `src/main.rs` | Child-role dispatch for re-exec + minimal event-driven usage |
+| `tests/integration.rs` | End-to-end tests running the built binary (both modes + sandbox) |
 
 ## Shortcuts taken (what a real implementation needs instead)
 

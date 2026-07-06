@@ -30,6 +30,8 @@ mod net_daemon;
 mod renderer;
 #[cfg(feature = "multi-process")]
 mod sandbox;
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+mod selftest;
 
 use engine::Mode;
 use events::{EngineEvent, ZoneId};
@@ -62,6 +64,9 @@ fn main() {
         Some("renderer") => renderer::run(&args[2], &args[3]),
         #[cfg(all(feature = "multi-process", target_os = "linux"))]
         Some("fork-server") => fork_server::run(&args[2]),
+        // Internal sandbox self-test, spawned only by the integration suite.
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        Some("selftest") => selftest::run(&args[2]),
         Some(other) => {
             eprintln!("unknown argument: {other}");
             eprintln!("usage: gosub-proc-iso-poc [--single-process | --multi-process]");
