@@ -4,7 +4,23 @@
 //! engine's event loop. Nothing here knows about processes, threads, or
 //! sockets — the isolation architecture is entirely below this layer.
 
-/// Identifies a tab for the lifetime of the engine.
+/// Identifies a **zone**: a storage/security partition (cookies, localStorage)
+/// à la browser profiles / container tabs ("Home", "Work"). All of a zone's
+/// tabs share its cookie jar; different zones are isolated. The engine keys
+/// per-origin state by `(ZoneId, origin)`, and a renderer process is bound to
+/// one `(zone, origin)` so it can never be reused across the partition.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ZoneId(pub u64);
+
+impl std::fmt::Display for ZoneId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "zone-{}", self.0)
+    }
+}
+
+/// Identifies a tab for the lifetime of the engine. A tab lives inside one
+/// zone and (in this PoC) hosts a single frame; a real tab is a frame tree
+/// that can span several `(zone, origin)` renderer processes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TabId(pub u64);
 
@@ -24,15 +40,16 @@ pub struct Tile {
 /// Commands accepted by the engine's event loop.
 #[derive(Debug)]
 pub enum EngineCommand {
-    /// Open a tab for the given URL. Spawns a renderer component for the
-    /// URL's origin; answered by [`EngineEvent::TabOpened`].
-    OpenTab { url: String },
+    /// Open a tab in `zone` for the given URL. Spawns a renderer bound to
+    /// `(zone, origin)`; answered by [`EngineEvent::TabOpened`].
+    OpenTab { zone: ZoneId, url: String },
     /// A command addressed to one tab.
     Tab { tab_id: TabId, cmd: TabCommand },
-    /// Store a cookie in the engine's jar (stand-in for `Set-Cookie`
-    /// arriving via the net component). `http_only` cookies are never exposed
-    /// to a renderer — only the net component sees their values.
-    SetCookie { origin: String, name: String, value: String, http_only: bool },
+    /// Store a cookie in a zone's jar (stand-in for `Set-Cookie` arriving via
+    /// the net component). Keyed by `(zone, origin)`, so the same origin has
+    /// independent cookies in different zones. `http_only` cookies are never
+    /// exposed to a renderer — only the net component sees their values.
+    SetCookie { zone: ZoneId, origin: String, name: String, value: String, http_only: bool },
     /// Gracefully shut down all components and the event loop; answered by
     /// [`EngineEvent::EngineShutdown`].
     Shutdown,
@@ -55,8 +72,8 @@ pub enum TabCommand {
 /// Events emitted by the engine's event loop.
 #[derive(Debug)]
 pub enum EngineEvent {
-    /// A tab (and its per-origin renderer component) is up.
-    TabOpened { tab_id: TabId, origin: String },
+    /// A tab (and its `(zone, origin)` renderer component) is up.
+    TabOpened { tab_id: TabId, zone: ZoneId, origin: String },
     /// `OpenTab` could not be honored (e.g. unparseable URL).
     OpenTabFailed { url: String, reason: String },
     /// A renderer delivered a frame for its tab.

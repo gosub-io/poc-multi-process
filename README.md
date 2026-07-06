@@ -81,11 +81,15 @@ engine event loop (broker — owns cookie jar & policy)
 - Renderers hold no secrets: cookies and network access live in the engine
   and net component. A renderer can only send IPC messages, and every message
   is policy-checked in the event loop (`tab_request`).
-- Identity is ambient, not claimed: the engine knows which origin each tab's
-  renderer belongs to because *it* spawned the component; origin fields inside
-  messages are never trusted. Navigation is same-origin per renderer (site
-  isolation) — a real engine would swap renderer processes on cross-origin
-  navigation.
+- Identity is **`(zone, origin)`**, ambient and not claimed. A *zone* is a
+  storage/cookie partition (browser profile / container tabs — "Work",
+  "Personal"), matching gosub's own `Zone` concept; the engine keys its cookie
+  jar by `(ZoneId, origin)`, and a renderer process is bound to one
+  `(zone, origin)`. So the same origin opened in two zones runs as two separate
+  processes with independent cookie jars — one can never touch the other's
+  partition. The engine knows each tab's `(zone, origin)` because *it* spawned
+  the renderer; identity fields inside messages are never trusted. Navigation
+  is same-origin per renderer (site isolation).
 - **HttpOnly cookies never reach a renderer.** Cookies carry an `http_only`
   flag; the net component receives all of a request's cookies to attach to the
   outbound fetch (it must — that's how authenticated requests work), but a

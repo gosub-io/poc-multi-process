@@ -36,11 +36,12 @@ pub fn serve(mut ep: Endpoint) {
         };
         match req {
             NetRequest::Shutdown => break,
-            NetRequest::Fetch { request_id, for_origin, url, cookies } => {
+            NetRequest::Fetch { request_id, for_zone, for_origin, url, cookies } => {
                 // The request id travels with the reply so the engine can
                 // route it back to the tab that asked, even with many
                 // fetches in flight.
-                let outcome = handle_fetch(&for_origin, &url, &cookies);
+                let requester = format!("zone-{for_zone}/{for_origin}");
+                let outcome = handle_fetch(&requester, &url, &cookies);
                 let resp = NetResponse { request_id, outcome };
                 if ep.send(&resp).is_err() {
                     break;
@@ -50,12 +51,12 @@ pub fn serve(mut ep: Endpoint) {
     }
 }
 
-/// `for_origin` is the requesting renderer's identity as recorded by the
-/// engine; a real implementation uses it for per-origin network policy.
-/// `cookies` are the origin's cookies (including HttpOnly) the engine wants
-/// attached to this request — the net component is the only process outside
-/// the engine that sees their values.
-fn handle_fetch(_for_origin: &str, url: &str, cookies: &[(String, String)]) -> FetchOutcome {
+/// `requester` is the `zone-N/origin` identity as recorded by the engine; a
+/// real implementation uses it for per-partition network policy. `cookies` are
+/// that partition's cookies (including HttpOnly) the engine wants attached to
+/// this request — the net component is the only process outside the engine
+/// that sees their values.
+fn handle_fetch(_requester: &str, url: &str, cookies: &[(String, String)]) -> FetchOutcome {
     if let Some(reason) = ssrf_block_reason(url) {
         return FetchOutcome::Denied { reason };
     }

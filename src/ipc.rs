@@ -54,8 +54,9 @@ pub enum ToRenderer {
 pub enum NetRequest {
     Fetch {
         request_id: u64,
-        /// Stamped by the *engine* from its own bookkeeping, so a compromised
-        /// renderer cannot spoof another origin's identity.
+        /// The `(zone, origin)` identity, stamped by the *engine* from its own
+        /// bookkeeping — a compromised renderer cannot spoof either half.
+        for_zone: u64,
         for_origin: String,
         url: String,
         /// The origin's cookies (name, value) for the net component to attach
