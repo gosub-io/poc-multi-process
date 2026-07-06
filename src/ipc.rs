@@ -24,17 +24,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 /// unbounded memory.
 pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
-/// First message on any child-process connection: the child proves it is the
-/// process the engine just spawned by echoing the one-time token it received
-/// on argv.
-///
-/// A production implementation would instead inherit one end of a
-/// `socketpair(2)` so no rendezvous path or token exists at all; the
-/// path+token dance keeps this PoC dependency-free.
-#[cfg(feature = "multi-process")]
+/// Engine -> fork server (Linux). The engine asks the fork server to `fork()`
+/// a renderer for `origin`; the renderer's IPC fd is passed alongside this
+/// message via `SCM_RIGHTS` (see `fork_server`).
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
 #[derive(Serialize, Deserialize, Debug)]
-pub struct Hello {
-    pub token: String,
+pub enum ForkRequest {
+    Renderer { origin: String },
+    Shutdown,
 }
 
 /// Renderer -> engine.
@@ -67,10 +64,15 @@ pub enum ToRenderer {
 pub enum NetRequest {
     Fetch {
         request_id: u64,
-        /// Stamped by the *engine* from its own bookkeeping, so a compromised
-        /// renderer cannot spoof another origin's identity.
+        /// The `(zone, origin)` identity, stamped by the *engine* from its own
+        /// bookkeeping — a compromised renderer cannot spoof either half.
+        for_zone: u64,
         for_origin: String,
         url: String,
+        /// The origin's cookies (name, value) for the net component to attach
+        /// to the request — *including* HttpOnly ones. These reach the
+        /// network process but never the renderer.
+        cookies: Vec<(String, String)>,
     },
     Shutdown,
 }

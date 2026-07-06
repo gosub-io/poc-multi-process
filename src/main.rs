@@ -23,12 +23,16 @@
 
 mod engine;
 mod events;
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+mod fork_server;
 mod ipc;
 mod net_daemon;
 mod renderer;
+#[cfg(feature = "multi-process")]
+mod sandbox;
 
 use engine::Mode;
-use events::EngineEvent;
+use events::{EngineEvent, ZoneId};
 
 #[cfg(feature = "multi-process")]
 const DEFAULT_MODE: Mode = Mode::Multi;
@@ -49,11 +53,15 @@ fn main() {
                 std::process::exit(2);
             }
         }
-        // Internal child roles, used by the engine to re-exec itself.
+        // Internal child roles, used by the engine to re-exec itself. The
+        // trailing argument is the inherited IPC fd number (see engine.rs).
+        // net-daemon <fd> ; renderer <origin> <fd> ; fork-server <control-fd>
         #[cfg(feature = "multi-process")]
-        Some("net-daemon") => net_daemon::run(&args[2], &args[3]),
+        Some("net-daemon") => net_daemon::run(&args[2]),
         #[cfg(feature = "multi-process")]
-        Some("renderer") => renderer::run(&args[3], &args[2], &args[4]),
+        Some("renderer") => renderer::run(&args[2], &args[3]),
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        Some("fork-server") => fork_server::run(&args[2]),
         Some(other) => {
             eprintln!("unknown argument: {other}");
             eprintln!("usage: gosub-proc-iso-poc [--single-process | --multi-process]");
@@ -66,15 +74,27 @@ fn main() {
 fn run(mode: Mode) {
     let (engine, events) = engine::start(mode);
 
-    engine.set_cookie("example.com", "session", "abc123").unwrap();
-    engine.open_tab("https://example.com").unwrap();
-    engine.open_tab("https://gosub.io").unwrap();
+    // Two zones = two storage/cookie partitions (think "Work" and "Personal").
+    let work = ZoneId(0);
+    let personal = ZoneId(1);
+
+    // Same origin, different zones → independent cookie jars. The session
+    // token is HttpOnly (never exposed to a renderer); the theme is
+    // script-visible.
+    engine.set_cookie(work, "example.com", "session", "work-token", true).unwrap();
+    engine.set_cookie(work, "example.com", "theme", "dark", false).unwrap();
+    engine.set_cookie(personal, "example.com", "session", "personal-token", true).unwrap();
+
+    // example.com opened in both zones runs as two separate renderer processes
+    // bound to (work, example.com) and (personal, example.com).
+    engine.open_tab(work, "https://example.com").unwrap();
+    engine.open_tab(personal, "https://example.com").unwrap();
 
     let mut tabs_closed = 0;
     for event in events {
         match event {
-            EngineEvent::TabOpened { tab_id, origin } => {
-                println!("{tab_id}: opened for {origin}");
+            EngineEvent::TabOpened { tab_id, zone, origin } => {
+                println!("{tab_id} [{zone}]: opened for {origin}");
                 engine.navigate(tab_id, format!("https://{origin}/index.html")).unwrap();
             }
             EngineEvent::FrameReady { tab_id, tile } => {

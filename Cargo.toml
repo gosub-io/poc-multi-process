@@ -16,3 +16,11 @@ multi-process = []
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
+
+# libc: socketpair fd-passing (all Unix) + seccomp syscall numbers (Linux).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# seccomp sandboxing is Linux-only; referenced under cfg(target_os = "linux").
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.4"
