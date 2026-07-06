@@ -216,31 +216,35 @@ a real security boundary with a process behind them.
 
 ## Shortcuts taken (what a real implementation needs instead)
 
-- **Rendezvous**: children inherit one end of a `socketpair(2)` — unforgeable,
-  nothing on disk, no token on argv. (Earlier revisions used a socket path +
-  argv token; that leaked the token through `/proc/<pid>/cmdline` and is gone.)
-- **Sandboxing**: seccomp-BPF with a fail-closed default-deny allowlist
-  (`src/sandbox.rs`) — `KillProcess` on violation, `PROT_EXEC` argument-filtered
-  out of `mmap`/`mprotect` (W^X), and abort-if-uninstallable startup. Production
-  would go further still — a per-arch baseline tested across libc/kernel
+The security *mechanisms* are real (see the isolation section); what's
+simplified is the surrounding browser. What each entry below still needs:
+
+- **Sandboxing**: the seccomp filter is production-shaped (fail-closed
+  allowlist, `KillProcess`, W^X via `PROT_EXEC` argument-filtering). Still
+  missing for a real deployment: a per-arch baseline tested across libc/kernel
   versions, filesystem restriction (Landlock), and namespaces/`pivot_root` for
   defense in depth. A real JS JIT needs executable memory, so it would carve out
-  a dedicated JIT exception rather than deny `PROT_EXEC` outright. macOS/Windows
-  need their own mechanisms (Seatbelt, AppContainer).
+  a dedicated JIT exception rather than deny `PROT_EXEC` outright.
+  macOS/Windows need their own mechanisms (Seatbelt, AppContainer).
 - **Fetching**: synthesized responses instead of real HTTP; the net component
   handles one request at a time (the engine doesn't block on it, but a real
   daemon would fetch concurrently). The SSRF filter classifies IP literals but
   can't resolve hostnames offline — production resolves DNS, re-checks the
-  result, and pins the IP against rebinding (see the isolation section).
-- **Event loop**: std threads + mpsc instead of tokio; the real engine's
-  worker loops are `select!`-based async tasks.
+  result, and pins the IP against rebinding.
+- **Event loop & writes**: std threads + mpsc instead of tokio; the real
+  engine's worker loops are `select!`-based async tasks. The loop's replies to
+  components are *blocking* socket writes, so a renderer that floods requests
+  **and** refuses to read its replies can stall the loop (memory stays bounded —
+  the per-source gates handle that — but responsiveness doesn't). Non-blocking
+  per-channel writes on an async loop fix both.
 - **Tile transport**: tiles are copied through the socket. At real frame rates
-  you'd use shared memory (`memfd` + fd-passing over the socket) and only send
-  the handle.
-- **Origins**: `scheme://host` string prefix, not a real URL parser/origin
-  tuple; cross-origin navigation is refused instead of swapping renderers.
-- Phase 3 (GPU process) is not modeled — structurally it's the same pattern as
-  the net component.
+  you'd use shared memory (`memfd` + fd-passing) and send only the handle — the
+  `SCM_RIGHTS` fd-passing primitive this needs already exists
+  (`fork_server::send_fd`).
+- **Origins**: the engine's `origin_of` is a `scheme://host` string prefix, not
+  a real URL parser/origin tuple, and cross-origin navigation is refused instead
+  of swapping renderers. (Note the inconsistency: the SSRF filter's `host_of`
+  *is* a careful parser — a real engine would share one origin implementation.)
 - **Fork server**: it is `exec`'d fresh (one exec) rather than forked from the
   engine early to inherit the *engine's* warm libraries; the modeled behavior
   is renderers fork-without-exec from a warm process. It is unsandboxed
@@ -248,3 +252,5 @@ a real security boundary with a process behind them.
   real one would also seccomp-confine itself around the `fork()`/fd-passing
   path. Linux only — `fork()`-without-exec + the Rust runtime relies on
   `fork()` semantics. Elsewhere renderers fall back to direct fork+exec.
+- **Phase 3 (GPU process)** is not modeled — structurally it's the same pattern
+  as the net component.
