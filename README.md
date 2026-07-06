@@ -14,6 +14,29 @@ cargo run --release -- --single-process  # same engine, components as threads
 cargo build --no-default-features        # single-process-only binary
 ```
 
+Verify the sandboxes (Linux) — each child tries the same network + exec I/O
+after its filter is installed and reports what the kernel does. The two roles
+have different profiles, so the *same* probe gives different results:
+
+```sh
+GOSUB_POC_PROBE=1 cargo run --release                          # see below
+GOSUB_POC_PROBE=1 GOSUB_POC_NO_SANDBOX=1 cargo run --release   # control: renderer's caps removed
+```
+
+| Probe op | engine (parent) | net component | renderer |
+|----------|-----------------|---------------|----------|
+| `socket()` / `TcpStream::connect` | ALLOWED | ALLOWED (it owns network) | DENIED (EPERM) |
+| `exec /bin/sh` | ALLOWED | DENIED (EPERM) | DENIED (EPERM) |
+| read a file | ALLOWED | ALLOWED | ALLOWED (fs not capped here) |
+
+Privilege *decreases* as you move away from the trusted core: the engine is
+the coordinator (spawns processes, holds secrets, never touches untrusted
+bytes) so it keeps everything; the net component gets exactly network and
+nothing else; the renderer — the one process that parses attacker-controlled
+input — gets neither network nor exec. `GOSUB_POC_NO_SANDBOX=1` skips the
+renderer's filter so its probe succeeds too, proving the denials are the
+seccomp filter, not the environment.
+
 ## Event-driven engine
 
 Mirroring gosub-engine's `EngineCommand`/`TabCommand`/`EngineEvent` shape
@@ -72,6 +95,12 @@ engine event loop (broker — owns cookie jar & policy)
   navigation.
 - SSRF policy is centralized in the net component (the one place allowed to
   open sockets), so no renderer bug can bypass it.
+- Renderers are **sandboxed at the OS level** (Linux): after connecting their
+  IPC link, they install a seccomp-BPF filter that denies `socket`, `connect`,
+  `execve`, `ptrace`, etc. A renderer — even one fully code-exec'd by an
+  exploit — physically cannot open a network socket; the kernel returns
+  `EPERM`. See `src/sandbox.rs`. The net component keeps network access but
+  still drops exec/ptrace.
 - A crashed renderer surfaces as `EngineEvent::TabCrashed` for that tab only;
   the engine and all other tabs keep running (in multi-process mode).
 
@@ -111,6 +140,7 @@ a real security boundary with a process behind them.
 | `src/ipc.rs` | `Endpoint` tx/rx halves (socket/local transports), wire messages, bincode framing |
 | `src/net_daemon.rs` | Net component: `serve` loop, SSRF policy, (synthesized) fetching |
 | `src/renderer.rs` | Per-origin renderer: `serve` loop, placeholder render pipeline |
+| `src/sandbox.rs` | seccomp-BPF privilege capping for the child processes (Linux) |
 | `src/main.rs` | Child-role dispatch for re-exec + minimal event-driven usage |
 
 ## Shortcuts taken (what a real implementation needs instead)
@@ -118,9 +148,12 @@ a real security boundary with a process behind them.
 - **Rendezvous**: children connect to a socket path and authenticate with an
   argv token. Real implementation: inherit one end of `socketpair(2)` —
   unforgeable, nothing on disk.
-- **Sandboxing**: the renderer merely *doesn't* do network/file I/O; nothing
-  stops it. Real implementation: seccomp-BPF/Landlock (Linux) so the syscalls
-  are actually denied, plus namespaces/pledge equivalents per platform.
+- **Sandboxing**: seccomp-BPF now denies the sharpest syscalls
+  (`src/sandbox.rs`), but a production sandbox goes further — a syscall
+  *allowlist* rather than this focused denylist, filesystem restriction
+  (Landlock), pid/net namespaces, `pivot_root`, and *fail-closed* behavior
+  (refuse to run if the sandbox can't be installed, rather than warn and
+  continue). macOS/Windows need their own mechanisms (Seatbelt, AppContainer).
 - **Fetching**: synthesized responses instead of real HTTP; the net component
   handles one request at a time (the engine doesn't block on it, but a real
   daemon would fetch concurrently).

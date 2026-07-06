@@ -16,6 +16,14 @@ pub fn run(socket_path: &str, token: &str) {
 
     let mut stream = UnixStream::connect(socket_path).expect("net: connect to engine");
     ipc::send_msg(&mut stream, &Hello { token: token.to_string() }).unwrap();
+    // The net component keeps network access (it is the one process that has
+    // it) but still drops exec/ptrace.
+    crate::sandbox::lock_down_net();
+    // Optional live demonstration: same probe as the renderer, but here
+    // network is expected to be ALLOWED and only exec DENIED.
+    if std::env::var_os("GOSUB_POC_PROBE").is_some() {
+        crate::sandbox::probe_io("net");
+    }
     serve(Endpoint::from_stream(stream).expect("net: split stream"));
 }
 

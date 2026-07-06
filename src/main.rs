@@ -26,6 +26,8 @@ mod events;
 mod ipc;
 mod net_daemon;
 mod renderer;
+#[cfg(feature = "multi-process")]
+mod sandbox;
 
 use engine::Mode;
 use events::EngineEvent;
@@ -65,6 +67,14 @@ fn main() {
 /// Minimal event-driven usage: send commands, react to events.
 fn run(mode: Mode) {
     let (engine, events) = engine::start(mode);
+
+    // Optional: probe the engine (parent/broker) process itself. Unlike the
+    // children it is deliberately NOT sandboxed — it is the trusted core that
+    // spawns processes and holds secrets, and it never parses untrusted bytes.
+    #[cfg(feature = "multi-process")]
+    if std::env::var_os("GOSUB_POC_PROBE").is_some() {
+        sandbox::probe_io("engine");
+    }
 
     engine.set_cookie("example.com", "session", "abc123").unwrap();
     engine.open_tab("https://example.com").unwrap();

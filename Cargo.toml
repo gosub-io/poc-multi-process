@@ -16,3 +16,10 @@ multi-process = []
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
+
+# Renderer/net syscall sandboxing (multi-process mode). Linux-only: seccomp
+# has no equivalent elsewhere, and these are only referenced under
+# `cfg(target_os = "linux")` in src/sandbox.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.4"
+libc = "0.2"
