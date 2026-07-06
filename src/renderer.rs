@@ -22,20 +22,13 @@ pub fn run(socket_path: &str, origin: &str, token: &str) {
 
     let mut stream = UnixStream::connect(socket_path).expect("renderer: connect to engine");
     ipc::send_msg(&mut stream, &Hello { token: token.to_string() }).unwrap();
+    // Split the endpoint *before* sandboxing: try_clone() does a dup, which
+    // the allowlist deliberately does not permit at run time.
+    let ep = Endpoint::from_stream(stream).expect("renderer: split stream");
     // Drop privileges now that the IPC link is established: from here on the
-    // renderer can only push pixels, not open sockets or exec programs.
-    // (GOSUB_POC_NO_SANDBOX skips this — a control for the probe below, to
-    // show the same operations succeed when the cap is absent.)
-    if std::env::var_os("GOSUB_POC_NO_SANDBOX").is_none() {
-        crate::sandbox::lock_down_renderer();
-    } else {
-        eprintln!("[renderer] WARNING: sandbox DISABLED (GOSUB_POC_NO_SANDBOX)");
-    }
-    // Optional live demonstration that the cap is enforced.
-    if std::env::var_os("GOSUB_POC_PROBE").is_some() {
-        crate::sandbox::probe_io("renderer");
-    }
-    serve(Endpoint::from_stream(stream).expect("renderer: split stream"), origin);
+    // renderer can only push pixels, not open sockets, files, or programs.
+    crate::sandbox::lock_down_renderer();
+    serve(ep, origin);
 }
 
 /// The component loop — identical in both modes.

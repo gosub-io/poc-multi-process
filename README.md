@@ -14,28 +14,21 @@ cargo run --release -- --single-process  # same engine, components as threads
 cargo build --no-default-features        # single-process-only binary
 ```
 
-Verify the sandboxes (Linux) — each child tries the same network + exec I/O
-after its filter is installed and reports what the kernel does. The two roles
-have different profiles, so the *same* probe gives different results:
+### Sandbox: allowlist by default (fail-closed)
 
-```sh
-GOSUB_POC_PROBE=1 cargo run --release                          # see below
-GOSUB_POC_PROBE=1 GOSUB_POC_NO_SANDBOX=1 cargo run --release   # control: renderer's caps removed
-```
+Each child installs a seccomp-BPF filter after connecting its IPC link. It is
+a default-deny **allowlist**: the component's legitimate syscalls are
+enumerated and everything else returns `EPERM`. This is fail-closed — a
+syscall we never considered (a new one, or a bypass such as io_uring-based
+networking) is denied for free — which is what real renderer sandboxes
+(Chromium, Firefox) do. `src/sandbox.rs` holds the curated baseline.
 
-| Probe op | engine (parent) | net component | renderer |
-|----------|-----------------|---------------|----------|
-| `socket()` / `TcpStream::connect` | ALLOWED | ALLOWED (it owns network) | DENIED (EPERM) |
-| `exec /bin/sh` | ALLOWED | DENIED (EPERM) | DENIED (EPERM) |
-| read a file | ALLOWED | ALLOWED | ALLOWED (fs not capped here) |
-
-Privilege *decreases* as you move away from the trusted core: the engine is
-the coordinator (spawns processes, holds secrets, never touches untrusted
-bytes) so it keeps everything; the net component gets exactly network and
-nothing else; the renderer — the one process that parses attacker-controlled
-input — gets neither network nor exec. `GOSUB_POC_NO_SANDBOX=1` skips the
-renderer's filter so its probe succeeds too, proving the denials are the
-seccomp filter, not the environment.
+The renderer gets the baseline only: no `socket`/`connect` (no network), no
+`openat` (no file opens — so the filesystem is capped without Landlock), no
+`execve`/`clone` (no subprocesses), no `io_uring_*`. The net component gets the
+same baseline plus the socket family, since it owns network access. The engine
+(parent) is unsandboxed on purpose — it is the trusted core that spawns
+processes and holds secrets, and it never parses untrusted bytes.
 
 ## Event-driven engine
 
@@ -96,11 +89,12 @@ engine event loop (broker — owns cookie jar & policy)
 - SSRF policy is centralized in the net component (the one place allowed to
   open sockets), so no renderer bug can bypass it.
 - Renderers are **sandboxed at the OS level** (Linux): after connecting their
-  IPC link, they install a seccomp-BPF filter that denies `socket`, `connect`,
-  `execve`, `ptrace`, etc. A renderer — even one fully code-exec'd by an
-  exploit — physically cannot open a network socket; the kernel returns
-  `EPERM`. See `src/sandbox.rs`. The net component keeps network access but
-  still drops exec/ptrace.
+  IPC link, they install a default-deny seccomp-BPF **allowlist** permitting
+  only a curated baseline (I/O on existing fds, memory, futex, signals, time).
+  A renderer — even one fully code-exec'd by an exploit — physically cannot
+  open a socket, an io_uring instance, a file, or a subprocess; the kernel
+  returns `EPERM`. See `src/sandbox.rs`. The net component gets the same
+  baseline plus the socket family.
 - A crashed renderer surfaces as `EngineEvent::TabCrashed` for that tab only;
   the engine and all other tabs keep running (in multi-process mode).
 
@@ -148,12 +142,13 @@ a real security boundary with a process behind them.
 - **Rendezvous**: children connect to a socket path and authenticate with an
   argv token. Real implementation: inherit one end of `socketpair(2)` —
   unforgeable, nothing on disk.
-- **Sandboxing**: seccomp-BPF now denies the sharpest syscalls
-  (`src/sandbox.rs`), but a production sandbox goes further — a syscall
-  *allowlist* rather than this focused denylist, filesystem restriction
-  (Landlock), pid/net namespaces, `pivot_root`, and *fail-closed* behavior
-  (refuse to run if the sandbox can't be installed, rather than warn and
-  continue). macOS/Windows need their own mechanisms (Seatbelt, AppContainer).
+- **Sandboxing**: seccomp-BPF with a default-deny allowlist
+  (`src/sandbox.rs`). Production would go a bit further still — `KillProcess`
+  instead of `EPERM` (a denied syscall should be fatal, not merely fail), a
+  per-arch baseline tested across libc/kernel versions, and truly *fail-closed*
+  startup (refuse to run if the filter can't be installed, rather than warn and
+  continue). Namespaces/`pivot_root` add defense in depth. macOS/Windows need
+  their own mechanisms (Seatbelt, AppContainer).
 - **Fetching**: synthesized responses instead of real HTTP; the net component
   handles one request at a time (the engine doesn't block on it, but a real
   daemon would fetch concurrently).

@@ -68,14 +68,6 @@ fn main() {
 fn run(mode: Mode) {
     let (engine, events) = engine::start(mode);
 
-    // Optional: probe the engine (parent/broker) process itself. Unlike the
-    // children it is deliberately NOT sandboxed — it is the trusted core that
-    // spawns processes and holds secrets, and it never parses untrusted bytes.
-    #[cfg(feature = "multi-process")]
-    if std::env::var_os("GOSUB_POC_PROBE").is_some() {
-        sandbox::probe_io("engine");
-    }
-
     engine.set_cookie("example.com", "session", "abc123").unwrap();
     engine.open_tab("https://example.com").unwrap();
     engine.open_tab("https://gosub.io").unwrap();
