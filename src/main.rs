@@ -99,10 +99,11 @@ fn run(mode: Mode) {
 
     // Same origin, different zones → independent cookie jars. The session
     // token is HttpOnly (never exposed to a renderer); the theme is
-    // script-visible.
-    engine.set_cookie(work, "example.com", "session", "work-token", true).unwrap();
-    engine.set_cookie(work, "example.com", "theme", "dark", false).unwrap();
-    engine.set_cookie(personal, "example.com", "session", "personal-token", true).unwrap();
+    // script-visible. Origins are the full scheme://host[:port] tuple, so
+    // these cookies can never be attached to an http:// fetch.
+    engine.set_cookie(work, "https://example.com", "session", "work-token", true).unwrap();
+    engine.set_cookie(work, "https://example.com", "theme", "dark", false).unwrap();
+    engine.set_cookie(personal, "https://example.com", "session", "personal-token", true).unwrap();
 
     // example.com opened in both zones runs as two separate renderer processes
     // bound to (work, example.com) and (personal, example.com).
@@ -120,7 +121,8 @@ fn run(mode: Mode) {
                 // The renderer reports the body transport + round-trip check
                 // on stderr.
                 let path = if zone == personal { "blob/4" } else { "index.html" };
-                engine.navigate(tab_id, format!("https://{origin}/{path}")).unwrap();
+                // `origin` is already scheme://host[:port].
+                engine.navigate(tab_id, format!("{origin}/{path}")).unwrap();
             }
             EngineEvent::FrameReady { tab_id, tile } => {
                 println!(

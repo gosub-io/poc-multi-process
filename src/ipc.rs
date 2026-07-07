@@ -302,12 +302,22 @@ pub unsafe fn send_fd(sock_fd: RawFd, fd: RawFd) -> io::Result<()> {
 /// `CLOEXEC` (`MSG_CMSG_CLOEXEC`) and returned owned, so an early return in
 /// the caller can never leak it.
 ///
+/// The kernel installs **every** fd the peer attached into this process's fd
+/// table before we ever look at the message, so this walks all control
+/// messages and wraps every received fd in an `OwnedFd` *first*, then
+/// enforces the protocol: exactly one fd. A peer stuffing extra fds into the
+/// hand-off (or overflowing the control buffer, `MSG_CTRUNC`) gets a refusal
+/// and every received fd closed — without this, each malicious message would
+/// leak descriptors into the engine until its fd table is exhausted.
+///
 /// SAFETY: `sock_fd` must be a valid open descriptor.
 #[cfg(feature = "multi-process")]
 pub unsafe fn recv_fd(sock_fd: RawFd) -> io::Result<OwnedFd> {
     let mut byte = [0u8; 1];
     let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
-    let mut cmsg = [0u8; 32];
+    // Room for several fds on purpose: a smuggling attempt should be *seen*
+    // (received, counted, closed) rather than silently truncated.
+    let mut cmsg = [0u8; 64];
 
     let mut msg: libc::msghdr = std::mem::zeroed();
     msg.msg_iov = &mut iov;
@@ -323,16 +333,41 @@ pub unsafe fn recv_fd(sock_fd: RawFd) -> io::Result<OwnedFd> {
     if n <= 0 {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no fd received"));
     }
-    let cmsgp = libc::CMSG_FIRSTHDR(&msg);
-    if cmsgp.is_null()
-        || (*cmsgp).cmsg_type != libc::SCM_RIGHTS
-        || (*cmsgp).cmsg_level != libc::SOL_SOCKET
-    {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "no SCM_RIGHTS cmsg"));
+
+    // Adopt every fd across every SCM_RIGHTS cmsg (each may carry several)
+    // before any verdict, so whatever is rejected below is closed, not leaked.
+    let mut fds: Vec<OwnedFd> = Vec::new();
+    let mut cmsgp = libc::CMSG_FIRSTHDR(&msg);
+    while !cmsgp.is_null() {
+        if (*cmsgp).cmsg_level == libc::SOL_SOCKET && (*cmsgp).cmsg_type == libc::SCM_RIGHTS {
+            let payload = (*cmsgp).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+            let data = libc::CMSG_DATA(cmsgp).cast::<RawFd>();
+            for i in 0..payload / std::mem::size_of::<RawFd>() {
+                let mut fd: RawFd = -1;
+                std::ptr::copy_nonoverlapping(data.add(i), &mut fd, 1);
+                if fd >= 0 {
+                    fds.push(OwnedFd::from_raw_fd(fd));
+                }
+            }
+        }
+        cmsgp = libc::CMSG_NXTHDR(&msg, cmsgp);
     }
-    let mut fd: RawFd = -1;
-    std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cmsgp).cast::<RawFd>(), &mut fd, 1);
-    Ok(OwnedFd::from_raw_fd(fd))
+
+    // Truncated control data = the peer attached more than even the roomy
+    // buffer holds; the kernel closed the overflow, we close the rest here.
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control data truncated (peer attached too many fds)",
+        ));
+    }
+    if fds.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected exactly 1 fd in the hand-off, got {}", fds.len()),
+        ));
+    }
+    Ok(fds.pop().expect("checked len"))
 }
 
 #[cfg(test)]
@@ -359,6 +394,64 @@ mod tests {
         let back: NetResponse = recv_msg(&mut cur).unwrap();
         assert_eq!(back.request_id, 42);
         assert!(matches!(back.outcome, FetchOutcome::Ok { status: 200, .. }));
+    }
+
+    /// Hand-rolled sendmsg attaching `fds` to ONE SCM_RIGHTS cmsg — what a
+    /// compromised peer (sendmsg is on its allowlist) can do to smuggle
+    /// descriptors into the fd hand-off.
+    #[cfg(feature = "multi-process")]
+    unsafe fn send_fds_one_cmsg(sock_fd: std::os::fd::RawFd, fds: &[std::os::fd::RawFd]) {
+        let mut byte = [0u8; 1];
+        let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+        let payload = std::mem::size_of_val(fds) as u32;
+        let mut buf = vec![0u8; libc::CMSG_SPACE(payload) as usize];
+
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = buf.as_mut_ptr().cast();
+        msg.msg_controllen = buf.len() as _;
+
+        let cmsgp = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsgp).cmsg_level = libc::SOL_SOCKET;
+        (*cmsgp).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsgp).cmsg_len = libc::CMSG_LEN(payload) as _;
+        std::ptr::copy_nonoverlapping(
+            fds.as_ptr(),
+            libc::CMSG_DATA(cmsgp).cast::<std::os::fd::RawFd>(),
+            fds.len(),
+        );
+        assert!(libc::sendmsg(sock_fd, &msg, 0) >= 0, "{}", io::Error::last_os_error());
+    }
+
+    #[cfg(feature = "multi-process")]
+    #[test]
+    fn recv_fd_roundtrips_exactly_one() {
+        let (a, b) = UnixStream::pair().unwrap();
+        unsafe { send_fd(a.as_raw_fd(), 2).unwrap() }; // stderr as a stand-in
+        let fd = unsafe { recv_fd(b.as_raw_fd()) }.unwrap();
+        assert!(fd.as_raw_fd() >= 0);
+    }
+
+    #[cfg(feature = "multi-process")]
+    #[test]
+    fn recv_fd_rejects_smuggled_extra_fds() {
+        // Several fds stuffed into the one-fd hand-off must be refused — and
+        // the extras closed, not leaked into the receiver's fd table (the
+        // OwnedFd-before-verdict adoption in recv_fd is what guarantees the
+        // close; this pins the refusal).
+        let (a, b) = UnixStream::pair().unwrap();
+        unsafe { send_fds_one_cmsg(a.as_raw_fd(), &[2, 2, 2]) };
+        assert!(unsafe { recv_fd(b.as_raw_fd()) }.is_err());
+    }
+
+    #[cfg(feature = "multi-process")]
+    #[test]
+    fn recv_fd_rejects_data_without_fd() {
+        use std::io::Write;
+        let (mut a, b) = UnixStream::pair().unwrap();
+        a.write_all(&[0u8]).unwrap(); // plain byte, no SCM_RIGHTS attached
+        assert!(unsafe { recv_fd(b.as_raw_fd()) }.is_err());
     }
 
     #[cfg(feature = "multi-process")]

@@ -39,10 +39,13 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 /// RGBA8.
 pub const BYTES_PER_PIXEL: usize = 4;
 
-/// Upper bound on either tile dimension the consumer will accept (8192² × 4 =
-/// 256 MiB) — far above the PoC's 512², but a ceiling on how much memory a
-/// malicious renderer's "tile" can make the engine map.
-pub const MAX_TILE_DIM: u32 = 8192;
+/// Upper bound on either tile dimension the consumer will accept. 2048² × 4
+/// = 16 MiB — deliberately the same ceiling `MAX_FRAME_LEN` puts on an
+/// in-band tile, so the shared-memory path never lets a renderer pin *more*
+/// engine memory per message than the socket path already could; the
+/// per-source gate then bounds how many such messages are in flight, exactly
+/// as it does for copied tiles.
+pub const MAX_TILE_DIM: u32 = 2048;
 
 /// The seals a consumer must see before touching the pages: size fixed in
 /// both directions, contents immutable.

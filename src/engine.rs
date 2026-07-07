@@ -657,15 +657,53 @@ fn join(handle: ChildHandle) {
     }
 }
 
-/// `scheme://host` -> `host`. Good enough for the PoC; a real engine uses a
-/// proper URL parser and the full origin tuple (scheme, host, port).
+/// Canonical origin of a URL: `scheme://host[:port]`, with the scheme's
+/// default port folded away — so `https://example.com:443` and
+/// `https://example.com` are the same origin, while a different scheme or a
+/// nonstandard port is a *different* origin. That full tuple is what the
+/// origin model is defined over, and everything downstream keys on it: the
+/// same-origin navigation check, and the cookie jar's `(zone, origin)`
+/// partition — so an HTTPS page's cookies can never be attached to an HTTP
+/// fetch (no secure-cookie downgrade), and an `https:` renderer can't be
+/// navigated to `http:`. Still a PoC parser, not a URL library: no IDNA and
+/// no userinfo handling (`net_daemon::host_of` is the deliberately-hostile
+/// one; a real engine shares one implementation).
 fn origin_of(url: &str) -> Option<String> {
-    let rest = url.split("://").nth(1)?;
-    let host = rest.split('/').next()?;
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        // [IPv6] or [IPv6]:port
+        let (host, after) = bracketed.split_once(']')?;
+        (host, after.strip_prefix(':'))
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        (host, Some(port))
+    } else {
+        (authority, None)
+    };
     if host.is_empty() {
         return None;
     }
-    Some(host.to_string())
+
+    let scheme = scheme.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    let port: Option<u16> = match port {
+        Some(p) => Some(p.parse().ok()?), // a non-numeric port is not a URL
+        None => None,
+    };
+    let default_port = match scheme.as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
+    Some(match port {
+        Some(p) if Some(p) != default_port => format!("{scheme}://{host}:{p}"),
+        _ => format!("{scheme}://{host}"),
+    })
 }
 
 /// Site-isolation gate for fetches: a renderer bound to `tab_origin` may only
@@ -881,10 +919,23 @@ mod tests {
 
     #[test]
     fn origin_extraction() {
-        assert_eq!(origin_of("https://example.com/a/b").as_deref(), Some("example.com"));
-        assert_eq!(origin_of("https://example.com").as_deref(), Some("example.com"));
+        assert_eq!(origin_of("https://example.com/a/b").as_deref(), Some("https://example.com"));
+        assert_eq!(origin_of("https://example.com").as_deref(), Some("https://example.com"));
+        // Default port folds into the schemeful origin; a nonstandard port —
+        // or a different scheme — is a different origin.
+        assert_eq!(origin_of("https://example.com:443/x").as_deref(), Some("https://example.com"));
+        assert_eq!(
+            origin_of("https://example.com:8443/x").as_deref(),
+            Some("https://example.com:8443")
+        );
+        assert_eq!(origin_of("http://example.com/").as_deref(), Some("http://example.com"));
+        assert_ne!(origin_of("http://example.com/"), origin_of("https://example.com/"));
+        // Case-insensitive scheme/host, IPv6 hosts keep their port handling.
+        assert_eq!(origin_of("HTTPS://Example.COM/x").as_deref(), Some("https://example.com"));
+        assert_eq!(origin_of("http://[::1]:8080/x").as_deref(), Some("http://::1:8080"));
         assert_eq!(origin_of("not-a-url"), None);
         assert_eq!(origin_of("https://"), None);
+        assert_eq!(origin_of("https://example.com:notaport/"), None);
     }
 
     #[test]
@@ -965,7 +1016,7 @@ mod tests {
             match ev {
                 EngineEvent::TabOpened { tab_id, origin, .. } => {
                     opened = true;
-                    assert_eq!(origin, "example.com");
+                    assert_eq!(origin, "https://example.com");
                     engine.navigate(tab_id, "https://example.com/x").unwrap();
                 }
                 EngineEvent::FrameReady { tab_id, tile } => {
