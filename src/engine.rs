@@ -25,7 +25,7 @@
 //! this address space, so the policy checks are only a real barrier when a
 //! process boundary stands behind them.
 
-use crate::events::{EngineCommand, EngineEvent, TabCommand, TabId, Tile, ZoneId};
+use crate::events::{EngineCommand, EngineEvent, TabCommand, TabId, Tile, TilePixels, ZoneId};
 use crate::ipc::{
     self, Endpoint, EndpointTx, FetchOutcome, FromRenderer, NetRequest, NetResponse, ToRenderer,
 };
@@ -108,6 +108,11 @@ enum LoopMsg {
     Command(EngineCommand),
     /// A renderer sent a message (forwarded by its reader thread).
     FromTab { tab_id: TabId, msg: FromRenderer },
+    /// A renderer delivered a tile via shared memory; its reader thread
+    /// already received the fd, validated it (seals + real size) and mapped
+    /// it, so what reaches the loop is a ready, immutable tile.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    ShmTile { tab_id: TabId, tile: Tile },
     /// A renderer's link died without a shutdown — crash, most likely.
     TabGone { tab_id: TabId },
     /// The net component answered a fetch.
@@ -324,6 +329,19 @@ impl EngineLoop {
                         gate.release();
                     }
                 }
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                LoopMsg::ShmTile { tab_id, tile } => {
+                    let gate = self.tabs.get(&tab_id).map(|t| Arc::clone(&t.gate));
+                    if gate.is_some() {
+                        // Zero-copy hand-off: the event carries the mapping
+                        // itself, and the mapping (+ pages) is freed when the
+                        // consumer drops the Tile.
+                        self.emit(EngineEvent::FrameReady { tab_id, tile });
+                    }
+                    if let Some(gate) = gate {
+                        gate.release();
+                    }
+                }
                 LoopMsg::TabGone { tab_id } => {
                     // Only a crash if we didn't remove the tab ourselves
                     // (close/shutdown also end the link, after removal).
@@ -373,6 +391,35 @@ impl EngineLoop {
             std::thread::spawn(move || {
                 loop {
                     match rx.recv::<FromRenderer>() {
+                        // A shared-memory tile: the fd follows the message on
+                        // the same socket, so this thread — the socket's only
+                        // reader — receives and validates it here. The message
+                        // dimensions are a claim; map_sealed_tile refuses an
+                        // fd that isn't sealed or can't actually hold them. A
+                        // tile that fails validation is a protocol violation:
+                        // drop the link and report the tab gone.
+                        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                        Ok(FromRenderer::TileShm { width, height }) => {
+                            let mapped = rx
+                                .recv_fd()
+                                .and_then(|fd| crate::shm::map_sealed_tile(fd, width, height));
+                            match mapped {
+                                Ok(mapping) => {
+                                    if !gate.acquire() {
+                                        return;
+                                    }
+                                    let tile =
+                                        Tile { width, height, pixels: TilePixels::Shared(mapping) };
+                                    if inbox.send(LoopMsg::ShmTile { tab_id, tile }).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[engine] {tab_id}: rejected shm tile: {e}");
+                                    break;
+                                }
+                            }
+                        }
                         Ok(msg) => {
                             if !gate.acquire() {
                                 return;
@@ -485,9 +532,13 @@ impl EngineLoop {
             FromRenderer::Tile { width, height, pixels } => {
                 self.emit(EngineEvent::FrameReady {
                     tab_id,
-                    tile: Tile { width, height, pixels },
+                    tile: Tile { width, height, pixels: TilePixels::Inline(pixels) },
                 });
             }
+            // Consumed (fd received, validated, mapped) by the reader thread;
+            // never reaches the loop as a FromTab message.
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            FromRenderer::TileShm { .. } => {}
         }
     }
 
@@ -662,7 +713,7 @@ impl Spawner {
                     // SCM_RIGHTS duplicates the fd into the fork server; the
                     // engine then drops its copy of the child's end so it sees
                     // EOF (→ TabCrashed) when the renderer dies.
-                    unsafe { crate::fork_server::send_fd(fork_control.as_raw_fd(), child_end.as_raw_fd()) }
+                    unsafe { ipc::send_fd(fork_control.as_raw_fd(), child_end.as_raw_fd()) }
                         .expect("send fd");
                     drop(child_end);
                     let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");

@@ -17,6 +17,8 @@ use std::io;
 #[cfg(feature = "multi-process")]
 use std::io::{Read, Write};
 #[cfg(feature = "multi-process")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(feature = "multi-process")]
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -43,8 +45,15 @@ pub enum FromRenderer {
     /// Renderers hold no cookie jar (Phase 2). The engine enforces
     /// same-origin using the *endpoint identity*, never this field.
     NeedCookies { origin: String },
-    /// The final product of a `RenderPage` command: a rasterized tile.
+    /// The final product of a `RenderPage` command: a rasterized tile,
+    /// copied in-band through the message itself.
     Tile { width: u32, height: u32, pixels: Vec<u8> },
+    /// The same product via shared memory (Linux): only the dimensions travel
+    /// in-band; the sealed memfd holding the pixels follows immediately as an
+    /// `SCM_RIGHTS` fd (see `shm`). The dimensions are a *claim* — the engine
+    /// validates the received fd's seals and real size against them.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    TileShm { width: u32, height: u32 },
 }
 
 /// Engine -> renderer.
@@ -105,6 +114,29 @@ pub enum EndpointRx {
 }
 
 impl EndpointTx {
+    /// Whether this endpoint can carry file descriptors (`SCM_RIGHTS`) — true
+    /// for the socket transport, false for in-process channels, where shared
+    /// memory would be pointless anyway (same address space). Only the
+    /// shared-memory tile path asks (hence the cfg).
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    pub fn supports_fd_passing(&self) -> bool {
+        matches!(self, EndpointTx::Socket(_))
+    }
+
+    /// Pass a duplicate of `fd` to the peer. The caller keeps (and should
+    /// promptly close) its own copy.
+    #[cfg(feature = "multi-process")]
+    pub fn send_fd(&mut self, fd: RawFd) -> io::Result<()> {
+        match self {
+            // SAFETY: both descriptors are valid — the stream is live and the
+            // caller owns `fd`.
+            EndpointTx::Socket(stream) => unsafe { send_fd(stream.as_raw_fd(), fd) },
+            EndpointTx::Local(_) => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "no fd passing on local channels"))
+            }
+        }
+    }
+
     pub fn send<T: Serialize>(&mut self, msg: &T) -> io::Result<()> {
         match self {
             #[cfg(feature = "multi-process")]
@@ -123,6 +155,19 @@ impl EndpointTx {
 }
 
 impl EndpointRx {
+    /// Receive a file descriptor the peer announced (e.g. right after a
+    /// `TileShm` message). Fails on local channels, which never carry fds.
+    #[cfg(feature = "multi-process")]
+    pub fn recv_fd(&mut self) -> io::Result<OwnedFd> {
+        match self {
+            // SAFETY: the stream is a valid open descriptor.
+            EndpointRx::Socket(stream) => unsafe { recv_fd(stream.as_raw_fd()) },
+            EndpointRx::Local(_) => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, "no fd passing on local channels"))
+            }
+        }
+    }
+
     pub fn recv<T: DeserializeOwned>(&mut self) -> io::Result<T> {
         match self {
             #[cfg(feature = "multi-process")]
@@ -211,6 +256,72 @@ pub fn recv_msg<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<T> {
     let mut payload = vec![0u8; len as usize];
     r.read_exact(&mut payload)?;
     bincode::deserialize(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Send one file descriptor over a Unix socket via `SCM_RIGHTS`, with a 1-byte
+/// dummy payload (fd-passing must carry at least one data byte). The kernel
+/// duplicates the fd into the receiver; the sender keeps its own copy.
+///
+/// SAFETY: `sock_fd` and `fd` must be valid open descriptors.
+#[cfg(feature = "multi-process")]
+pub unsafe fn send_fd(sock_fd: RawFd, fd: RawFd) -> io::Result<()> {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+    let mut cmsg = [0u8; 32]; // > CMSG_SPACE(size_of::<RawFd>())
+
+    let mut msg: libc::msghdr = std::mem::zeroed();
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr().cast();
+    msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as _;
+
+    let cmsgp = libc::CMSG_FIRSTHDR(&msg);
+    (*cmsgp).cmsg_level = libc::SOL_SOCKET;
+    (*cmsgp).cmsg_type = libc::SCM_RIGHTS;
+    (*cmsgp).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
+    std::ptr::copy_nonoverlapping(&fd, libc::CMSG_DATA(cmsgp).cast::<RawFd>(), 1);
+
+    if libc::sendmsg(sock_fd, &msg, 0) < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Receive one file descriptor sent via [`send_fd`]. The new fd is created
+/// `CLOEXEC` (`MSG_CMSG_CLOEXEC`) and returned owned, so an early return in
+/// the caller can never leak it.
+///
+/// SAFETY: `sock_fd` must be a valid open descriptor.
+#[cfg(feature = "multi-process")]
+pub unsafe fn recv_fd(sock_fd: RawFd) -> io::Result<OwnedFd> {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+    let mut cmsg = [0u8; 32];
+
+    let mut msg: libc::msghdr = std::mem::zeroed();
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr().cast();
+    msg.msg_controllen = cmsg.len() as _;
+
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    let n = libc::recvmsg(sock_fd, &mut msg, flags);
+    if n <= 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no fd received"));
+    }
+    let cmsgp = libc::CMSG_FIRSTHDR(&msg);
+    if cmsgp.is_null()
+        || (*cmsgp).cmsg_type != libc::SCM_RIGHTS
+        || (*cmsgp).cmsg_level != libc::SOL_SOCKET
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "no SCM_RIGHTS cmsg"));
+    }
+    let mut fd: RawFd = -1;
+    std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cmsgp).cast::<RawFd>(), &mut fd, 1);
+    Ok(OwnedFd::from_raw_fd(fd))
 }
 
 #[cfg(test)]

@@ -39,6 +39,23 @@ pub fn run(probe: &str) {
             std::process::exit(0);
         },
 
+        // The full shared-memory tile producer dance (memfd_create, ftruncate,
+        // mmap write, munmap, fcntl F_ADD_SEALS) must survive the sandbox —
+        // it's how a confined renderer ships every frame. Clean exit = pass.
+        "memfd-seal" => {
+            crate::shm::create_sealed_tile(64, 64, |buf| buf.fill(0xCD))
+                .expect("sealed tile under sandbox");
+            std::process::exit(0);
+        }
+
+        // fcntl is allowed *only* for the seal commands; any other command —
+        // here F_DUPFD, an fd-fabrication primitive — must be fatal. Reached
+        // only if the argument filter failed.
+        "fcntl-dupfd" => unsafe {
+            let _ = libc::fcntl(2, libc::F_DUPFD, 0);
+            std::process::exit(0);
+        },
+
         other => {
             eprintln!("unknown selftest probe: {other}");
             std::process::exit(2);

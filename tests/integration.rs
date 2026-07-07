@@ -26,13 +26,47 @@ fn default_run_renders_and_shuts_down() {
     assert!(!stdout.contains("crashed"), "unexpected crash:\n{stdout}");
 }
 
-/// The same lifecycle must work with components as threads.
+/// The same lifecycle must work with components as threads. No fd-passing on
+/// in-process channels, so tiles arrive as message copies — still verified.
 #[test]
 fn single_process_run_renders_and_shuts_down() {
     let out = run(&["--single-process"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "exit {:?}\nstdout: {stdout}", out.status);
     assert!(stdout.contains("frame ready") && stdout.contains("engine shut down"), "{stdout}");
+    assert!(stdout.contains("via message copy"), "expected copied tiles:\n{stdout}");
+    assert!(stdout.contains("pattern ok"), "tile pattern not verified:\n{stdout}");
+}
+
+/// In multi-process mode tiles must travel as sealed shared memory — only the
+/// dimensions and an fd cross the socket — and the received pixels must be
+/// byte-identical to the pattern the renderer wrote (the round-trip check for
+/// the memfd + SCM_RIGHTS channel).
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[test]
+fn multi_process_tiles_travel_via_shared_memory() {
+    let out = run(&[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exit {:?}\nstdout: {stdout}", out.status);
+    assert!(stdout.contains("via shared memory"), "expected shm tiles:\n{stdout}");
+    assert!(stdout.contains("pattern ok"), "tile pattern not verified:\n{stdout}");
+    assert!(!stdout.contains("MISMATCH"), "tile bytes corrupted in transit:\n{stdout}");
+}
+
+/// The tile bench must complete on both transports (the numbers themselves
+/// are for humans; asserting on timing would be flaky).
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[test]
+fn bench_tiles_runs_on_both_transports() {
+    for transport in ["shm", "socket"] {
+        let out = run(&["--bench-tiles", "5", transport]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "bench {transport}: exit {:?}\n{stdout}", out.status);
+        assert!(stdout.contains("ms/frame"), "bench {transport} incomplete:\n{stdout}");
+        let expected =
+            if transport == "shm" { "via shared memory" } else { "via message copy" };
+        assert!(stdout.contains(expected), "bench {transport} wrong path:\n{stdout}");
+    }
 }
 
 #[test]
@@ -85,5 +119,21 @@ mod sandbox_enforcement {
     fn opening_a_socket_is_killed() {
         let st = probe("socket");
         assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (no network), got {st:?}");
+    }
+
+    #[test]
+    fn sealed_memfd_tile_survives_the_sandbox() {
+        // The shared-memory tile producer path (memfd_create → ftruncate →
+        // mmap → seal) is exactly what a confined renderer does per frame.
+        let st = probe("memfd-seal");
+        assert!(st.success(), "sealed-tile creation should survive the sandbox, got {st:?}");
+    }
+
+    #[test]
+    fn fcntl_outside_the_seal_commands_is_killed() {
+        // fcntl is argument-filtered to F_ADD_SEALS/F_GET_SEALS; anything
+        // else (here F_DUPFD) must be fatal.
+        let st = probe("fcntl-dupfd");
+        assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (fcntl filter), got {st:?}");
     }
 }

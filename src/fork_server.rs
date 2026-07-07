@@ -28,7 +28,7 @@
 //! sound with `fork()` semantics, and it pairs with the Linux seccomp story.
 
 use crate::ipc::{self, Endpoint, ForkRequest};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 /// Entry point for the `fork-server` role. `control_fd` is the inherited end
@@ -47,7 +47,8 @@ pub fn run(control_fd: &str) {
             ForkRequest::Shutdown => break,
             ForkRequest::Renderer { origin } => {
                 // The renderer's IPC fd arrives right after the request.
-                let comp_fd = match unsafe { recv_fd(control.as_raw_fd()) } {
+                // SAFETY: the control stream is a valid open descriptor.
+                let comp_fd = match unsafe { ipc::recv_fd(control.as_raw_fd()) } {
                     Ok(fd) => fd,
                     Err(_) => break,
                 };
@@ -60,19 +61,19 @@ pub fn run(control_fd: &str) {
     while unsafe { libc::waitpid(-1, std::ptr::null_mut(), 0) } > 0 {}
 }
 
-fn fork_renderer(control_fd: RawFd, comp_fd: RawFd, origin: String) {
+fn fork_renderer(control_fd: RawFd, comp_fd: OwnedFd, origin: String) {
     // SAFETY: we are single-threaded, so the child may run normal code (the
     // async-signal-safe-only rule applies to *multithreaded* fork).
     match unsafe { libc::fork() } {
         -1 => {
             eprintln!("[fork-server] fork failed: {}", std::io::Error::last_os_error());
-            unsafe { libc::close(comp_fd) };
+            // comp_fd drops (closes) here.
         }
         0 => {
             // Child — this IS the renderer now. It inherited the fork server's
             // warm runtime via copy-on-write; no exec, no re-init.
             unsafe { libc::close(control_fd) }; // never touch the engine's control channel
-            let stream = unsafe { UnixStream::from_raw_fd(comp_fd) };
+            let stream = UnixStream::from(comp_fd);
             let ep = Endpoint::from_stream(stream).expect("fork-server child: wrap fd");
             // Drop privileges, then serve. rlimits were inherited from the
             // fork server; seccomp is per-process, applied here.
@@ -83,64 +84,7 @@ fn fork_renderer(control_fd: RawFd, comp_fd: RawFd, origin: String) {
         _pid => {
             // Parent (fork server): drop our copy of the renderer's end so the
             // engine sees EOF (→ TabCrashed) when the renderer dies.
-            unsafe { libc::close(comp_fd) };
+            drop(comp_fd);
         }
     }
-}
-
-/// Send one file descriptor over a Unix socket via `SCM_RIGHTS`, with a 1-byte
-/// dummy payload (fd-passing must carry at least one data byte).
-///
-/// SAFETY: `sock_fd` and `fd` must be valid open descriptors.
-pub unsafe fn send_fd(sock_fd: RawFd, fd: RawFd) -> std::io::Result<()> {
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
-    let mut cmsg = [0u8; 32]; // > CMSG_SPACE(size_of::<RawFd>())
-
-    let mut msg: libc::msghdr = std::mem::zeroed();
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg.as_mut_ptr().cast();
-    msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as _;
-
-    let cmsgp = libc::CMSG_FIRSTHDR(&msg);
-    (*cmsgp).cmsg_level = libc::SOL_SOCKET;
-    (*cmsgp).cmsg_type = libc::SCM_RIGHTS;
-    (*cmsgp).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-    std::ptr::copy_nonoverlapping(&fd, libc::CMSG_DATA(cmsgp).cast::<RawFd>(), 1);
-
-    if libc::sendmsg(sock_fd, &msg, 0) < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Receive one file descriptor sent via [`send_fd`].
-///
-/// SAFETY: `sock_fd` must be a valid open descriptor.
-unsafe fn recv_fd(sock_fd: RawFd) -> std::io::Result<RawFd> {
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
-    let mut cmsg = [0u8; 32];
-
-    let mut msg: libc::msghdr = std::mem::zeroed();
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg.len() as _;
-
-    let n = libc::recvmsg(sock_fd, &mut msg, 0);
-    if n <= 0 {
-        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no fd received"));
-    }
-    let cmsgp = libc::CMSG_FIRSTHDR(&msg);
-    if cmsgp.is_null()
-        || (*cmsgp).cmsg_type != libc::SCM_RIGHTS
-        || (*cmsgp).cmsg_level != libc::SOL_SOCKET
-    {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "no SCM_RIGHTS cmsg"));
-    }
-    let mut fd: RawFd = -1;
-    std::ptr::copy_nonoverlapping(libc::CMSG_DATA(cmsgp).cast::<RawFd>(), &mut fd, 1);
-    Ok(fd)
 }

@@ -14,6 +14,20 @@ use std::io;
 const TILE_W: u32 = 512;
 const TILE_H: u32 = 512;
 
+/// The deterministic placeholder "rasterization": byte `i` of a tile always
+/// has this value. Public so the consumer side (demo, bench, tests) can
+/// byte-compare a received tile against what the renderer must have written —
+/// the round-trip acceptance check for the shared-memory channel.
+pub fn tile_pattern(i: usize) -> u8 {
+    (i.wrapping_mul(31) ^ (i >> 8)) as u8
+}
+
+fn fill_tile(buf: &mut [u8]) {
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = tile_pattern(i);
+    }
+}
+
 /// Multi-process entry point: adopt the inherited IPC fd, sandbox, serve.
 ///
 /// `fd` is the number of the `socketpair(2)` end the engine handed us at
@@ -74,6 +88,40 @@ fn render_page(ep: &mut Endpoint, origin: &str, url: &str) -> io::Result<()> {
 
     // A real renderer parses, styles, lays out and rasterizes here; the PoC
     // ships a placeholder tile of the size the issue budgets per frame.
-    let pixels = vec![0xAB; (TILE_W * TILE_H * 4) as usize];
+    send_tile(ep)
+}
+
+/// Deliver the rendered tile, preferring shared memory: rasterize into a
+/// memfd, seal it immutable, send only the dimensions in-band and the fd via
+/// `SCM_RIGHTS`. Falls back to copying the pixels through the socket if the
+/// transport can't carry fds (single-process mode) or the memfd path fails —
+/// the fallback is about availability, not security: the *consumer* validates
+/// whatever arrives. `GOSUB_TILE_TRANSPORT=socket` forces the copy path so the
+/// bench can compare the two.
+fn send_tile(ep: &mut Endpoint) -> io::Result<()> {
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    if ep.tx.supports_fd_passing()
+        && !std::env::var_os("GOSUB_TILE_TRANSPORT").is_some_and(|v| v == "socket")
+    {
+        use std::os::fd::AsRawFd;
+        match crate::shm::create_sealed_tile(TILE_W, TILE_H, fill_tile) {
+            Ok(fd) => {
+                // Dimensions in-band first, then the fd right behind them —
+                // the engine's reader consumes them as one exchange.
+                ep.send(&FromRenderer::TileShm { width: TILE_W, height: TILE_H })?;
+                ep.tx.send_fd(fd.as_raw_fd())?;
+                // Our copy of the fd closes here (drop); the engine received
+                // its own duplicate. Nothing stays mapped on this side either
+                // (create_sealed_tile unmapped before sealing).
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("[renderer] shm tile failed ({e}); falling back to socket copy")
+            }
+        }
+    }
+
+    let mut pixels = vec![0u8; TILE_W as usize * TILE_H as usize * 4];
+    fill_tile(&mut pixels);
     ep.send(&FromRenderer::Tile { width: TILE_W, height: TILE_H, pixels })
 }
