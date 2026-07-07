@@ -61,6 +61,12 @@ pub enum FromRenderer {
 pub enum ToRenderer {
     RenderPage { url: String },
     FetchResult { status: u16, body: Vec<u8> },
+    /// A fetch whose body streams through a shared-memory ring (Linux): the
+    /// ring fd follows immediately via `SCM_RIGHTS`. `body_len` is a *claim*
+    /// the renderer bounds before allocating; the ring fd itself is validated
+    /// by `ring::consume` (size seals, real size).
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    FetchBodyStream { status: u16, body_len: u64 },
     FetchDenied { reason: String },
     /// `None` means the broker refused to hand the cookies over.
     Cookies(Option<Vec<(String, String)>>),
@@ -96,6 +102,11 @@ pub struct NetResponse {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum FetchOutcome {
     Ok { status: u16, body: Vec<u8> },
+    /// The body streams through a shared-memory ring: the ring fd follows
+    /// this message via `SCM_RIGHTS`. The engine routes header + fd to the
+    /// requesting renderer without ever mapping the ring itself.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    OkStreaming { status: u16, body_len: u64 },
     Denied { reason: String },
 }
 

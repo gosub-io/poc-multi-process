@@ -31,6 +31,8 @@ mod renderer;
 #[cfg(feature = "multi-process")]
 mod sandbox;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
+mod ring;
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
 mod selftest;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 mod shm;
@@ -73,10 +75,14 @@ fn main() {
         // time + engine memory, via shared memory or the socket-copy path.
         #[cfg(all(feature = "multi-process", target_os = "linux"))]
         Some("--bench-tiles") => bench_tiles(args.get(2), args.get(3)),
+        // Body-transport measurement: fetch one N-MiB body and report time +
+        // throughput + engine memory, via the shm ring or the socket copy.
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        Some("--bench-stream") => bench_stream(args.get(2), args.get(3)),
         Some(other) => {
             eprintln!("unknown argument: {other}");
             eprintln!(
-                "usage: gosub-proc-iso-poc [--single-process | --multi-process | --bench-tiles <frames> <shm|socket>]"
+                "usage: gosub-proc-iso-poc [--single-process | --multi-process | --bench-tiles <frames> <shm|socket> | --bench-stream <MiB> <ring|socket>]"
             );
             std::process::exit(2);
         }
@@ -108,7 +114,13 @@ fn run(mode: Mode) {
         match event {
             EngineEvent::TabOpened { tab_id, zone, origin } => {
                 println!("{tab_id} [{zone}]: opened for {origin}");
-                engine.navigate(tab_id, format!("https://{origin}/index.html")).unwrap();
+                // The personal tab fetches a large (4 MiB) body — the PoC's
+                // stand-in for a big download — to exercise the shared-memory
+                // ring transport; the work tab fetches a small in-band page.
+                // The renderer reports the body transport + round-trip check
+                // on stderr.
+                let path = if zone == personal { "blob/4" } else { "index.html" };
+                engine.navigate(tab_id, format!("https://{origin}/{path}")).unwrap();
             }
             EngineEvent::FrameReady { tab_id, tile } => {
                 println!(
@@ -207,6 +219,61 @@ fn bench_tiles(frames: Option<&String>, transport: Option<&String>) {
                 } else {
                     engine.navigate(tab_id, "https://example.com/frame").unwrap();
                 }
+            }
+            EngineEvent::TabClosed { .. } => engine.shutdown().unwrap(),
+            EngineEvent::EngineShutdown => break,
+            EngineEvent::TabCrashed { tab_id } => panic!("{tab_id} crashed during bench"),
+            other => panic!("unexpected event during bench: {other:?}"),
+        }
+    }
+}
+
+/// `--bench-stream <MiB> <ring|socket>`: fetch one `MiB`-sized body through
+/// one tab in multi-process mode and report time, throughput, and the
+/// engine's memory high-water mark. Via the ring the body flows net →
+/// renderer directly (the engine only forwards an fd); via the socket every
+/// byte is copied through the engine — the frame cap limits that path to
+/// 12 MiB, which is itself part of the story.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+fn bench_stream(mib: Option<&String>, transport: Option<&String>) {
+    let mib: u64 = mib.and_then(|f| f.parse().ok()).unwrap_or(64);
+    match transport.map(String::as_str).unwrap_or("ring") {
+        "ring" => {}
+        "socket" => {
+            if mib > 12 {
+                eprintln!("socket transport is bounded by the 16 MiB frame cap; use <= 12 MiB");
+                std::process::exit(2);
+            }
+            // Inherited by the net component: forces the in-band copy path.
+            std::env::set_var("GOSUB_BODY_TRANSPORT", "socket");
+        }
+        _ => {
+            eprintln!("usage: gosub-proc-iso-poc --bench-stream <MiB> <ring|socket>");
+            std::process::exit(2);
+        }
+    }
+
+    let (engine, events) = engine::start(Mode::Multi);
+    engine.open_tab(ZoneId(0), "https://example.com").unwrap();
+
+    let mut started = std::time::Instant::now();
+    for event in events {
+        match event {
+            EngineEvent::TabOpened { tab_id, .. } => {
+                started = std::time::Instant::now(); // exclude spawn cost
+                engine.navigate(tab_id, format!("https://example.com/blob/{mib}")).unwrap();
+            }
+            // The frame only renders after the fetch completed; the renderer
+            // verified the body pattern and reported the transport on stderr.
+            EngineEvent::FrameReady { tab_id, .. } => {
+                let elapsed = started.elapsed();
+                println!(
+                    "bench: {mib} MiB body fetched in {:.1} ms ({:.0} MiB/s)",
+                    elapsed.as_secs_f64() * 1e3,
+                    mib as f64 / elapsed.as_secs_f64(),
+                );
+                println!("bench: engine {}", vm_stats());
+                engine.close_tab(tab_id).unwrap();
             }
             EngineEvent::TabClosed { .. } => engine.shutdown().unwrap(),
             EngineEvent::EngineShutdown => break,

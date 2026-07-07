@@ -22,6 +22,22 @@ pub fn tile_pattern(i: usize) -> u8 {
     (i.wrapping_mul(31) ^ (i >> 8)) as u8
 }
 
+/// For `/blob/` bodies (the large-download stand-in), byte-compare against
+/// the net component's deterministic pattern and report the transport used —
+/// the round-trip acceptance check for the fetch-body channel, mirrored on
+/// stderr for the integration tests.
+fn report_blob(url: &str, transport: &str, body: &[u8]) {
+    if !url.contains("/blob/") {
+        return;
+    }
+    let ok = body.iter().enumerate().all(|(i, &b)| b == crate::net_daemon::body_pattern(i));
+    eprintln!(
+        "[renderer] {} KiB body via {transport} (pattern {})",
+        body.len() / 1024,
+        if ok { "ok" } else { "MISMATCH" },
+    );
+}
+
 fn fill_tile(buf: &mut [u8]) {
     for (i, b) in buf.iter_mut().enumerate() {
         *b = tile_pattern(i);
@@ -74,7 +90,29 @@ fn render_page(ep: &mut Endpoint, origin: &str, url: &str) -> io::Result<()> {
     // Fetch the document — must go through the broker (Phase 1).
     ep.send(&FromRenderer::NeedFetch { url: url.to_string() })?;
     let _document = match ep.recv::<ToRenderer>()? {
-        ToRenderer::FetchResult { body, .. } => Some(body),
+        ToRenderer::FetchResult { body, .. } => {
+            report_blob(url, "message copy", &body);
+            Some(body)
+        }
+        // A large body streams through a shared-memory ring: the fd follows
+        // the header on the same socket. `ring::consume` validates the fd
+        // (size seals, real size, bounded claim) and drains the producer.
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        ToRenderer::FetchBodyStream { body_len, .. } => {
+            let fd = ep.rx.recv_fd()?;
+            match crate::ring::consume(fd, body_len) {
+                Ok(body) => {
+                    report_blob(url, "ring", &body);
+                    Some(body)
+                }
+                Err(e) => {
+                    // A broken stream fails this fetch, not the renderer —
+                    // same shape as FetchDenied.
+                    eprintln!("[renderer] body stream failed: {e}");
+                    None
+                }
+            }
+        }
         _ => None,
     };
 

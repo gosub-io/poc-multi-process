@@ -53,6 +53,30 @@ fn multi_process_tiles_travel_via_shared_memory() {
     assert!(!stdout.contains("MISMATCH"), "tile bytes corrupted in transit:\n{stdout}");
 }
 
+/// The demo's large (4 MiB) fetch body must stream net → renderer through the
+/// shared-memory ring — 16× its 256 KiB window, so it demonstrably wraps —
+/// and byte-match the producer's pattern (the ring's round-trip check). The
+/// renderer reports both on stderr. In single-process mode the same body
+/// falls back to the in-band copy, still verified.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[test]
+fn large_fetch_body_streams_through_the_ring() {
+    let out = run(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {:?}\nstderr: {stderr}", out.status);
+    assert!(stderr.contains("4096 KiB body via ring"), "expected ring body:\n{stderr}");
+    assert!(stderr.contains("(pattern ok)"), "body pattern not verified:\n{stderr}");
+    assert!(!stderr.contains("MISMATCH"), "body bytes corrupted in transit:\n{stderr}");
+
+    let out = run(&["--single-process"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {:?}\nstderr: {stderr}", out.status);
+    assert!(
+        stderr.contains("4096 KiB body via message copy") && stderr.contains("(pattern ok)"),
+        "expected verified in-band fallback:\n{stderr}"
+    );
+}
+
 /// The tile bench must complete on both transports (the numbers themselves
 /// are for humans; asserting on timing would be flaky).
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
@@ -66,6 +90,25 @@ fn bench_tiles_runs_on_both_transports() {
         let expected =
             if transport == "shm" { "via shared memory" } else { "via message copy" };
         assert!(stdout.contains(expected), "bench {transport} wrong path:\n{stdout}");
+    }
+}
+
+/// The body-stream bench must complete on both transports, with the renderer
+/// verifying the pattern either way.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[test]
+fn bench_stream_runs_on_both_transports() {
+    for transport in ["ring", "socket"] {
+        let out = run(&["--bench-stream", "4", transport]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "bench {transport}: exit {:?}\n{stdout}{stderr}", out.status);
+        assert!(stdout.contains("MiB/s"), "bench {transport} incomplete:\n{stdout}");
+        let expected = if transport == "ring" { "via ring" } else { "via message copy" };
+        assert!(
+            stderr.contains(expected) && stderr.contains("(pattern ok)"),
+            "bench {transport} wrong/unverified path:\n{stderr}"
+        );
     }
 }
 
@@ -135,5 +178,13 @@ mod sandbox_enforcement {
         // else (here F_DUPFD) must be fatal.
         let st = probe("fcntl-dupfd");
         assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (fcntl filter), got {st:?}");
+    }
+
+    #[test]
+    fn ring_buffer_survives_the_sandbox() {
+        // The ring produce+consume dance (memfd + size seals, RW mapping,
+        // cursor atomics) is how a confined renderer receives large bodies.
+        let st = probe("ring");
+        assert!(st.success(), "ring transport should survive the sandbox, got {st:?}");
     }
 }

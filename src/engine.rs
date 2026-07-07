@@ -117,6 +117,11 @@ enum LoopMsg {
     TabGone { tab_id: TabId },
     /// The net component answered a fetch.
     NetReply(NetResponse),
+    /// The net component answered a fetch with a *streamed* body: the header
+    /// to route, plus the ring fd (already received by the net reader thread)
+    /// to forward to the requesting renderer. The engine never maps the ring.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    NetStream { resp: NetResponse, fd: std::os::fd::OwnedFd },
 }
 
 /// A running child component, however it is hosted.
@@ -268,6 +273,20 @@ impl EngineLoop {
             std::thread::spawn(move || loop {
                 match net_rx.recv::<NetResponse>() {
                     Ok(resp) => {
+                        // A streaming response's ring fd follows on the same
+                        // socket; this thread is its only reader, so take the
+                        // fd here and route both together.
+                        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                        if matches!(resp.outcome, FetchOutcome::OkStreaming { .. }) {
+                            let Ok(fd) = net_rx.recv_fd() else { break };
+                            if !net_gate.acquire() {
+                                break;
+                            }
+                            if inbox.send(LoopMsg::NetStream { resp, fd }).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                         if !net_gate.acquire() {
                             break;
                         }
@@ -354,6 +373,11 @@ impl EngineLoop {
                 }
                 LoopMsg::NetReply(resp) => {
                     self.net_reply(resp);
+                    self.net_gate.release();
+                }
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                LoopMsg::NetStream { resp, fd } => {
+                    self.net_stream(resp, fd);
                     self.net_gate.release();
                 }
             }
@@ -553,8 +577,38 @@ impl EngineLoop {
         let reply = match resp.outcome {
             FetchOutcome::Ok { status, body } => ToRenderer::FetchResult { status, body },
             FetchOutcome::Denied { reason } => ToRenderer::FetchDenied { reason },
+            // Streamed outcomes arrive as LoopMsg::NetStream, never here.
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            FetchOutcome::OkStreaming { .. } => return,
         };
         let _ = tab.tx.send(&reply);
+    }
+
+    /// Route a streamed fetch body: same bookkeeping as [`net_reply`], but
+    /// the payload is a ring fd the engine *forwards* to the renderer without
+    /// ever mapping it — the bytes flow net → renderer directly; the broker
+    /// only decides who gets the handle. If the tab is gone the fd just
+    /// drops, and the net component's stall timeout reclaims its ring.
+    ///
+    /// [`net_reply`]: Self::net_reply
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    fn net_stream(&mut self, resp: NetResponse, fd: std::os::fd::OwnedFd) {
+        use std::os::fd::AsRawFd;
+        let Some(tab_id) = self.pending_fetches.remove(&resp.request_id) else {
+            return; // requester disappeared while the fetch was in flight
+        };
+        let Some(tab) = self.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1);
+        let FetchOutcome::OkStreaming { status, body_len } = resp.outcome else {
+            return;
+        };
+        // Header first, fd right behind it — the renderer consumes them as
+        // one exchange (the tile path's discipline, direction reversed).
+        if tab.tx.send(&ToRenderer::FetchBodyStream { status, body_len }).is_ok() {
+            let _ = tab.tx.send_fd(fd.as_raw_fd());
+        }
     }
 
     fn shutdown(&mut self) {
