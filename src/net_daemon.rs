@@ -303,11 +303,26 @@ fn blocked_ip_reason(ip: IpAddr) -> Option<&'static str> {
                 Some("IPv6 link-local (fe80::/10)")
             } else if v6.is_multicast() {
                 Some("IPv6 multicast")
+            } else if seg[0] == 0x64 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0] {
+                // NAT64 (64:ff9b::/96): what gets reached is the *embedded
+                // IPv4*, so classify that — a public embed stays allowed.
+                blocked_v4(embedded_v4(seg))
+            } else if seg[..6] == [0, 0, 0, 0, 0, 0] {
+                // Deprecated IPv4-compatible (::a.b.c.d): same reach as the
+                // embedded IPv4 on stacks that still honor it. (::1 and ::
+                // were already handled above.)
+                blocked_v4(embedded_v4(seg))
             } else {
                 None
             }
         }
     }
+}
+
+/// The IPv4 address in the low 32 bits of an IPv6 address (NAT64 and
+/// IPv4-compatible embeddings).
+fn embedded_v4(seg: [u16; 8]) -> Ipv4Addr {
+    Ipv4Addr::new((seg[6] >> 8) as u8, seg[6] as u8, (seg[7] >> 8) as u8, seg[7] as u8)
 }
 
 fn blocked_v4(v4: Ipv4Addr) -> Option<&'static str> {
@@ -324,9 +339,27 @@ fn blocked_v4(v4: Ipv4Addr) -> Option<&'static str> {
         Some("broadcast (255.255.255.255)")
     } else if o[0] == 100 && o[1] & 0xc0 == 64 {
         Some("shared/CGNAT (100.64.0.0/10)")
+    } else if v4.is_multicast() {
+        Some("IPv4 multicast (224.0.0.0/4)")
+    } else if o[0] >= 240 {
+        Some("reserved class E (240.0.0.0/4)")
+    } else if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+        Some("IETF protocol assignments (192.0.0.0/24)")
+    } else if o[0] == 192 && o[1] == 88 && o[2] == 99 {
+        Some("6to4 relay anycast (192.88.99.0/24)")
+    } else if o[0] == 198 && o[1] & 0xfe == 18 {
+        Some("benchmarking (198.18.0.0/15)")
+    } else if (o[0] == 192 && o[1] == 0 && o[2] == 2)
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+    {
+        Some("documentation TEST-NET (192.0.2/24, 198.51.100/24, 203.0.113/24)")
     } else {
         None
     }
+    // Deliberately NOT blocked: subnet-directed broadcast (x.y.z.255) — which
+    // addresses are broadcasts depends on the local netmask, and refusing
+    // every .255 would break legitimate public hosts.
 }
 
 #[cfg(test)]
@@ -347,6 +380,16 @@ mod tests {
             // IPv6 internal + IPv4-mapped + scoped (zone id, raw and %25-encoded).
             "http://[::1]/", "http://[::ffff:169.254.169.254]/", "http://[fc00::1]/", "http://[fe80::1]/",
             "http://[fe80::1%eth0]/", "http://[fe80::1%25eth0]/",
+            // Multicast, class E, and the special-purpose IPv4 registry blocks.
+            "http://224.0.0.1/", "http://239.255.255.250/", "http://240.0.0.1/",
+            "http://192.0.0.5/", "http://192.88.99.1/", "http://198.18.0.1/",
+            "http://198.19.255.1/", "http://192.0.2.1/", "http://198.51.100.7/",
+            "http://203.0.113.9/",
+            // IPv6 internal + IPv4-mapped.
+            "http://[::1]/", "http://[::ffff:169.254.169.254]/", "http://[fc00::1]/", "http://[fe80::1]/",
+            // IPv6 embeddings that reach internal IPv4: NAT64 + deprecated
+            // IPv4-compatible.
+            "http://[64:ff9b::7f00:1]/", "http://[64:ff9b::a00:1]/", "http://[::127.0.0.1]/",
             // Parser-confusion: userinfo and trailing dot.
             "http://real.com@127.0.0.1/", "http://127.0.0.1.:80/",
             // Non-HTTP schemes are refused outright, whatever the host.
@@ -372,7 +415,10 @@ mod tests {
             "http://93.184.216.34/", "http://example.com/", "http://8.8.8.8/",
             "http://172.32.0.1/",   // just outside 172.16/12
             "http://100.128.0.1/",  // just outside 100.64/10
+            "http://223.255.255.1/", // just below multicast
+            "http://198.20.0.1/",    // just outside benchmarking 198.18/15
             "http://[2606:2800:220:1::1]/",
+            "http://[64:ff9b::808:808]/", // NAT64 embedding a *public* v4 (8.8.8.8)
         ] {
             assert!(ssrf_block_reason(u).is_none(), "should allow {u}: {:?}", ssrf_block_reason(u));
         }

@@ -114,9 +114,15 @@ engine event loop (broker — owns cookie jar & policy)
 - SSRF policy is centralized in the net component (the one place allowed to
   open sockets), so no renderer bug can bypass it. It classifies the *numeric*
   address (loopback, private incl. `172.16/12`, link-local/cloud-metadata,
-  CGNAT, `0.0.0.0/8`, and the IPv6 equivalents), so it isn't fooled by
+  CGNAT, `0.0.0.0/8`, multicast, class E, the special-purpose registry blocks
+  — TEST-NETs, benchmarking, `192.0.0/24`, 6to4 relay — and the IPv6
+  equivalents incl. unique-local and link-local), so it isn't fooled by
   alternate IP encodings (`http://2130706433/`, `0x7f.1`, octal), IPv4-mapped
-  IPv6, userinfo confusion (`http://real.com@127.0.0.1/`), or a trailing dot.
+  IPv6, NAT64/IPv4-compatible embeddings (`64:ff9b::7f00:1`, `::127.0.0.1`),
+  userinfo confusion (`http://real.com@127.0.0.1/`), or a trailing dot.
+  Subnet-directed broadcast (`x.y.z.255`) is knowingly not classified — it
+  depends on the local netmask, and refusing every `.255` would break
+  legitimate public hosts.
   It can't resolve *hostnames* offline; a real one resolves DNS, re-checks the
   resolved IPs, and pins that IP for the connection to defeat DNS rebinding.
 - Renderers are **sandboxed at the OS level** (Linux): after connecting their
@@ -195,17 +201,24 @@ reuse. `src/shm.rs` holds both sides; the lifecycle discipline:
   fd *proves* no writer remains anywhere. There is no window where both
   processes can write the same pages, and the seals can never be lifted.
 - **Consumer validates the fd, not the message.** The dimensions in the
-  message are a claim: the engine bounds them (≤ 8192²), requires the seals to
-  actually be present (`F_GET_SEALS`), and `fstat`s the fd's *real* size
-  before mapping. `F_SEAL_SHRINK` makes that check TOCTOU-free — a malicious
-  renderer can't shrink the fd after validation to `SIGBUS` the engine. A tile
-  that fails validation is a protocol violation: the engine drops the link
-  (→ `TabCrashed`).
-- **No fd leaks.** The memfd is `MFD_CLOEXEC`, received fds are
-  `MSG_CMSG_CLOEXEC` and wrapped in `OwnedFd`, the producer's copy closes
-  right after sending, and the consumer's closes as soon as the mapping exists
-  (dropping the `Tile` unmaps). One sealed memfd per tile; a real compositor
-  at 60 fps would switch to a reusable buffer pool, which must trade
+  message are a claim: the engine bounds them (≤ 2048², i.e. 16 MiB — the
+  same per-message ceiling the in-band frame cap imposes, so shared memory
+  never lets a renderer pin *more* engine memory per message than the socket
+  path could), requires the seals to actually be present (`F_GET_SEALS`), and
+  `fstat`s the fd's *real* size before mapping. `F_SEAL_SHRINK` makes that
+  check TOCTOU-free — a malicious renderer can't shrink the fd after
+  validation to `SIGBUS` the engine. A tile that fails validation is a
+  protocol violation: the engine drops the link (→ `TabCrashed`).
+- **No fd leaks — including smuggled ones.** The memfd is `MFD_CLOEXEC`,
+  received fds are `MSG_CMSG_CLOEXEC` and wrapped in `OwnedFd`, the
+  producer's copy closes right after sending, and the consumer's closes as
+  soon as the mapping exists (dropping the `Tile` unmaps). The receive side
+  (`ipc::recv_fd`) walks *all* control messages, adopts every fd the kernel
+  installed, and enforces exactly-one — a peer stuffing extra fds into the
+  hand-off (`sendmsg` is on its allowlist) gets a refusal and every fd
+  closed, instead of silently leaking descriptors into the engine's fd table
+  until it's exhausted. One sealed memfd per tile; a real compositor at
+  60 fps would switch to a reusable buffer pool, which must trade
   `F_SEAL_WRITE` for fence-based ownership handoff (see `src/shm.rs` docs).
 - The renderer's sandbox allowlist grows only `memfd_create`, `ftruncate`, and
   `fcntl` argument-filtered to the seal commands — `memfd_create` opens
@@ -377,16 +390,25 @@ simplified is the surrounding browser. What each entry below still needs:
   components are *blocking* socket writes, so a renderer that floods requests
   **and** refuses to read its replies can stall the loop (memory stays bounded —
   the per-source gates handle that — but responsiveness doesn't). Non-blocking
-  per-channel writes on an async loop fix both.
+  per-channel writes on an async loop fix both. Relatedly, the per-source
+  gate bounds what sits *in the engine loop's inbox*, but `FrameReady` events
+  ride an unbounded channel to the embedding application — a tile's gate
+  permit is returned when the loop forwards it, not when the app drops it, so
+  an app that stops draining events accumulates tiles (capped at 16 MiB
+  each). A real engine bounds its compositor queue and recycles tile buffers.
 - **Tile transport**: implemented over sealed shared memory (see above). What
   a real compositor still needs: a reusable buffer *pool* instead of one memfd
   per tile (fd churn at 60 fps), which trades `F_SEAL_WRITE` for fence-based
   ownership handoff, plus damage rects and a swapchain-style
   acquire/present protocol.
-- **Origins**: the engine's `origin_of` is a `scheme://host` string prefix, not
-  a real URL parser/origin tuple, and cross-origin navigation is refused instead
-  of swapping renderers. (Note the inconsistency: the SSRF filter's `host_of`
-  *is* a careful parser — a real engine would share one origin implementation.)
+- **Origins**: the engine's `origin_of` now canonicalizes the full
+  `scheme://host[:port]` tuple (default ports folded), so different schemes
+  or ports are different origins — the cookie jar is partitioned by scheme
+  too, closing the HTTPS→HTTP secure-cookie downgrade, and an `https:`
+  renderer can't be navigated to `http:`. Still not a real URL parser (no
+  IDNA, no userinfo; the SSRF filter's `host_of` remains the
+  deliberately-hostile one — a real engine would share one implementation),
+  and cross-origin navigation is refused instead of swapping renderers.
 - **Fork server**: it is `exec`'d fresh (one exec) rather than forked from the
   engine early to inherit the *engine's* warm libraries; the modeled behavior
   is renderers fork-without-exec from a warm process. It is unsandboxed
