@@ -34,7 +34,45 @@ impl std::fmt::Display for TabId {
 pub struct Tile {
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<u8>,
+    pub pixels: TilePixels,
+}
+
+/// How a tile's pixels reached the engine. The compositor-facing API is the
+/// same either way (`as_slice`); the variant only records whether the bytes
+/// were copied through the IPC message or are a zero-copy view of the
+/// renderer's sealed shared-memory buffer. (This is the one place transport
+/// shows through this layer — deliberately, so the consumer can composite
+/// straight from shared memory without an extra copy.)
+pub enum TilePixels {
+    /// Copied in-band through the IPC message (local channels, fallback).
+    Inline(Vec<u8>),
+    /// A read-only mapping of the renderer's sealed memfd (Linux).
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    Shared(crate::shm::TileMapping),
+}
+
+impl TilePixels {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            TilePixels::Inline(v) => v,
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            TilePixels::Shared(m) => m.as_slice(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    /// Human-readable transport label, used by the demo/bench output (and
+    /// asserted by the integration tests).
+    pub fn transport(&self) -> &'static str {
+        match self {
+            TilePixels::Inline(_) => "message copy",
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            TilePixels::Shared(_) => "shared memory",
+        }
+    }
 }
 
 /// Commands accepted by the engine's event loop.
@@ -94,7 +132,10 @@ impl std::fmt::Debug for Tile {
         f.debug_struct("Tile")
             .field("width", &self.width)
             .field("height", &self.height)
-            .field("pixels", &format_args!("{} bytes", self.pixels.len()))
+            .field(
+                "pixels",
+                &format_args!("{} bytes via {}", self.pixels.len(), self.pixels.transport()),
+            )
             .finish()
     }
 }

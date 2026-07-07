@@ -14,6 +14,10 @@ cargo run --release                      # multi-process (default)
 cargo run --release -- --single-process  # same engine, components as threads
 cargo build --no-default-features        # single-process-only binary
 cargo test                               # unit + integration suite (see Tests)
+cargo run --release -- --bench-tiles 500 shm     # measure tile transport…
+cargo run --release -- --bench-tiles 500 socket  # …against the copy path
+cargo run --release -- --bench-stream 12 ring    # measure body streaming…
+cargo run --release -- --bench-stream 12 socket  # …against the copy path
 ```
 
 ### Sandbox: allowlist by default (fail-closed)
@@ -175,6 +179,100 @@ You can see it in a syscall trace: only `fork-server` and `net-daemon` are ever
 `execve`'d — the renderers appear only as `clone()`/`fork()` from the fork
 server, with no exec. The net component (a one-off) is still spawned directly.
 
+### Tiles over shared memory (Linux)
+
+In multi-process mode a rendered tile is not copied through the socket: the
+renderer rasterizes into a **sealed `memfd`** and passes the *fd* over the
+existing `SCM_RIGHTS` channel; the engine maps the same physical pages
+read-only and hands the zero-copy view to the compositor
+(`TilePixels::Shared`). Only a ~10-byte `TileShm { width, height }` message
+travels in-band. This is the channel OOPIFs and a future decode process would
+reuse. `src/shm.rs` holds both sides; the lifecycle discipline:
+
+- **Producer seals before sending.** The renderer writes the tile, unmaps, and
+  seals `F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL` — the
+  kernel refuses `F_SEAL_WRITE` while any writable mapping exists, so a sealed
+  fd *proves* no writer remains anywhere. There is no window where both
+  processes can write the same pages, and the seals can never be lifted.
+- **Consumer validates the fd, not the message.** The dimensions in the
+  message are a claim: the engine bounds them (≤ 8192²), requires the seals to
+  actually be present (`F_GET_SEALS`), and `fstat`s the fd's *real* size
+  before mapping. `F_SEAL_SHRINK` makes that check TOCTOU-free — a malicious
+  renderer can't shrink the fd after validation to `SIGBUS` the engine. A tile
+  that fails validation is a protocol violation: the engine drops the link
+  (→ `TabCrashed`).
+- **No fd leaks.** The memfd is `MFD_CLOEXEC`, received fds are
+  `MSG_CMSG_CLOEXEC` and wrapped in `OwnedFd`, the producer's copy closes
+  right after sending, and the consumer's closes as soon as the mapping exists
+  (dropping the `Tile` unmaps). One sealed memfd per tile; a real compositor
+  at 60 fps would switch to a reusable buffer pool, which must trade
+  `F_SEAL_WRITE` for fence-based ownership handoff (see `src/shm.rs` docs).
+- The renderer's sandbox allowlist grows only `memfd_create`, `ftruncate`, and
+  `fcntl` argument-filtered to the seal commands — `memfd_create` opens
+  nothing on the filesystem, and every mutating `fcntl` (e.g. `F_DUPFD`,
+  `F_SETFD` clearing `CLOEXEC`) is still a fatal `SIGSYS`, which the selftest
+  probes verify from outside.
+
+Measured, not assumed (`--bench-tiles <frames> <shm|socket>`, release build,
+500 × 512²×4 tiles over one tab, every tile byte-compared against the expected
+pattern): **2.22 ms/frame via shared memory vs 4.90 ms/frame copied through
+the socket** (2.2×), with engine peak RSS 3.6 MB vs 4.6 MB — the ~1 MiB tile
+no longer materializes in the engine at all. Single-process mode (and any
+shm failure) falls back to the in-band copy; the consumer-side validation
+doesn't care which path was taken.
+
+### Large fetch bodies over a shared-memory ring (Linux)
+
+Where a tile is complete-and-immutable (seal everything), a download is a
+*stream* — so large fetch bodies use the other end of the shared-memory dial:
+a fixed **ring buffer** (`src/ring.rs`, 256 KiB window) that the net component
+keeps writing while the renderer keeps reading, wrapping at the end — pipe
+semantics without the kernel copy, which is what Chromium's data pipes are.
+The engine brokers but never touches the bytes: it routes the in-band header
+(`FetchBodyStream { status, body_len }`) and **forwards the ring fd** to the
+requesting renderer, so body bytes flow net → renderer directly. What the
+ring buys:
+
+- **Constant memory for unbounded data.** The transport holds one window, not
+  one body: a 128 MiB body streams through the 256 KiB ring (wrapping ~512
+  times) with every process's RSS flat. The 16 MiB IPC frame cap stays
+  untouched — it still bounds *messages*; bodies no longer ride in messages.
+- **Structural backpressure.** A full ring blocks the producer, an empty one
+  blocks the consumer; nobody buffers on the other's behalf (a real net
+  component's stalled writes would close the TCP window back to the origin).
+  Both sides bound their patience (5 s of zero progress = abandon the
+  stream), so a dead or deliberately-stalling peer costs seconds, not a hung
+  process — and only that stream, never the component.
+- **The trust contract shifts from seals to discipline** — deliberately, per
+  transport role. The kernel still guarantees *size* (`F_SEAL_SHRINK|GROW` are
+  applied at creation; unlike `F_SEAL_WRITE` they coexist with writers, so the
+  consumer's `fstat` check stays TOCTOU-free and no read can `SIGBUS`).
+  Contents and cursors are hostile: each side copies the shared read/write
+  cursors to locals and validates them against capacity before touching a
+  byte (a corrupt cursor is a detected protocol violation, not an OOB read),
+  offsets are reduced mod capacity only after that check, and the consumer
+  reads **single-pass** — every byte copied out exactly once, never re-read —
+  which is the discipline that replaces immutability. Wakeups are shared
+  futexes on the cursor words; a producer that dies mid-stream is caught by
+  an abort flag, a truncated stream (fewer bytes than promised) is an error.
+- **Same lifecycle hygiene as tiles**: `MFD_CLOEXEC`/`MSG_CMSG_CLOEXEC`,
+  `OwnedFd` everywhere, producer drops its fd right after sending, consumer
+  maps then closes, `F_SEAL_SEAL` stops the peer from adding seals. No new
+  syscalls in the sandbox — memfd/seals/futex were already in the baseline,
+  and the `ring` selftest probe proves the full dance under renderer lockdown.
+
+The demo exercises it (the personal-zone tab fetches `/blob/4`, a synthesized
+4 MiB patterned body; the renderer byte-verifies and reports the transport),
+and it is measured (`--bench-stream <MiB> <ring|socket>`, release build):
+**12 MiB in 20 ms (596 MiB/s) via the ring vs 134 ms (90 MiB/s) copied
+through the socket** — 6.6× — with engine peak RSS **2.7 MB vs 27 MB**, since
+the socket path materializes the body in the engine twice (net reply + tab
+forward) while the ring path never lets it exist there at all. A 128 MiB body
+(impossible in-band) streams at 608 MiB/s with the engine flat at 2.6 MB.
+Small responses stay in-band on purpose — a ring costs setup; a few-KB page
+does not earn it — as does everything in single-process mode (same address
+space, nothing to share).
+
 ## Single- vs multi-process: two-level selection
 
 The same trick as Chromium's `--single-process`: components are written once,
@@ -217,9 +315,19 @@ a real security boundary with a process behind them.
   code is identical in both modes, so this exercises the real thing.
 - **Integration tests** (`tests/integration.rs`) run the actual built binary:
   multi- and single-process runs render and shut down cleanly, unknown args are
-  rejected, and (Linux) the children both *announce* and *enforce* their seccomp
-  sandbox — the `selftest` probes confirm that making memory executable
-  (`PROT_EXEC`) and opening a socket are each killed by `SIGSYS`.
+  rejected, tiles arrive via shared memory (multi-process) or in-band copy
+  (single-process) and byte-match the expected pattern either way, the tile
+  bench completes on both transports, large fetch bodies stream through the
+  ring (multi-process) or fall back in-band (single-process) and byte-match
+  the producer's pattern either way, the stream bench completes on both
+  transports, and (Linux) the children both *announce* and *enforce* their
+  seccomp sandbox — the `selftest` probes confirm that making memory
+  executable (`PROT_EXEC`), opening a socket, and any `fcntl` beyond the seal
+  commands are each killed by `SIGSYS`, while the sealed-memfd tile dance and
+  the ring produce/consume dance both survive. The `shm` and `ring` unit
+  tests additionally pin the consumer-side refusals: unsealed fds, undersized
+  fds, absurd dimensions/lengths, corrupt ring cursors, aborted and truncated
+  streams — plus a two-thread ring round-trip that wraps the window 256×.
 
 Two properties are checked by hand rather than in `cargo test`, as they need
 external tooling: the fork server forking renderers *without* exec (an `execve`
@@ -234,10 +342,12 @@ covers the bounding mechanism itself deterministically.
 |------|----------|
 | `src/events.rs` | Public vocabulary: `EngineCommand`, `TabCommand`, `EngineEvent`, `TabId`, `Tile` |
 | `src/engine.rs` | `start(mode)`, `EngineHandle`, the event loop (broker + policy), `Spawner` |
-| `src/ipc.rs` | `Endpoint` tx/rx halves (socket/local transports), wire messages, bincode framing |
+| `src/ipc.rs` | `Endpoint` tx/rx halves (socket/local transports), wire messages, bincode framing, `SCM_RIGHTS` fd-passing |
 | `src/net_daemon.rs` | Net component: `serve` loop, SSRF policy, (synthesized) fetching |
 | `src/renderer.rs` | Per-`(zone,origin)` renderer: `serve` loop, placeholder render pipeline |
-| `src/fork_server.rs` | Fork server (Linux): `fork()`s renderers without exec; `SCM_RIGHTS` fd-passing |
+| `src/fork_server.rs` | Fork server (Linux): `fork()`s renderers without exec |
+| `src/shm.rs` | Shared-memory tiles (Linux): sealed-`memfd` producer + validating consumer |
+| `src/ring.rs` | Shared-memory ring (Linux): streams large fetch bodies, futex wakeups, hostile-cursor validation |
 | `src/sandbox.rs` | seccomp-BPF privilege capping for the child processes (Linux) |
 | `src/selftest.rs` | Sandbox-enforcement probes spawned by the integration tests (Linux) |
 | `src/main.rs` | Child-role dispatch for re-exec + minimal event-driven usage |
@@ -257,7 +367,9 @@ simplified is the surrounding browser. What each entry below still needs:
   macOS/Windows need their own mechanisms (Seatbelt, AppContainer).
 - **Fetching**: synthesized responses instead of real HTTP; the net component
   handles one request at a time (the engine doesn't block on it, but a real
-  daemon would fetch concurrently). The SSRF filter classifies IP literals but
+  daemon would fetch concurrently — with the ring transport that matters
+  more, since one slow-draining body stream now occupies the component until
+  it completes or hits the 5 s stall timeout). The SSRF filter classifies IP literals but
   can't resolve hostnames offline — production resolves DNS, re-checks the
   result, and pins the IP against rebinding.
 - **Event loop & writes**: std threads + mpsc instead of tokio; the real
@@ -266,10 +378,11 @@ simplified is the surrounding browser. What each entry below still needs:
   **and** refuses to read its replies can stall the loop (memory stays bounded —
   the per-source gates handle that — but responsiveness doesn't). Non-blocking
   per-channel writes on an async loop fix both.
-- **Tile transport**: tiles are copied through the socket. At real frame rates
-  you'd use shared memory (`memfd` + fd-passing) and send only the handle — the
-  `SCM_RIGHTS` fd-passing primitive this needs already exists
-  (`fork_server::send_fd`).
+- **Tile transport**: implemented over sealed shared memory (see above). What
+  a real compositor still needs: a reusable buffer *pool* instead of one memfd
+  per tile (fd churn at 60 fps), which trades `F_SEAL_WRITE` for fence-based
+  ownership handoff, plus damage rects and a swapchain-style
+  acquire/present protocol.
 - **Origins**: the engine's `origin_of` is a `scheme://host` string prefix, not
   a real URL parser/origin tuple, and cross-origin navigation is refused instead
   of swapping renderers. (Note the inconsistency: the SSRF filter's `host_of`

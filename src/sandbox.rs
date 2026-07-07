@@ -15,8 +15,10 @@
 //! A handful of allowed syscalls are additionally **argument-filtered**:
 //! `mmap`/`mprotect` are permitted only when `PROT_EXEC` is clear, so a
 //! renderer can never turn writable memory executable (the W^X property that
-//! blocks the final step of most memory-corruption exploit chains). An empty
-//! rule for a syscall matches any arguments; these two carry a real condition.
+//! blocks the final step of most memory-corruption exploit chains), and
+//! `fcntl` is permitted only for the memfd seal commands the shared-memory
+//! tile path needs (`F_ADD_SEALS`/`F_GET_SEALS`). An empty rule for a syscall
+//! matches any arguments; these carry real conditions.
 //!
 //! Installing it is safe here because the child has already connected and
 //! split its endpoint (the `socket`/`connect`/`dup` for that happened *before*
@@ -68,6 +70,14 @@ const BASELINE: &[libc::c_long] = &[
     libc::SYS_mprotect,
     libc::SYS_madvise,
     libc::SYS_brk,
+    // shared-memory tile transport: create an anonymous sealable buffer, size
+    // it, seal it. fcntl is argument-filtered in `install` to the two seal
+    // commands only — its other commands (F_DUPFD, F_SETFD/F_SETFL, locks)
+    // stay fatal. memfd_create yields a plain memory fd: it opens no path on
+    // the filesystem, so this adds no reach `openat`'s absence was denying.
+    libc::SYS_memfd_create,
+    libc::SYS_ftruncate,
+    libc::SYS_fcntl,
     // runtime / synchronization
     libc::SYS_futex,
     libc::SYS_getrandom,
@@ -170,6 +180,21 @@ fn install(allowed: Vec<libc::c_long>) -> Result<(), Box<dyn std::error::Error>>
         )?;
         rules.insert(nr as i64, vec![SeccompRule::new(vec![no_exec])?]);
     }
+
+    // …and fcntl, allowed only for memfd sealing plus the read-only F_GETFD
+    // (`cmd` is argument index 1; multiple rules OR together). A renderer must
+    // be able to seal its tile buffers, and Rust's std *debug* builds probe
+    // fds with fcntl(F_GETFD) when an OwnedFd drops (debug_assert_fd_is_open)
+    // — a pure query with nothing to escalate. Every *mutating* fcntl command
+    // — F_DUPFD (fd fabrication), F_SETFD (clearing CLOEXEC), F_SETFL, locks —
+    // hits KillProcess.
+    let mut fcntl_allowed = Vec::new();
+    for cmd in [libc::F_ADD_SEALS, libc::F_GET_SEALS, libc::F_GETFD] {
+        let is_cmd =
+            SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, cmd as u64)?;
+        fcntl_allowed.push(SeccompRule::new(vec![is_cmd])?);
+    }
+    rules.insert(libc::SYS_fcntl as i64, fcntl_allowed);
 
     let filter = SeccompFilter::new(
         rules,

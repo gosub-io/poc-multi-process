@@ -38,6 +38,23 @@ pub fn serve(mut ep: Endpoint) {
         match req {
             NetRequest::Shutdown => break,
             NetRequest::Fetch { request_id, for_zone, for_origin, url, cookies } => {
+                // Large bodies stream through a shared-memory ring when the
+                // transport can carry the fd (SSRF policy still applies
+                // first). `GOSUB_BODY_TRANSPORT=socket` forces the in-band
+                // copy so the bench can compare the two.
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                if ssrf_block_reason(&url).is_none()
+                    && ep.tx.supports_fd_passing()
+                    && !std::env::var_os("GOSUB_BODY_TRANSPORT").is_some_and(|v| v == "socket")
+                {
+                    if let Some(body_len) = blob_len(&url) {
+                        if stream_blob(&mut ep, request_id, body_len).is_err() {
+                            break; // engine went away mid-stream setup
+                        }
+                        continue;
+                    }
+                }
+
                 // The request id travels with the reply so the engine can
                 // route it back to the tab that asked, even with many
                 // fetches in flight.
@@ -52,6 +69,71 @@ pub fn serve(mut ep: Endpoint) {
     }
 }
 
+/// The deterministic byte at position `i` of every synthesized large body.
+/// Public so the consumer side can byte-compare a delivered body against what
+/// this component must have produced — the ring's round-trip check.
+pub fn body_pattern(i: usize) -> u8 {
+    (i.wrapping_mul(131) ^ (i >> 7)) as u8
+}
+
+/// `https://host/blob/<n>` synthesizes an `n`-MiB body — the PoC's stand-in
+/// for a large download (an image, a video segment). 1–256 MiB.
+fn blob_len(url: &str) -> Option<u64> {
+    let path = url.split("://").nth(1)?.split_once('/')?.1;
+    let mib: u64 = path.strip_prefix("blob/")?.parse().ok()?;
+    (1..=256).contains(&mib).then(|| mib * 1024 * 1024)
+}
+
+/// Ring window for streamed bodies. Small on purpose: a 64 MiB body wraps
+/// through it hundreds of times, and neither producer nor consumer ever
+/// holds more than this (plus one chunk) for the transport.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+const RING_CAPACITY: u32 = 256 * 1024;
+
+/// Stream a synthesized `body_len`-byte body through a shared-memory ring:
+/// header in-band first (so the consumer knows to start draining), ring fd
+/// right behind it via `SCM_RIGHTS`, then produce chunk by chunk — the whole
+/// body never exists in this process. `Err` means the engine link is gone; a
+/// dead *consumer* only costs this stream (bounded by the ring's stall
+/// timeout), not the component.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+fn stream_blob(ep: &mut Endpoint, request_id: u64, body_len: u64) -> std::io::Result<()> {
+    use crate::ipc::FetchOutcome;
+    use std::os::fd::AsRawFd;
+
+    let (mut producer, fd) = match crate::ring::RingProducer::create(RING_CAPACITY) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("[net] ring setup failed ({e}); denying stream");
+            let outcome = FetchOutcome::Denied { reason: "body stream setup failed".into() };
+            return ep.send(&NetResponse { request_id, outcome });
+        }
+    };
+    let outcome = FetchOutcome::OkStreaming { status: 200, body_len };
+    ep.send(&NetResponse { request_id, outcome })?;
+    ep.tx.send_fd(fd.as_raw_fd())?;
+    drop(fd); // the consumer got its duplicate; our mapping needs no fd
+
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut sent = 0u64;
+    while sent < body_len {
+        let n = chunk.len().min((body_len - sent) as usize);
+        for (i, b) in chunk[..n].iter_mut().enumerate() {
+            *b = body_pattern(sent as usize + i);
+        }
+        if let Err(e) = producer.write_all(&chunk[..n]) {
+            // Consumer gone, stalled, or corrupt: abandon this stream (the
+            // producer's Drop marks the ring aborted). The engine link is
+            // fine, so keep serving other fetches.
+            eprintln!("[net] body stream abandoned after {sent} bytes: {e}");
+            return Ok(());
+        }
+        sent += n as u64;
+    }
+    producer.finish();
+    Ok(())
+}
+
 /// `requester` is the `zone-N/origin` identity as recorded by the engine; a
 /// real implementation uses it for per-partition network policy. `cookies` are
 /// that partition's cookies (including HttpOnly) the engine wants attached to
@@ -60,6 +142,23 @@ pub fn serve(mut ep: Endpoint) {
 fn handle_fetch(_requester: &str, url: &str, cookies: &[(String, String)]) -> FetchOutcome {
     if let Some(reason) = ssrf_block_reason(url) {
         return FetchOutcome::Denied { reason };
+    }
+    // A large body on a transport without fd passing (single-process mode,
+    // or the bench's forced-socket comparison) is copied in-band — if it
+    // fits. The 16 MiB frame cap is DoS protection and stays authoritative:
+    // beyond it the honest answer is a refusal, not a raised limit.
+    if let Some(body_len) = blob_len(url) {
+        const MAX_INLINE_BLOB: u64 = 12 * 1024 * 1024; // frame cap minus headroom
+        if body_len > MAX_INLINE_BLOB {
+            return FetchOutcome::Denied {
+                reason: "body too large for in-band transport (needs the shm ring)".into(),
+            };
+        }
+        let mut body = vec![0u8; body_len as usize];
+        for (i, b) in body.iter_mut().enumerate() {
+            *b = body_pattern(i);
+        }
+        return FetchOutcome::Ok { status: 200, body };
     }
     // A real implementation would set `Cookie: name=value; ...` on the
     // outbound request from `cookies` and perform the HTTP fetch here; the PoC

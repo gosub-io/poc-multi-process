@@ -39,6 +39,39 @@ pub fn run(probe: &str) {
             std::process::exit(0);
         },
 
+        // The full shared-memory tile producer dance (memfd_create, ftruncate,
+        // mmap write, munmap, fcntl F_ADD_SEALS) must survive the sandbox —
+        // it's how a confined renderer ships every frame. Clean exit = pass.
+        "memfd-seal" => {
+            crate::shm::create_sealed_tile(64, 64, |buf| buf.fill(0xCD))
+                .expect("sealed tile under sandbox");
+            std::process::exit(0);
+        }
+
+        // fcntl is allowed *only* for the seal commands; any other command —
+        // here F_DUPFD, an fd-fabrication primitive — must be fatal. Reached
+        // only if the argument filter failed.
+        "fcntl-dupfd" => unsafe {
+            let _ = libc::fcntl(2, libc::F_DUPFD, 0);
+            std::process::exit(0);
+        },
+
+        // The full ring-buffer dance (memfd + size seals, RW mapping, cursor
+        // atomics, drain) must survive the sandbox — it's how a confined
+        // renderer receives every large fetch body. Single-threaded (the
+        // sandbox has no clone), so the body must fit the window: write it
+        // all, finish, then consume. Clean exit = pass.
+        "ring" => {
+            let (mut producer, fd) =
+                crate::ring::RingProducer::create(64 * 1024).expect("ring create under sandbox");
+            let body: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
+            producer.write_all(&body).expect("ring write under sandbox");
+            producer.finish();
+            let got = crate::ring::consume(fd, body.len() as u64).expect("ring consume under sandbox");
+            assert_eq!(got, body, "ring bytes corrupted under sandbox");
+            std::process::exit(0);
+        }
+
         other => {
             eprintln!("unknown selftest probe: {other}");
             std::process::exit(2);

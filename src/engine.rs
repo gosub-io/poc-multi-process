@@ -25,7 +25,7 @@
 //! this address space, so the policy checks are only a real barrier when a
 //! process boundary stands behind them.
 
-use crate::events::{EngineCommand, EngineEvent, TabCommand, TabId, Tile, ZoneId};
+use crate::events::{EngineCommand, EngineEvent, TabCommand, TabId, Tile, TilePixels, ZoneId};
 use crate::ipc::{
     self, Endpoint, EndpointTx, FetchOutcome, FromRenderer, NetRequest, NetResponse, ToRenderer,
 };
@@ -108,10 +108,20 @@ enum LoopMsg {
     Command(EngineCommand),
     /// A renderer sent a message (forwarded by its reader thread).
     FromTab { tab_id: TabId, msg: FromRenderer },
+    /// A renderer delivered a tile via shared memory; its reader thread
+    /// already received the fd, validated it (seals + real size) and mapped
+    /// it, so what reaches the loop is a ready, immutable tile.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    ShmTile { tab_id: TabId, tile: Tile },
     /// A renderer's link died without a shutdown — crash, most likely.
     TabGone { tab_id: TabId },
     /// The net component answered a fetch.
     NetReply(NetResponse),
+    /// The net component answered a fetch with a *streamed* body: the header
+    /// to route, plus the ring fd (already received by the net reader thread)
+    /// to forward to the requesting renderer. The engine never maps the ring.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    NetStream { resp: NetResponse, fd: std::os::fd::OwnedFd },
 }
 
 /// A running child component, however it is hosted.
@@ -263,6 +273,20 @@ impl EngineLoop {
             std::thread::spawn(move || loop {
                 match net_rx.recv::<NetResponse>() {
                     Ok(resp) => {
+                        // A streaming response's ring fd follows on the same
+                        // socket; this thread is its only reader, so take the
+                        // fd here and route both together.
+                        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                        if matches!(resp.outcome, FetchOutcome::OkStreaming { .. }) {
+                            let Ok(fd) = net_rx.recv_fd() else { break };
+                            if !net_gate.acquire() {
+                                break;
+                            }
+                            if inbox.send(LoopMsg::NetStream { resp, fd }).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                         if !net_gate.acquire() {
                             break;
                         }
@@ -324,6 +348,19 @@ impl EngineLoop {
                         gate.release();
                     }
                 }
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                LoopMsg::ShmTile { tab_id, tile } => {
+                    let gate = self.tabs.get(&tab_id).map(|t| Arc::clone(&t.gate));
+                    if gate.is_some() {
+                        // Zero-copy hand-off: the event carries the mapping
+                        // itself, and the mapping (+ pages) is freed when the
+                        // consumer drops the Tile.
+                        self.emit(EngineEvent::FrameReady { tab_id, tile });
+                    }
+                    if let Some(gate) = gate {
+                        gate.release();
+                    }
+                }
                 LoopMsg::TabGone { tab_id } => {
                     // Only a crash if we didn't remove the tab ourselves
                     // (close/shutdown also end the link, after removal).
@@ -336,6 +373,11 @@ impl EngineLoop {
                 }
                 LoopMsg::NetReply(resp) => {
                     self.net_reply(resp);
+                    self.net_gate.release();
+                }
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                LoopMsg::NetStream { resp, fd } => {
+                    self.net_stream(resp, fd);
                     self.net_gate.release();
                 }
             }
@@ -373,6 +415,35 @@ impl EngineLoop {
             std::thread::spawn(move || {
                 loop {
                     match rx.recv::<FromRenderer>() {
+                        // A shared-memory tile: the fd follows the message on
+                        // the same socket, so this thread — the socket's only
+                        // reader — receives and validates it here. The message
+                        // dimensions are a claim; map_sealed_tile refuses an
+                        // fd that isn't sealed or can't actually hold them. A
+                        // tile that fails validation is a protocol violation:
+                        // drop the link and report the tab gone.
+                        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                        Ok(FromRenderer::TileShm { width, height }) => {
+                            let mapped = rx
+                                .recv_fd()
+                                .and_then(|fd| crate::shm::map_sealed_tile(fd, width, height));
+                            match mapped {
+                                Ok(mapping) => {
+                                    if !gate.acquire() {
+                                        return;
+                                    }
+                                    let tile =
+                                        Tile { width, height, pixels: TilePixels::Shared(mapping) };
+                                    if inbox.send(LoopMsg::ShmTile { tab_id, tile }).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[engine] {tab_id}: rejected shm tile: {e}");
+                                    break;
+                                }
+                            }
+                        }
                         Ok(msg) => {
                             if !gate.acquire() {
                                 return;
@@ -485,9 +556,13 @@ impl EngineLoop {
             FromRenderer::Tile { width, height, pixels } => {
                 self.emit(EngineEvent::FrameReady {
                     tab_id,
-                    tile: Tile { width, height, pixels },
+                    tile: Tile { width, height, pixels: TilePixels::Inline(pixels) },
                 });
             }
+            // Consumed (fd received, validated, mapped) by the reader thread;
+            // never reaches the loop as a FromTab message.
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            FromRenderer::TileShm { .. } => {}
         }
     }
 
@@ -502,8 +577,38 @@ impl EngineLoop {
         let reply = match resp.outcome {
             FetchOutcome::Ok { status, body } => ToRenderer::FetchResult { status, body },
             FetchOutcome::Denied { reason } => ToRenderer::FetchDenied { reason },
+            // Streamed outcomes arrive as LoopMsg::NetStream, never here.
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            FetchOutcome::OkStreaming { .. } => return,
         };
         let _ = tab.tx.send(&reply);
+    }
+
+    /// Route a streamed fetch body: same bookkeeping as [`net_reply`], but
+    /// the payload is a ring fd the engine *forwards* to the renderer without
+    /// ever mapping it — the bytes flow net → renderer directly; the broker
+    /// only decides who gets the handle. If the tab is gone the fd just
+    /// drops, and the net component's stall timeout reclaims its ring.
+    ///
+    /// [`net_reply`]: Self::net_reply
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    fn net_stream(&mut self, resp: NetResponse, fd: std::os::fd::OwnedFd) {
+        use std::os::fd::AsRawFd;
+        let Some(tab_id) = self.pending_fetches.remove(&resp.request_id) else {
+            return; // requester disappeared while the fetch was in flight
+        };
+        let Some(tab) = self.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1);
+        let FetchOutcome::OkStreaming { status, body_len } = resp.outcome else {
+            return;
+        };
+        // Header first, fd right behind it — the renderer consumes them as
+        // one exchange (the tile path's discipline, direction reversed).
+        if tab.tx.send(&ToRenderer::FetchBodyStream { status, body_len }).is_ok() {
+            let _ = tab.tx.send_fd(fd.as_raw_fd());
+        }
     }
 
     fn shutdown(&mut self) {
@@ -662,7 +767,7 @@ impl Spawner {
                     // SCM_RIGHTS duplicates the fd into the fork server; the
                     // engine then drops its copy of the child's end so it sees
                     // EOF (→ TabCrashed) when the renderer dies.
-                    unsafe { crate::fork_server::send_fd(fork_control.as_raw_fd(), child_end.as_raw_fd()) }
+                    unsafe { ipc::send_fd(fork_control.as_raw_fd(), child_end.as_raw_fd()) }
                         .expect("send fd");
                     drop(child_end);
                     let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
