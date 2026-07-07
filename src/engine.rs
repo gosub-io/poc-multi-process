@@ -666,7 +666,7 @@ fn join(handle: ChildHandle) {
 /// partition — so an HTTPS page's cookies can never be attached to an HTTP
 /// fetch (no secure-cookie downgrade), and an `https:` renderer can't be
 /// navigated to `http:`. Still a PoC parser, not a URL library: no IDNA and
-/// no userinfo handling (`net_daemon::host_of` is the deliberately-hostile
+/// no userinfo handling (`ip_utils::host_of` is the deliberately-hostile
 /// one; a real engine shares one implementation).
 fn origin_of(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
@@ -940,20 +940,25 @@ mod tests {
 
     #[test]
     fn fetch_confined_to_own_origin() {
-        // A renderer may fetch its own origin (any path/port/scheme reduces to
-        // the same host origin here)...
-        assert!(may_fetch("example.com", "https://example.com/index.html"));
-        assert!(may_fetch("example.com", "https://example.com/a/b?c#d"));
+        // A renderer may fetch its own origin: any path/query on the same
+        // scheme://host, with the default port folding away.
+        assert!(may_fetch("https://example.com", "https://example.com/index.html"));
+        assert!(may_fetch("https://example.com", "https://example.com/a/b?c#d"));
+        assert!(may_fetch("https://example.com", "https://example.com:443/x"));
         // ...but not another host. This is the guard that stops a compromised
         // renderer from having the engine attach example.com's (HttpOnly)
         // cookies to a request aimed at an attacker-controlled server.
-        assert!(!may_fetch("example.com", "https://attacker.com/collect"));
-        assert!(!may_fetch("example.com", "https://evil.example.com/"));
+        assert!(!may_fetch("https://example.com", "https://attacker.com/collect"));
+        assert!(!may_fetch("https://example.com", "https://evil.example.com/"));
+        // Origins are schemeful: the same host over plain http (or another
+        // port) is a *different* origin — no secure-cookie downgrade.
+        assert!(!may_fetch("https://example.com", "http://example.com/"));
+        assert!(!may_fetch("https://example.com", "https://example.com:8443/"));
         // Userinfo confusion must not fool the gate into treating the
         // authority as same-origin.
-        assert!(!may_fetch("example.com", "https://example.com@attacker.com/"));
+        assert!(!may_fetch("https://example.com", "https://example.com@attacker.com/"));
         // An unparseable URL is not the tab's origin → refused.
-        assert!(!may_fetch("example.com", "not-a-url"));
+        assert!(!may_fetch("https://example.com", "not-a-url"));
     }
 
     #[test]

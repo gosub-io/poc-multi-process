@@ -25,6 +25,7 @@ mod engine;
 mod events;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 mod fork_server;
+mod ip_utils;
 mod ipc;
 mod net_daemon;
 mod renderer;

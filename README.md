@@ -356,7 +356,8 @@ covers the bounding mechanism itself deterministically.
 | `src/events.rs` | Public vocabulary: `EngineCommand`, `TabCommand`, `EngineEvent`, `TabId`, `Tile` |
 | `src/engine.rs` | `start(mode)`, `EngineHandle`, the event loop (broker + policy), `Spawner` |
 | `src/ipc.rs` | `Endpoint` tx/rx halves (socket/local transports), wire messages, bincode framing, `SCM_RIGHTS` fd-passing |
-| `src/net_daemon.rs` | Net component: `serve` loop, SSRF policy, (synthesized) fetching |
+| `src/net_daemon.rs` | Net component: `serve` loop, (synthesized) fetching |
+| `src/ip_utils.rs` | SSRF policy: URL host extraction, IP-literal parsing (incl. `inet_aton` encodings), blocked-range classification |
 | `src/renderer.rs` | Per-`(zone,origin)` renderer: `serve` loop, placeholder render pipeline |
 | `src/fork_server.rs` | Fork server (Linux): `fork()`s renderers without exec |
 | `src/shm.rs` | Shared-memory tiles (Linux): sealed-`memfd` producer + validating consumer |
