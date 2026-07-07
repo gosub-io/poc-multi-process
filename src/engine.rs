@@ -505,6 +505,17 @@ impl EngineLoop {
         };
         match msg {
             FromRenderer::NeedFetch { url } => {
+                // Site isolation for fetches: a renderer may only fetch its own
+                // origin. Without this a compromised renderer could name an
+                // attacker-controlled URL and the engine would attach *this*
+                // origin's cookies — including HttpOnly — to it, exfiltrating
+                // the session token the renderer is never allowed to see. Same
+                // rule the engine already applies to cross-origin navigation.
+                if !may_fetch(&tab.origin, &url) {
+                    let reason = format!("{url} is outside this renderer's origin {}", tab.origin);
+                    let _ = tab.tx.send(&ToRenderer::FetchDenied { reason });
+                    return;
+                }
                 // Backpressure: refuse a renderer that floods fetches without
                 // consuming replies, so it can't grow the engine unbounded.
                 if tab.inflight_fetches >= MAX_INFLIGHT_FETCHES {
@@ -657,9 +668,20 @@ fn origin_of(url: &str) -> Option<String> {
     Some(host.to_string())
 }
 
+/// Site-isolation gate for fetches: a renderer bound to `tab_origin` may only
+/// fetch its own origin. This is what makes attaching `tab_origin`'s cookies
+/// (below) safe — the destination is guaranteed to be that same origin, so a
+/// compromised renderer can't redirect its origin's (HttpOnly) cookies to an
+/// attacker-controlled host. Mirrors the cross-origin navigation refusal.
+fn may_fetch(tab_origin: &str, url: &str) -> bool {
+    origin_of(url).as_deref() == Some(tab_origin)
+}
+
 /// The `(zone, origin)` partition's cookies (name, value) to attach to an
 /// outbound request — **including HttpOnly**. Keyed by the pair, so one zone's
-/// cookies never travel on another zone's request.
+/// cookies never travel on another zone's request. Safe to attach by
+/// `tab.origin` only because [`may_fetch`] has already confirmed the request's
+/// destination *is* `tab.origin`.
 fn attachable_cookies(
     jar: &HashMap<(ZoneId, String), Vec<Cookie>>,
     zone: ZoneId,
@@ -863,6 +885,24 @@ mod tests {
         assert_eq!(origin_of("https://example.com").as_deref(), Some("example.com"));
         assert_eq!(origin_of("not-a-url"), None);
         assert_eq!(origin_of("https://"), None);
+    }
+
+    #[test]
+    fn fetch_confined_to_own_origin() {
+        // A renderer may fetch its own origin (any path/port/scheme reduces to
+        // the same host origin here)...
+        assert!(may_fetch("example.com", "https://example.com/index.html"));
+        assert!(may_fetch("example.com", "https://example.com/a/b?c#d"));
+        // ...but not another host. This is the guard that stops a compromised
+        // renderer from having the engine attach example.com's (HttpOnly)
+        // cookies to a request aimed at an attacker-controlled server.
+        assert!(!may_fetch("example.com", "https://attacker.com/collect"));
+        assert!(!may_fetch("example.com", "https://evil.example.com/"));
+        // Userinfo confusion must not fool the gate into treating the
+        // authority as same-origin.
+        assert!(!may_fetch("example.com", "https://example.com@attacker.com/"));
+        // An unparseable URL is not the tab's origin → refused.
+        assert!(!may_fetch("example.com", "not-a-url"));
     }
 
     #[test]

@@ -184,6 +184,16 @@ fn handle_fetch(_requester: &str, url: &str, cookies: &[(String, String)]) -> Fe
 /// rebinding. The PoC synthesizes responses offline, so a non-literal host is
 /// allowed with that caveat noted.
 fn ssrf_block_reason(url: &str) -> Option<String> {
+    // Scheme allowlist: the net component speaks HTTP(S) only. Anything else
+    // (`file:`, `gopher:`, `ftp:`, …) is refused outright rather than reasoned
+    // about — a renderer confined to its own *host* origin can still name a
+    // non-HTTP scheme, since origin identity here is scheme-blind.
+    match scheme_of(url) {
+        Some(s) if s == "http" || s == "https" => {}
+        Some(s) => return Some(format!("scheme {s}:// is not allowed (SSRF policy)")),
+        None => return Some("unparseable URL".into()),
+    }
+
     let Some(host) = host_of(url) else {
         return Some("unparseable URL".into());
     };
@@ -201,6 +211,13 @@ fn ssrf_block_reason(url: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The lowercased URL scheme (the part before `://`), or `None` if the URL has
+/// no `scheme://` form at all.
+fn scheme_of(url: &str) -> Option<String> {
+    let (scheme, _) = url.split_once("://")?;
+    (!scheme.is_empty()).then(|| scheme.to_ascii_lowercase())
 }
 
 /// Extract the host from a URL: drops the scheme, path/query/fragment, any
@@ -229,6 +246,10 @@ fn host_of(url: &str) -> Option<String> {
 /// `inet_aton(3)`/browsers accept (a single decimal/octal/hex number, or fewer
 /// than four dotted parts) — the encodings SSRF filters classically miss.
 fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+    // Strip an IPv6 zone id (`fe80::1%eth0`, or percent-encoded `fe80::1%25eth0`)
+    // before parsing, so a scoped link-local literal is still classified
+    // numerically instead of slipping through as an "unresolvable hostname".
+    let host = host.split('%').next().unwrap_or(host);
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Some(ip); // standard dotted-quad IPv4 or IPv6
     }
@@ -323,13 +344,26 @@ mod tests {
             "http://localhost/", "http://api.localhost/",
             // Alternate IPv4 encodings for 127.0.0.1.
             "http://2130706433/", "http://0x7f000001/", "http://017700000001/", "http://127.1/",
-            // IPv6 internal + IPv4-mapped.
+            // IPv6 internal + IPv4-mapped + scoped (zone id, raw and %25-encoded).
             "http://[::1]/", "http://[::ffff:169.254.169.254]/", "http://[fc00::1]/", "http://[fe80::1]/",
+            "http://[fe80::1%eth0]/", "http://[fe80::1%25eth0]/",
             // Parser-confusion: userinfo and trailing dot.
             "http://real.com@127.0.0.1/", "http://127.0.0.1.:80/",
+            // Non-HTTP schemes are refused outright, whatever the host.
+            "file://example.com/etc/passwd", "gopher://example.com/", "ftp://127.0.0.1/",
         ] {
             assert!(ssrf_block_reason(u).is_some(), "should block {u}: {:?}", ssrf_block_reason(u));
         }
+    }
+
+    #[test]
+    fn allows_only_http_schemes() {
+        assert!(scheme_of("https://example.com/").as_deref() == Some("https"));
+        assert!(scheme_of("HTTP://example.com/").as_deref() == Some("http")); // case-folded
+        assert!(scheme_of("not-a-url").is_none());
+        // A public host over http/https is fine; the same host over file:// is not.
+        assert!(ssrf_block_reason("https://example.com/").is_none());
+        assert!(ssrf_block_reason("file://example.com/").is_some());
     }
 
     #[test]
