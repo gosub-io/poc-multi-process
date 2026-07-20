@@ -122,7 +122,10 @@ fn run(mode: Mode) {
     engine.open_tab(work, "https://example.com").unwrap();
     engine.open_tab(personal, "https://example.com").unwrap();
 
-    let mut tabs_closed = 0;
+    // Counts tabs that have *finished*, however they finished. A crash is an
+    // outcome, not a reason to wait forever — see `TabCrashed` below.
+    let mut tabs_finished = 0;
+    let mut crashed = 0;
     for event in events {
         match event {
             EngineEvent::TabOpened { tab_id, zone, origin } => {
@@ -149,8 +152,8 @@ fn run(mode: Mode) {
             }
             EngineEvent::TabClosed { tab_id } => {
                 println!("{tab_id}: closed");
-                tabs_closed += 1;
-                if tabs_closed == 2 {
+                tabs_finished += 1;
+                if tabs_finished == 2 {
                     engine.shutdown().unwrap();
                 }
             }
@@ -161,13 +164,36 @@ fn run(mode: Mode) {
                 println!("{tab_id}: navigation failed: {reason}");
             }
             EngineEvent::TabCrashed { tab_id } => {
+                // A crashed tab is finished too. Counting it is what keeps a
+                // dead renderer from hanging the whole run: previously this
+                // arm only printed, so `tabs_finished` never reached its
+                // target, shutdown was never sent, and the loop blocked
+                // forever. That turned any renderer failure — a sandbox gap on
+                // an untested libc, say — into a silent hang instead of a
+                // fast, loud failure. CI sat for hours on one.
+                //
+                // The exit code below still reports it, so this terminates
+                // *and* fails rather than pretending all is well.
                 println!("{tab_id}: renderer crashed (other tabs unaffected)");
+                crashed += 1;
+                tabs_finished += 1;
+                if tabs_finished == 2 {
+                    engine.shutdown().unwrap();
+                }
             }
             EngineEvent::EngineShutdown => {
                 println!("engine shut down");
                 break;
             }
         }
+    }
+
+    // Exit non-zero if any renderer died. Without this the demo would report
+    // success on a run where nothing rendered, which is exactly the false
+    // green the integration tests would then have to catch on their own.
+    if crashed > 0 {
+        eprintln!("{crashed} renderer(s) crashed — see the sandbox notes in src/sandbox/");
+        std::process::exit(1);
     }
 }
 

@@ -162,15 +162,28 @@ const NET_EXTRA: &[libc::c_long] = &[
 /// `prctl` commands involved are one-way switches.
 #[cfg(feature = "multi-process")]
 const FORK_SERVER_EXTRA: &[libc::c_long] = &[
+    // All three spellings of "make a process", because which one `fork()`
+    // becomes is the C library's choice: glibc issues `clone3` (new) or
+    // `clone` (older), musl issues the legacy `SYS_fork`. Allowing only the
+    // pair glibc uses kills the fork server outright on musl — at its own
+    // canary, which is the one failure the canary cannot report politely.
+    //
+    // `SYS_fork` is x86-only: aarch64 has no fork syscall at all, and naming
+    // it there does not compile.
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    libc::SYS_fork,
     libc::SYS_clone,
     libc::SYS_clone3,
     libc::SYS_wait4,
     libc::SYS_prctl,
     libc::SYS_seccomp,
-    // glibc's own post-fork housekeeping in the child, before a single line of
-    // our code runs: it resets the robust-futex list. Invisible in the source,
-    // fatal without it.
+    // The C library's own post-fork housekeeping in the child, before a single
+    // line of our code runs — and each libc does it differently: glibc resets
+    // the robust-futex list, musl registers a TID address. Invisible in the
+    // source, fatal without them. Both merely register a pointer for the
+    // kernel to clear on exit; neither can escalate.
     libc::SYS_set_robust_list,
+    libc::SYS_set_tid_address,
 ];
 
 /// Prove, on *this* machine, that the fork-server filter actually permits what
@@ -255,20 +268,20 @@ pub fn verify_fork_server_filter() {
 /// against it, so the *detection* is tested and not merely the happy path.
 ///
 /// Spawned only by the integration suite (`selftest forkserver-canary-gap`).
-/// The omission is `set_robust_list` — one of the three syscalls that were
-/// genuinely missing when this filter was written, and the one whose absence
-/// is invisible in our source because glibc issues it in the child before any
-/// of our code runs. The canary must catch it and exit non-zero; a canary that
-/// only ever passes is indistinguishable from no canary at all.
+/// The canary must catch the gap and exit non-zero; a canary that only ever
+/// passes is indistinguishable from no canary at all.
 #[cfg(feature = "multi-process")]
 pub fn canary_must_detect_a_missing_syscall() -> ! {
-    let crippled: Vec<libc::c_long> = BASELINE
-        .iter()
-        .chain(FORK_SERVER_EXTRA)
-        .copied()
-        .filter(|nr| *nr != libc::SYS_set_robust_list)
-        .collect();
-    if install_with(crippled, true).is_err() {
+    // The gap is the missing `F_DUPFD_CLOEXEC` permission, deliberately, and
+    // not a missing syscall from the list: the syscall a forked child needs is
+    // itself libc-dependent, so removing any *one* of them tests nothing on the
+    // libc that does not use it. An earlier version dropped `set_robust_list`,
+    // which glibc issues and musl does not — so on musl the crippled filter was
+    // not crippled, the canary correctly reported no problem, and this test
+    // failed for being wrong rather than the code being wrong. Every libc needs
+    // to clone a descriptor here, so denying that is a gap everywhere.
+    let full: Vec<libc::c_long> = BASELINE.iter().chain(FORK_SERVER_EXTRA).copied().collect();
+    if install_with(full, false).is_err() {
         eprintln!("could not install the crippled filter");
         std::process::exit(2);
     }
@@ -394,8 +407,9 @@ fn install_with(
     // be able to seal its tile buffers, and Rust's std *debug* builds probe
     // fds with fcntl(F_GETFD) when an OwnedFd drops (debug_assert_fd_is_open)
     // — a pure query with nothing to escalate. Every *mutating* fcntl command
-    // — F_DUPFD (fd fabrication), F_SETFD (clearing CLOEXEC), F_SETFL, locks —
-    // hits KillProcess.
+    // — F_DUPFD (fd fabrication), F_SETFL, locks — hits KillProcess. F_SETFD
+    // is a special case handled below: permitted only to *set* close-on-exec,
+    // never to clear it.
     let mut fcntl_allowed = Vec::new();
     let mut cmds = vec![libc::F_ADD_SEALS, libc::F_GET_SEALS, libc::F_GETFD];
     if allow_dup_fd {
@@ -405,6 +419,24 @@ fn install_with(
         let is_cmd =
             SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, cmd as u64)?;
         fcntl_allowed.push(SeccompRule::new(vec![is_cmd])?);
+    }
+    if allow_dup_fd {
+        // musl follows its `F_DUPFD_CLOEXEC` with an explicit
+        // `fcntl(F_SETFD, FD_CLOEXEC)`; glibc does not. Both conditions are
+        // required together (they AND), so this permits *setting* close-on-exec
+        // and nothing else: `F_SETFD` with any other flag word — crucially 0,
+        // which would CLEAR close-on-exec and leak the descriptor across an
+        // exec — still hits KillProcess. Setting the flag only ever narrows
+        // what a descriptor can do, so this grants no reach.
+        let is_setfd =
+            SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, libc::F_SETFD as u64)?;
+        let sets_cloexec = SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::Eq,
+            libc::FD_CLOEXEC as u64,
+        )?;
+        fcntl_allowed.push(SeccompRule::new(vec![is_setfd, sets_cloexec])?);
     }
     rules.insert(libc::SYS_fcntl as i64, fcntl_allowed);
 

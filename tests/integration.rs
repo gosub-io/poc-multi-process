@@ -10,8 +10,48 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_gosub-proc-iso-poc")
 }
 
+/// How long the binary may run before the harness gives up on it. Everything
+/// here finishes in seconds; this is a backstop, not a budget.
+const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run the binary to completion, killing it if it exceeds [`RUN_TIMEOUT`].
+///
+/// The timeout is the point. `Command::output()` waits forever, so anything
+/// that wedges the engine — a renderer dying on a syscall the sandbox forgot,
+/// on a libc nobody tested — stops being a test failure and becomes a hung
+/// job. That is exactly what happened on the first CI run: the musl leg sat
+/// for hours on a demo that had already lost both its renderers, reporting
+/// nothing. A hang must present as a fast, loud failure.
 fn run(args: &[&str]) -> Output {
-    Command::new(bin()).args(args).output().expect("spawn poc binary")
+    use std::process::Stdio;
+
+    let mut child = Command::new(bin())
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn poc binary");
+
+    let deadline = std::time::Instant::now() + RUN_TIMEOUT;
+    loop {
+        match child.try_wait().expect("poll child") {
+            Some(_) => break,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let out = child.wait_with_output().expect("reap timed-out child");
+                panic!(
+                    "`{}` did not finish within {RUN_TIMEOUT:?} — killed.\n\
+                     A hang here usually means a renderer died and the engine is \
+                     still waiting on it.\nstdout:\n{}\nstderr:\n{}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr),
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    child.wait_with_output().expect("collect child output")
 }
 
 /// The default run (multi-process where the feature is on) must open two tabs,

@@ -26,6 +26,10 @@ jobs:
   linux-libc-matrix:
     name: linux (${{ matrix.name }})
     runs-on: ubuntu-latest
+    # A cap, not a budget: these finish in well under a minute. The default is
+    # 360, and the first run of this workflow spent hours on a wedged musl job
+    # before it was cancelled by hand. A hang should cost minutes and report.
+    timeout-minutes: 15
     container:
       image: ${{ matrix.image }}
       # Docker's default seccomp profile denies unshare(CLONE_NEWUSER), which
@@ -75,6 +79,7 @@ jobs:
   cross-compile:
     name: check (${{ matrix.target }}${{ matrix.features && ' single-process' }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -101,6 +106,7 @@ jobs:
   native-tests:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -118,6 +124,7 @@ jobs:
   # fmt, once a rustfmt.toml pins the style the code actually uses.
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
