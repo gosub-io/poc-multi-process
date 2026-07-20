@@ -48,6 +48,11 @@
 
 use std::ffi::c_void;
 
+/// Address-space ceiling for a confined child — the `RLIMIT_AS` analogue,
+/// matching the Linux backend's 512 MiB.
+#[cfg(feature = "multi-process")]
+const CHILD_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
+
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessMitigationPolicy, SetProcessMitigationPolicy,
     ProcessChildProcessPolicy, ProcessDynamicCodePolicy, ProcessExtensionPointDisablePolicy,
@@ -151,6 +156,20 @@ fn lock_down(role: &str) {
         }
     }
 
+    // Lower integrity *after* the mitigation policies: those are pure
+    // capability removals, whereas this changes what objects we may touch, and
+    // doing it last keeps the window in which we are both privileged and
+    // partially confined as small as possible.
+    let integrity = match set_low_integrity() {
+        Ok(()) => "low-integrity",
+        Err(e) => {
+            // Best-effort, like win32k below: a host or token configuration
+            // that refuses this should degrade hardening, not refuse to run.
+            eprintln!("[{role}] warning: could not drop to low integrity: {e}");
+            "integrity-unchanged"
+        }
+    };
+
     let win32k = match set_policy(ProcessSystemCallDisablePolicy, DISALLOW_WIN32K_SYSCALLS) {
         Ok(()) => "win32k-blocked",
         Err(e) => {
@@ -159,7 +178,9 @@ fn lock_down(role: &str) {
         }
     };
 
-    eprintln!("[{role}] mitigation policies active (no dynamic code, no child processes, {win32k})");
+    eprintln!(
+        "[{role}] mitigation policies active (no dynamic code, no child processes, {win32k}, {integrity})"
+    );
 }
 
 /// Cap a renderer.
@@ -186,16 +207,162 @@ pub fn lock_down_net() {
     lock_down("net");
 }
 
-/// Resource ceilings. Not implemented on Windows.
+/// Resource ceilings are imposed by [`confine_spawned_child`] instead.
 ///
-/// The natural mechanism is a **job object** (`JOB_OBJECT_LIMIT_PROCESS_MEMORY`
-/// for the `RLIMIT_AS` analogue, plus an active-process cap), which a process
-/// can create and assign itself to. It is not wired up yet, and this hook is
-/// additionally never reached: it is called from `pre_exec`, which is a Unix
-/// concept the Windows spawn path has no equivalent of.
+/// This hook is a Unix `pre_exec` concept and is never reached on Windows —
+/// there is no post-fork/pre-exec moment to run code in. The equivalent caps
+/// live in a job object, which the *parent* attaches after `CreateProcess`
+/// returns.
 #[cfg(feature = "multi-process")]
 pub fn apply_child_rlimits() -> std::io::Result<()> {
     Ok(())
+}
+
+/// Put a freshly spawned child into a job object carrying its resource caps.
+///
+/// This is the parent-side half of Windows confinement — the half that cannot
+/// be self-applied — and it is deliberately the *simplest* member of that
+/// family, because a job can be attached to a process that already exists.
+/// Its siblings (a restricted token, an AppContainer) must be supplied at
+/// `CreateProcess` time and so need a spawn path that `std::process::Command`
+/// cannot provide. See the module docs.
+///
+/// The limits:
+/// * **`PROCESS_MEMORY`** — the `RLIMIT_AS` analogue Windows otherwise lacks.
+///   An over-allocating child fails its allocation and dies alone rather than
+///   taking the machine with it.
+/// * **`ACTIVE_PROCESS` = 1** — belt and braces with the child-process
+///   mitigation policy: even if that policy could be evaded, the job refuses to
+///   hold a second process.
+/// * **`KILL_ON_JOB_CLOSE`** — when the last handle to the job closes, every
+///   process in it dies. Since the engine holds that handle for its own
+///   lifetime, an engine that crashes takes its renderers with it instead of
+///   orphaning them.
+///
+/// **The job handle is deliberately never closed.** `KILL_ON_JOB_CLOSE` is
+/// armed by exactly that: were it closed here, the child would be killed
+/// immediately. Leaking it ties the job's lifetime to the engine process,
+/// which is the property we want. The cost is one handle per child spawned,
+/// which for this PoC is negligible; a long-running browser would store the
+/// handle alongside the child and drop it when the child is reaped.
+#[cfg(feature = "multi-process")]
+pub fn confine_spawned_child(child: windows_sys::Win32::Foundation::HANDLE) -> std::io::Result<()> {
+    apply_job_limits(child, CHILD_MEMORY_LIMIT)
+}
+
+/// Create a job with `memory_limit`, apply it to `process`, and leak the job
+/// handle (see [`confine_spawned_child`] for why).
+#[cfg(feature = "multi-process")]
+pub fn apply_job_limits(
+    process: windows_sys::Win32::Foundation::HANDLE,
+    memory_limit: usize,
+) -> std::io::Result<()> {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    };
+
+    // SAFETY: an unnamed job with default security.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // SAFETY: the struct is plain data with no pointers; zeroing is its
+    // documented "no limits" state, and we then set only the fields we want.
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY
+        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    info.BasicLimitInformation.ActiveProcessLimit = 1;
+    info.ProcessMemoryLimit = memory_limit;
+
+    // SAFETY: the info class matches the struct passed, with its true size.
+    let ok = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            std::ptr::addr_of!(info).cast::<c_void>(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // SAFETY: both handles are valid and owned by this process.
+    if unsafe { AssignProcessToJobObject(job, process) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Intentionally not closed — see the doc comment.
+    Ok(())
+}
+
+/// Drop this process to **low integrity**, self-applied and irreversible.
+///
+/// Windows integrity levels are mandatory access control: a low-integrity
+/// process cannot write to any securable object labelled medium or above,
+/// which is essentially all of the user's profile and registry. A token may
+/// always lower its own level — raising it is what requires privilege — so
+/// this fits the self-applied contract even though it is an access control,
+/// unlike its siblings.
+///
+/// This is the largest single reduction in blast radius available here, and it
+/// partially covers the gap left by the missing restricted token: the renderer
+/// can still *read* broadly, but it can no longer write to the user's files.
+fn set_low_integrity() -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows_sys::Win32::Security::{
+        SetTokenInformation, TokenIntegrityLevel, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT,
+        TOKEN_MANDATORY_LABEL,
+    };
+    // windows-sys files this constant under SystemServices rather than
+    // Security, though it is a token group attribute.
+    use windows_sys::Win32::System::SystemServices::SE_GROUP_INTEGRITY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // S-1-16-4096 = SECURITY_MANDATORY_LOW_RID.
+    let sid_text: Vec<u16> = "S-1-16-4096 ".encode_utf16().collect();
+    let mut sid = std::ptr::null_mut();
+    // SAFETY: NUL-terminated wide string in, owned SID out (freed below).
+    if unsafe { ConvertStringSidToSidW(sid_text.as_ptr(), &mut sid) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut token = std::ptr::null_mut();
+    // SAFETY: pseudo-handle for self; token handle out.
+    let opened =
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_DEFAULT, &mut token) };
+    if opened == 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { LocalFree(sid) };
+        return Err(e);
+    }
+
+    let label = TOKEN_MANDATORY_LABEL {
+        Label: SID_AND_ATTRIBUTES { Sid: sid, Attributes: SE_GROUP_INTEGRITY as u32 },
+    };
+    // SAFETY: the info class matches the struct; the SID is valid until freed.
+    let set = unsafe {
+        SetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            std::ptr::addr_of!(label).cast::<c_void>(),
+            std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32,
+        )
+    };
+    let result = if set == 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) };
+
+    // SAFETY: both were allocated by the calls above and are no longer used.
+    unsafe {
+        CloseHandle(token);
+        LocalFree(sid);
+    }
+    result
 }
 
 /// No network isolation. On Linux this is an empty netns; on macOS the

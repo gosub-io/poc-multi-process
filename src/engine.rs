@@ -962,6 +962,13 @@ fn spawn_inherited(
     }
 
     let child = cmd.spawn().expect("spawn child process");
+    // Parent-side confinement, for the mechanisms a child cannot apply to
+    // itself. A no-op outside Windows, where everything is self-applied.
+    if let Err(e) = crate::sandbox::confine_spawned_child(&child) {
+        // Fail closed, matching the lockdown precedent: a child that was meant
+        // to be capped and silently is not is worse than an honest refusal.
+        panic!("could not confine spawned child: {e}");
+    }
     // The child holds its own copy now; drop ours so a dead child is seen as
     // EOF rather than a link the engine is itself holding open.
     drop(child_end);

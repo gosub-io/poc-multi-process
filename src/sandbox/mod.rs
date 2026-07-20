@@ -43,6 +43,8 @@
 //! | [`lock_down_renderer`]   | after the IPC link is connected | renderer |
 //! | [`lock_down_net`]        | after the IPC link is connected | net component |
 //!
+//! | [`confine_spawned_child`] | immediately after spawn, **by the parent** | children (Windows only in effect) |
+//!
 //! Linux additionally has [`lock_down_fork_server`], which is not part of the
 //! cross-platform contract: no other backend has a zygote to confine.
 //!
@@ -68,13 +70,21 @@
 //! `CreateProcess` time, before the child executes an instruction. They cannot
 //! be expressed as a `lock_down_*` call from inside the child.
 //!
-//! Adding Windows therefore means adding a sixth, parent-side operation that
-//! the spawner applies at creation time, with `lock_down_*` demoted to the
-//! second stage of a two-phase drop (Chromium's model: create suspended and
-//! already-confined, warm up, then `LowerToken()` to the final restricted
-//! token). That is a change to *this* contract, not a detail a backend can
-//! absorb — which is the main reason a Windows port is a larger job than the
-//! macOS one was. See `unsupported.rs` for what happens there today.
+//! That is what [`confine_spawned_child`] is: the sixth operation, applied by the
+//! parent rather than the process itself. It turned out to be less invasive
+//! than expected, because the mechanisms split three ways rather than two:
+//!
+//! * Self-applied after exec — the mitigation policies, and (because a token
+//!   may always lower its own integrity) the low-integrity drop. These fit the
+//!   original contract untouched.
+//! * Parent-side but *post*-spawn — a job object, which can be attached to a
+//!   process that already exists. This is the one new hook.
+//! * Parent-side and *pre*-create — a restricted token and an AppContainer,
+//!   which must be supplied to `CreateProcess` itself. These still have no
+//!   home: `std::process::Command` cannot pass a token or a
+//!   `PROC_THREAD_ATTRIBUTE_LIST`, so they need a bespoke Windows spawn path,
+//!   and with it Chromium's two-phase drop (create suspended and confined,
+//!   warm up, then `LowerToken`). Not implemented.
 
 // --- platform seam: the only place a sandbox `target_os` cfg lives ---
 #[cfg(target_os = "linux")]
@@ -139,6 +149,40 @@ pub fn lock_down_renderer() {
 #[cfg(feature = "multi-process")]
 pub fn lock_down_net() {
     imp::lock_down_net();
+}
+
+/// Apply parent-side confinement to a child that has just been spawned.
+///
+/// **The sixth operation**, and the first that is not self-applied: the parent
+/// does this *to* the child. Windows needs it because its access controls
+/// (here a job object; later a restricted token and an AppContainer) can only
+/// be attached from outside — see the note below on why the contract assumed
+/// otherwise. On Linux and macOS confinement is entirely self-applied, so this
+/// is a no-op there and the platforms stay symmetric at the call site.
+///
+/// Called immediately after spawn, before the child has done any work.
+#[cfg(feature = "multi-process")]
+pub fn confine_spawned_child(child: &std::process::Child) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::io::AsRawHandle;
+        return imp::confine_spawned_child(child.as_raw_handle() as _);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = child;
+        Ok(())
+    }
+}
+
+/// Apply a job-object memory cap to a process. Exposed for the probe suite,
+/// which assigns the caps to itself to verify they bind. Windows only.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub fn apply_job_limits(
+    process: ::windows_sys::Win32::Foundation::HANDLE,
+    memory_limit: usize,
+) -> std::io::Result<()> {
+    imp::apply_job_limits(process, memory_limit)
 }
 
 /// Read back a Windows process mitigation policy's flag word, so a probe can

@@ -393,6 +393,23 @@ mod mitigation_enforcement {
     fn kernel_recorded_the_policies() {
         check("mitigation-policies-readback");
     }
+
+    /// Integrity is mandatory access control: a low-integrity process cannot
+    /// write to objects labelled medium or above, which is most of the user's
+    /// profile. This is the largest single reduction in blast radius available
+    /// on Windows without a bespoke spawn path.
+    #[test]
+    fn renderer_cannot_write_to_medium_integrity_objects() {
+        check("low-integrity");
+    }
+
+    /// The job object's memory ceiling — the `RLIMIT_AS` analogue Windows
+    /// otherwise lacks, and the one parent-side control that can be attached
+    /// to a process that already exists.
+    #[test]
+    fn job_object_caps_memory() {
+        check("job-memory-limit");
+    }
 }
 
 /// Guards the enforcement suite against silently shrinking.
@@ -459,6 +476,8 @@ mod probe_inventory {
         "mitigation-dynamic-code",
         "mitigation-child-process",
         "mitigation-policies-readback",
+        "low-integrity",
+        "job-memory-limit",
     ];
 
     /// Everything else has no sandbox backend: components run unconfined under

@@ -123,6 +123,10 @@ pub const PROBES: &[&str] = &[
     "mitigation-child-process",
     #[cfg(target_os = "windows")]
     "mitigation-policies-readback",
+    #[cfg(target_os = "windows")]
+    "low-integrity",
+    #[cfg(target_os = "windows")]
+    "job-memory-limit",
 ];
 
 /// Outcome codes for the Windows probes, mirroring the macOS set.
@@ -238,6 +242,78 @@ fn run_windows_probe(probe: &str) {
                         std::process::exit(wcode::WRONG_VALUE);
                     }
                 }
+            }
+            std::process::exit(0);
+        }
+
+        // Integrity is mandatory access control: a low-integrity process
+        // cannot write to objects labelled medium or above, which is most of
+        // the user's profile. Tested behaviourally rather than by reading the
+        // token back — what matters is that a write is actually refused, and
+        // the checkout directory the test runs from is medium integrity.
+        "low-integrity" => {
+            let path = std::env::current_dir()
+                .unwrap_or_else(|_| ".".into())
+                .join("gosub-integrity-probe.tmp");
+            if std::fs::write(&path, b"control").is_err() {
+                std::process::exit(wcode::CONTROL_FAILED);
+            }
+            let _ = std::fs::remove_file(&path);
+
+            crate::sandbox::lock_down_renderer();
+
+            match std::fs::write(&path, b"after") {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&path);
+                    std::process::exit(wcode::NOT_DENIED)
+                }
+                Err(_) => std::process::exit(0),
+            }
+        }
+
+        // The job object's memory ceiling — the `RLIMIT_AS` analogue Windows
+        // otherwise lacks. Uses its own small limit rather than the engine's
+        // 512 MiB so the probe stays quick; what is under test is that a job
+        // memory cap binds at all, not the specific number.
+        "job-memory-limit" => {
+            use windows_sys::Win32::System::Memory::{
+                VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+            };
+            const LIMIT: usize = 64 * 1024 * 1024;
+            const ASK: usize = 192 * 1024 * 1024;
+
+            // SAFETY: plain anonymous commit; freed immediately.
+            let control = unsafe {
+                let p = VirtualAlloc(std::ptr::null(), ASK, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if p.is_null() {
+                    false
+                } else {
+                    VirtualFree(p, 0, MEM_RELEASE);
+                    true
+                }
+            };
+            if !control {
+                std::process::exit(wcode::CONTROL_FAILED);
+            }
+
+            // SAFETY: pseudo-handle for the current process.
+            let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
+            if crate::sandbox::apply_job_limits(me, LIMIT).is_err() {
+                std::process::exit(wcode::WRONG_VALUE);
+            }
+
+            // SAFETY: as above; the allocation is expected to be refused now.
+            let after = unsafe {
+                let p = VirtualAlloc(std::ptr::null(), ASK, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if p.is_null() {
+                    false
+                } else {
+                    VirtualFree(p, 0, MEM_RELEASE);
+                    true
+                }
+            };
+            if after {
+                std::process::exit(wcode::NOT_DENIED);
             }
             std::process::exit(0);
         }
