@@ -379,7 +379,13 @@ simplified is the surrounding browser. What each entry below still needs:
   "a renderer cannot reach the network" no longer rests on the syscall
   allowlist alone. The two layers fail independently: an allowlist gap is
   survivable when the namespace has no interfaces to connect through. The net
-  component is the one role that keeps the host netns. Still missing for a real
+  component is the one role that keeps the host netns. Separately, every process
+  (engine included, in both modes) clears its **dumpable** flag, so other
+  software running as the same user cannot `ptrace`-attach or read
+  `/proc/<pid>/mem` — the engine's cookie jar is the obvious target, and this is
+  the inbound direction that seccomp has no say over. It is set after `execve`,
+  which resets the flag; it survives `fork`, so renderers inherit it from the
+  fork server. Still missing for a real
   deployment: a per-arch baseline tested across libc/kernel versions,
   filesystem restriction (Landlock), and the remaining namespaces
   (mount/PID/IPC) plus `pivot_root`. A real JS JIT needs executable memory, so

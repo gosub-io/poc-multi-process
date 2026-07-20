@@ -29,7 +29,9 @@ mod ip_utils;
 mod ipc;
 mod net_daemon;
 mod renderer;
-#[cfg(feature = "multi-process")]
+// Unconditional: the seccomp/rlimit machinery inside is feature-gated, but
+// `deny_debugger_attach` applies to the single-process build too — that build
+// still holds the cookie jar in its address space.
 mod sandbox;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 mod ring;

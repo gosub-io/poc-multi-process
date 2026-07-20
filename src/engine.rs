@@ -95,6 +95,10 @@ impl EngineHandle {
 /// event stream; the event loop runs on its own thread until
 /// [`EngineCommand::Shutdown`].
 pub fn start(mode: Mode) -> (EngineHandle, Receiver<EngineEvent>) {
+    // The engine is the highest-value target on the machine: it is the only
+    // process holding the cookie jar. Do this before the loop starts, and so
+    // before any jar is loaded, so the secrets are never in a readable process.
+    crate::sandbox::deny_debugger_attach();
     let (inbox_tx, inbox_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     let handle = EngineHandle { inbox: inbox_tx.clone() };

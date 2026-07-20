@@ -164,6 +164,16 @@ mod sandbox_enforcement {
         assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (no network), got {st:?}");
     }
 
+    /// The inbound direction: other software running as the same user must not
+    /// be able to `ptrace`-attach or read `/proc/<pid>/mem`. Guards the
+    /// placement as much as the call — the dumpable flag does not survive
+    /// `execve`, so setting it pre-exec would leave this silently at 1.
+    #[test]
+    fn children_refuse_debugger_attach() {
+        let st = probe("no-ptrace");
+        assert!(st.success(), "expected a non-dumpable process, got {st:?}");
+    }
+
     /// Defense in depth beneath the allowlist: even if `socket()` were somehow
     /// reachable, the renderer's network namespace has nothing in it. This
     /// probe unshares and then enumerates interfaces, so it fails loudly if the

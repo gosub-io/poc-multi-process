@@ -127,12 +127,14 @@ const NET_EXTRA: &[libc::c_long] = &[
 /// Cap a renderer: pixels only — the baseline, no network, files, or exec.
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 pub fn lock_down_renderer() {
+    deny_debugger_attach();
     enforce("renderer", install(BASELINE.to_vec()));
 }
 
 /// Cap the net component: the baseline plus the socket family.
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 pub fn lock_down_net() {
+    deny_debugger_attach();
     let allowed: Vec<libc::c_long> = BASELINE.iter().chain(NET_EXTRA).copied().collect();
     enforce("net", install(allowed));
 }
@@ -271,6 +273,50 @@ pub fn unshare_network() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Mark the calling process non-dumpable, closing the *inbound* debugging
+/// surface.
+///
+/// Everything else here confines what a compromised child can do. This defends
+/// the opposite direction: what another process on the host may do *to* us.
+/// A same-uid process can normally `ptrace`-attach to any of ours and read
+/// `/proc/<pid>/mem` — which for the engine means the cookie jar in cleartext.
+/// `RLIMIT_CORE = 0` already stops a crash from spilling those pages to disk;
+/// this stops a live process from reading them.
+///
+/// The observable effect is that `PTRACE_ATTACH` (and so `/proc/<pid>/mem`)
+/// is refused with `EPERM`. Note it does *not* reliably reassign the existing
+/// `/proc/<pid>` directory to root — that ownership is decided when the inode
+/// is created, so a directory already materialized under the invoking user
+/// stays that way. Do not use `/proc` ownership as evidence this took effect;
+/// `PR_GET_DUMPABLE`, or an actual attach attempt, is the honest check.
+///
+/// Note the children cannot do this to *each other* anyway — `ptrace` is not on
+/// the allowlist — so the threat model here is other software running as the
+/// same user, which seccomp has no say over.
+///
+/// **Placement matters**: the dumpable flag is reset to 1 by `execve` (for a
+/// normal, non-setuid binary), but is inherited across `fork`. So this must be
+/// called by each role *after* it has exec'd — calling it in `pre_exec`
+/// alongside the rlimits would be silently undone by the exec that follows.
+/// The fork server calls it once and every renderer it forks inherits it.
+/// Applies in single-process mode too: that build has no children to confine,
+/// but it still holds the cookie jar in its address space.
+#[cfg(target_os = "linux")]
+pub fn deny_debugger_attach() {
+    // SAFETY: PR_SET_DUMPABLE takes one value argument and affects only the
+    // calling process.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } < 0 {
+        // Not fatal, unlike seccomp: this is a hardening measure against other
+        // software on the host, not the boundary that contains a compromised
+        // renderer. Losing it degrades defense in depth rather than opening the
+        // sandbox, so we report it and continue.
+        eprintln!(
+            "[sandbox] warning: could not clear dumpable flag: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// Lower the calling process's scheduling priority (higher nice = lower
 /// priority). Async-signal-safe (a single syscall), so usable pre-exec.
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
@@ -291,6 +337,11 @@ fn set_rlimit(resource: libc::__rlimit_resource_t, limit: libc::rlim_t) -> std::
     }
     Ok(())
 }
+
+/// No-op off Linux. macOS has `PT_DENY_ATTACH` and Windows has process
+/// mitigation policies; both would go here.
+#[cfg(not(target_os = "linux"))]
+pub fn deny_debugger_attach() {}
 
 // On non-Linux (multi-process still builds over Unix sockets on e.g. macOS)
 // there is no seccomp; the caps are no-ops with a note.

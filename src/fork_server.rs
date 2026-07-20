@@ -38,6 +38,12 @@ pub fn run(control_fd: &str) {
     // SAFETY: the engine passed us sole ownership of this inherited fd.
     let mut control = unsafe { UnixStream::from_raw_fd(control_fd) };
 
+    // Close the inbound debugging surface *here*, after exec: the flag does not
+    // survive execve, so it could not have been set with the rlimits pre-exec.
+    // It does survive fork, so every renderer below inherits it — which also
+    // covers the window before a renderer reaches its own lockdown.
+    crate::sandbox::deny_debugger_attach();
+
     loop {
         let req: ForkRequest = match ipc::recv_msg(&mut control) {
             Ok(req) => req,
