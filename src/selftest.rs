@@ -85,6 +85,12 @@ pub const PROBES: &[&str] = &[
     "netns",
     #[cfg(target_os = "linux")]
     "no-ptrace",
+    #[cfg(target_os = "linux")]
+    "forkserver-can-fork",
+    #[cfg(target_os = "linux")]
+    "forkserver-no-exec",
+    #[cfg(target_os = "linux")]
+    "forkserver-no-socket",
 ];
 
 /// Entry point for the `selftest <probe>` role.
@@ -176,6 +182,58 @@ fn run_platform_probe(probe: &str) {
         let errno = attach_refused(true).expect("a non-dumpable child must refuse PTRACE_ATTACH");
         assert_eq!(errno, libc::EPERM, "expected EPERM, got errno {errno}");
         std::process::exit(0);
+    }
+
+    // Fork-server probes: this role's filter is not the renderer's, and it is
+    // inherited by every renderer forked under it — so it gets its own
+    // lockdown here rather than falling through to `lock_down_renderer`.
+    if let Some(op) = probe.strip_prefix("forkserver-") {
+        crate::sandbox::lock_down_fork_server();
+        match op {
+            // The positive case, and the one that actually bites: this filter
+            // is inherited across `fork`, so anything it forgets kills the
+            // renderer instead of the fork server. Forking, reaping, and the
+            // `F_DUPFD_CLOEXEC` a child needs to split its endpoint before its
+            // own lockdown must all still work. Clean exit = pass.
+            "can-fork" => unsafe {
+                let pid = libc::fork();
+                assert!(pid >= 0, "fork refused under the fork-server filter");
+                if pid == 0 {
+                    libc::_exit(0);
+                }
+                let mut status = 0;
+                assert_eq!(libc::waitpid(pid, &mut status, 0), pid, "cannot reap");
+                // What `Endpoint::from_channel` does in a freshly forked child.
+                let dup = libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 0);
+                assert!(dup >= 0, "endpoint split would fail in a forked child");
+                std::process::exit(0);
+            },
+
+            // The fork server forks; it never execs. Reached only if the
+            // allowlist let `execve` through.
+            "no-exec" => unsafe {
+                let path = b"/bin/true\0";
+                let argv = [path.as_ptr().cast::<libc::c_char>(), std::ptr::null()];
+                let _ = libc::execve(
+                    path.as_ptr().cast::<libc::c_char>(),
+                    argv.as_ptr(),
+                    [std::ptr::null()].as_ptr(),
+                );
+                std::process::exit(0);
+            },
+
+            // It talks only on the control fd it was handed. A new socket must
+            // be fatal, exactly as for a renderer.
+            "no-socket" => unsafe {
+                let _ = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+                std::process::exit(0);
+            },
+
+            other => {
+                eprintln!("unknown fork-server probe: {other}");
+                std::process::exit(2);
+            }
+        }
     }
 
     // Drop to the renderer's privileges, exactly as a real renderer does.

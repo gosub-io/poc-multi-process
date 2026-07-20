@@ -129,6 +129,62 @@ const NET_EXTRA: &[libc::c_long] = &[
     libc::SYS_getpeername,
 ];
 
+/// Extra syscalls the fork server needs on top of the baseline: making
+/// renderers, and reaping them.
+///
+/// `clone3` matters as much as `clone` — glibc's `fork()` issues `clone3` on
+/// current versions, so an allowlist carrying only `clone` kills the zygote at
+/// its first fork. It cannot be argument-filtered either: `clone3` passes its
+/// flags in a struct in memory rather than in registers, and seccomp can only
+/// see registers. (The trick production sandboxes use is to return `ENOSYS`
+/// for `clone3` so glibc falls back to the filterable `clone`; not done here.)
+/// Coarse is acceptable in this one process because it is minimal, trusted and
+/// secret-free — and because a renderer cannot inherit the privilege: its own
+/// filter, installed straight after the fork, denies both.
+///
+/// `prctl`/`seccomp` are here for the *children*, not for the fork server
+/// itself. A forked renderer's first act is to install its own filter, which
+/// means `prctl(PR_SET_NO_NEW_PRIVS)` followed by `seccomp(SECCOMP_SET_MODE_FILTER)`
+/// — under the filter it inherited from this process. Omit them and every
+/// renderer dies on `SIGSYS` at the moment it tries to sandbox itself, which
+/// surfaces as `TabCrashed` and looks nothing like a sandbox problem.
+///
+/// Granting them costs nothing: both syscalls only ever *remove* privilege.
+/// There is no version of `seccomp(2)` that widens an existing filter, and the
+/// `prctl` commands involved are one-way switches.
+#[cfg(feature = "multi-process")]
+const FORK_SERVER_EXTRA: &[libc::c_long] = &[
+    libc::SYS_clone,
+    libc::SYS_clone3,
+    libc::SYS_wait4,
+    libc::SYS_prctl,
+    libc::SYS_seccomp,
+    // glibc's own post-fork housekeeping in the child, before a single line of
+    // our code runs: it resets the robust-futex list. Invisible in the source,
+    // fatal without it.
+    libc::SYS_set_robust_list,
+];
+
+/// Cap the fork server: the baseline, plus forking, reaping, and the one
+/// `fcntl` command a freshly-forked renderer needs before its own lockdown.
+///
+/// **This filter also constrains every renderer**, because seccomp filters are
+/// inherited across `fork` — so it must be a *superset* of the renderer
+/// baseline or renderers break in ways that look like transport bugs. It is
+/// the reason `F_DUPFD_CLOEXEC` is permitted here: the forked child splits its
+/// endpoint (`Endpoint::from_channel` → `try_clone`) *before* calling
+/// `lock_down_renderer`, and on Linux that split is an `fcntl(F_DUPFD_CLOEXEC)`
+/// — there is no `dup` call involved. Filters stack most-restrictive-wins, so
+/// the renderer's own filter still denies it a moment later; the
+/// `fcntl-dupfd` probe pins exactly that.
+#[cfg(feature = "multi-process")]
+pub fn lock_down_fork_server() {
+    deny_debugger_attach();
+    let allowed: Vec<libc::c_long> =
+        BASELINE.iter().chain(FORK_SERVER_EXTRA).copied().collect();
+    enforce("fork-server", install_with(allowed, true));
+}
+
 /// Cap a renderer: pixels only — the baseline, no network, files, or exec.
 #[cfg(feature = "multi-process")]
 pub fn lock_down_renderer() {
@@ -162,6 +218,17 @@ fn enforce(role: &str, result: Result<(), Box<dyn std::error::Error>>) {
 /// arguments fail its filter — is a fatal `SIGSYS`.
 #[cfg(feature = "multi-process")]
 fn install(allowed: Vec<libc::c_long>) -> Result<(), Box<dyn std::error::Error>> {
+    install_with(allowed, false)
+}
+
+/// As [`install`], but `allow_dup_fd` additionally permits
+/// `fcntl(F_DUPFD_CLOEXEC)` — needed only by the fork server, whose forked
+/// children must clone a descriptor before installing their own filter.
+#[cfg(feature = "multi-process")]
+fn install_with(
+    allowed: Vec<libc::c_long>,
+    allow_dup_fd: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     use seccompiler::{
         apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
         SeccompFilter, SeccompRule,
@@ -200,7 +267,11 @@ fn install(allowed: Vec<libc::c_long>) -> Result<(), Box<dyn std::error::Error>>
     // — F_DUPFD (fd fabrication), F_SETFD (clearing CLOEXEC), F_SETFL, locks —
     // hits KillProcess.
     let mut fcntl_allowed = Vec::new();
-    for cmd in [libc::F_ADD_SEALS, libc::F_GET_SEALS, libc::F_GETFD] {
+    let mut cmds = vec![libc::F_ADD_SEALS, libc::F_GET_SEALS, libc::F_GETFD];
+    if allow_dup_fd {
+        cmds.push(libc::F_DUPFD_CLOEXEC);
+    }
+    for cmd in cmds {
         let is_cmd =
             SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, cmd as u64)?;
         fcntl_allowed.push(SeccompRule::new(vec![is_cmd])?);

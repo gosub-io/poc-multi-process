@@ -194,6 +194,9 @@ mod probe_inventory {
         "ring",
         "netns",
         "no-ptrace",
+        "forkserver-can-fork",
+        "forkserver-no-exec",
+        "forkserver-no-socket",
     ];
 
     /// macOS applies a Seatbelt profile, `PT_DENY_ATTACH` and rlimits — none
@@ -279,6 +282,30 @@ mod sandbox_enforcement {
     fn renderer_network_namespace_is_empty() {
         let st = probe("netns");
         assert!(st.success(), "expected an empty netns, got {st:?}");
+    }
+
+    /// The fork server's filter is inherited by every renderer it forks, so a
+    /// gap in it kills *renderers*, not the fork server — and surfaces as
+    /// `TabCrashed`, looking nothing like a sandbox problem. This is the
+    /// positive case guarding that: forking, reaping, and the
+    /// `fcntl(F_DUPFD_CLOEXEC)` a forked child needs to split its endpoint
+    /// before its own lockdown must all survive.
+    #[test]
+    fn fork_server_can_still_fork_and_reap() {
+        let st = probe("forkserver-can-fork");
+        assert!(st.success(), "the zygote cannot do its job under its filter: {st:?}");
+    }
+
+    #[test]
+    fn fork_server_cannot_exec() {
+        let st = probe("forkserver-no-exec");
+        assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (no exec), got {st:?}");
+    }
+
+    #[test]
+    fn fork_server_cannot_open_a_socket() {
+        let st = probe("forkserver-no-socket");
+        assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (no network), got {st:?}");
     }
 
     #[test]

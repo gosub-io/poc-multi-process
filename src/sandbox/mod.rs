@@ -39,6 +39,9 @@
 //! | [`lock_down_renderer`]   | after the IPC link is connected | renderer |
 //! | [`lock_down_net`]        | after the IPC link is connected | net component |
 //!
+//! Linux additionally has [`lock_down_fork_server`], which is not part of the
+//! cross-platform contract: no other backend has a zygote to confine.
+//!
 //! `deny_debugger_attach` is compiled in every build — the single-process
 //! engine has no children to confine but still holds the cookie jar in its own
 //! address space. The other four exist only under the `multi-process` feature,
@@ -127,4 +130,15 @@ pub fn lock_down_renderer() {
 #[cfg(feature = "multi-process")]
 pub fn lock_down_net() {
     imp::lock_down_net();
+}
+
+/// Cap the fork server (Linux only — it is the one platform with a zygote).
+///
+/// Sits outside the five-operation table above because it is not a per-platform
+/// contract: no other backend has a fork server to confine. Note its filter is
+/// inherited by every renderer it forks, so it must stay a superset of the
+/// renderer baseline — see the backend for what that forces in.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn lock_down_fork_server() {
+    imp::lock_down_fork_server();
 }
