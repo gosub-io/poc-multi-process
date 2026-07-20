@@ -165,6 +165,128 @@ const FORK_SERVER_EXTRA: &[libc::c_long] = &[
     libc::SYS_set_robust_list,
 ];
 
+/// Prove, on *this* machine, that the fork-server filter actually permits what
+/// a forked renderer needs — before any renderer depends on it.
+///
+/// The allowlist is sensitive to the C library, not just the architecture, and
+/// the sensitivity is invisible in our source. `fork()` reaches the kernel as
+/// `clone3` on current glibc but `clone` on older ones and on musl; the child
+/// calls `set_robust_list` before a line of our code runs; the endpoint split
+/// is an `fcntl(F_DUPFD_CLOEXEC)` rather than a `dup`. Every one of those is a
+/// property of the libc *loaded at run time*, so a compile-time check cannot
+/// see it: glibc is dynamically linked, and the version on the build host is
+/// not the version on the deployment host.
+///
+/// So this verifies instead of predicting. It forks one child that performs
+/// exactly what a renderer does between `fork` and its own lockdown — clone
+/// the descriptor, then install a filter (`prctl` + `seccomp`) — and exits.
+/// If that child dies on `SIGSYS`, the filter is wrong for this libc and we
+/// abort here, at startup, naming the cause.
+///
+/// Without it the same breakage appears as every renderer dying moments after
+/// spawn, surfacing to the engine as `TabCrashed` — a symptom that points at
+/// the transport, not the sandbox. That is precisely how this filter's three
+/// missing syscalls presented while it was being written.
+///
+/// One case it cannot catch politely: if `fork` itself is denied, `KillProcess`
+/// kills *us* at the call below rather than the child. That still fails at
+/// startup rather than mid-session, which is the point, but it arrives as a
+/// bare `SIGSYS` on the fork server instead of the message here.
+#[cfg(feature = "multi-process")]
+pub fn verify_fork_server_filter() {
+    // SAFETY: the fork server is single-threaded, so the child may run normal
+    // code (the async-signal-safe-only rule applies to multithreaded fork).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        fail_canary(&format!("could not fork: {}", std::io::Error::last_os_error()));
+    }
+
+    if pid == 0 {
+        // The child: do what a renderer does before it is confined.
+        // SAFETY: fd 2 is open; F_DUPFD_CLOEXEC returns a new descriptor.
+        let duped = unsafe { libc::fcntl(2, libc::F_DUPFD_CLOEXEC, 0) };
+        if duped < 0 {
+            unsafe { libc::_exit(EXIT_CANARY_DUP) };
+        }
+        unsafe { libc::close(duped) };
+        // Installing a filter is `prctl` + `seccomp`, both issued *under* the
+        // filter we inherited. Silent: `enforce` would print a second lockdown
+        // banner and this is a probe, not a component starting up.
+        if install(BASELINE.to_vec()).is_err() {
+            unsafe { libc::_exit(EXIT_CANARY_SECCOMP) };
+        }
+        unsafe { libc::_exit(0) };
+    }
+
+    let mut status: libc::c_int = 0;
+    // SAFETY: `status` is a valid out-param for our own child.
+    if unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
+        fail_canary("could not reap the canary child (is wait4 allowed?)");
+    }
+
+    if libc::WIFSIGNALED(status) {
+        let sig = libc::WTERMSIG(status);
+        fail_canary(&format!(
+            "canary child killed by signal {sig}{} — the allowlist is missing a \
+             syscall this C library needs (glibc issues clone3 on newer versions, \
+             clone on older; musl differs again)",
+            if sig == libc::SIGSYS { " (SIGSYS)" } else { "" }
+        ));
+    }
+    match libc::WEXITSTATUS(status) {
+        0 => {}
+        EXIT_CANARY_DUP => fail_canary("fcntl(F_DUPFD_CLOEXEC) refused — a forked \
+             renderer could not split its endpoint"),
+        EXIT_CANARY_SECCOMP => fail_canary("the child could not install its own \
+             seccomp filter — are prctl and seccomp on the allowlist?"),
+        other => fail_canary(&format!("canary child exited {other}")),
+    }
+}
+
+/// Install a deliberately incomplete fork-server filter and run the canary
+/// against it, so the *detection* is tested and not merely the happy path.
+///
+/// Spawned only by the integration suite (`selftest forkserver-canary-gap`).
+/// The omission is `set_robust_list` — one of the three syscalls that were
+/// genuinely missing when this filter was written, and the one whose absence
+/// is invisible in our source because glibc issues it in the child before any
+/// of our code runs. The canary must catch it and exit non-zero; a canary that
+/// only ever passes is indistinguishable from no canary at all.
+#[cfg(feature = "multi-process")]
+pub fn canary_must_detect_a_missing_syscall() -> ! {
+    let crippled: Vec<libc::c_long> = BASELINE
+        .iter()
+        .chain(FORK_SERVER_EXTRA)
+        .copied()
+        .filter(|nr| *nr != libc::SYS_set_robust_list)
+        .collect();
+    if install_with(crippled, true).is_err() {
+        eprintln!("could not install the crippled filter");
+        std::process::exit(2);
+    }
+    // Must not return: the canary is expected to abort the process.
+    verify_fork_server_filter();
+    eprintln!("canary did NOT detect the missing syscall");
+    std::process::exit(3);
+}
+
+/// Distinct child exit codes, so a canary failure names the operation rather
+/// than just reporting "the child died".
+#[cfg(feature = "multi-process")]
+const EXIT_CANARY_DUP: libc::c_int = 91;
+#[cfg(feature = "multi-process")]
+const EXIT_CANARY_SECCOMP: libc::c_int = 92;
+
+/// Fail closed, matching the rest of this module: a sandbox that cannot be
+/// shown to work is treated exactly like one that failed to install.
+#[cfg(feature = "multi-process")]
+fn fail_canary(detail: &str) -> ! {
+    eprintln!("[fork-server] FATAL: sandbox self-check failed: {detail}");
+    eprintln!("[fork-server] renderers would crash on spawn; refusing to continue. \
+               Use --single-process on this host.");
+    std::process::exit(1);
+}
+
 /// Cap the fork server: the baseline, plus forking, reaping, and the one
 /// `fcntl` command a freshly-forked renderer needs before its own lockdown.
 ///

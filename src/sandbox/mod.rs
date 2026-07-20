@@ -142,3 +142,22 @@ pub fn lock_down_net() {
 pub fn lock_down_fork_server() {
     imp::lock_down_fork_server();
 }
+
+/// Verify at startup that the fork-server filter permits what a forked
+/// renderer needs on *this* host's C library, aborting if it does not. Called
+/// straight after [`lock_down_fork_server`]. The allowlist is libc-sensitive in
+/// ways a compile-time check cannot see, so this verifies rather than predicts
+/// — see the backend for what varies and why.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn verify_fork_server_filter() {
+    imp::verify_fork_server_filter();
+}
+
+/// Test hook: run the canary against a filter with one syscall deliberately
+/// removed, so the integration suite can prove the canary *detects* rather than
+/// merely passes. Aborts the process, as a real canary failure would. Spawned
+/// only by the `selftest` role.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn canary_must_detect_a_missing_syscall() -> ! {
+    imp::canary_must_detect_a_missing_syscall()
+}

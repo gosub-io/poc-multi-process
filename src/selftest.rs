@@ -88,6 +88,8 @@ pub const PROBES: &[&str] = &[
     #[cfg(target_os = "linux")]
     "forkserver-can-fork",
     #[cfg(target_os = "linux")]
+    "forkserver-canary-gap",
+    #[cfg(target_os = "linux")]
     "forkserver-no-exec",
     #[cfg(target_os = "linux")]
     "forkserver-no-socket",
@@ -208,6 +210,11 @@ fn run_platform_probe(probe: &str) {
                 assert!(dup >= 0, "endpoint split would fail in a forked child");
                 std::process::exit(0);
             },
+
+            // The canary must *detect*, not merely pass. Runs it against a
+            // filter with one syscall deliberately removed; the canary is
+            // expected to abort the process, so a clean exit here is a failure.
+            "canary-gap" => crate::sandbox::canary_must_detect_a_missing_syscall(),
 
             // The fork server forks; it never execs. Reached only if the
             // allowlist let `execve` through.

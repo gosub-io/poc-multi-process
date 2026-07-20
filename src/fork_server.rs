@@ -50,6 +50,14 @@ pub fn run(control_fd: &str) {
     // forked below, covering the window before each reaches its own lockdown.
     crate::sandbox::lock_down_fork_server();
 
+    // Then prove the filter is right for *this* host's C library before any
+    // renderer stakes its life on it. The allowlist depends on how libc issues
+    // fork and how it splits descriptors, which varies by glibc version and
+    // differs again on musl — none of it visible at compile time, since the
+    // libc we build against is not the one we run against. Failing here costs
+    // one fork; failing later looks like every tab crashing on open.
+    crate::sandbox::verify_fork_server_filter();
+
     loop {
         let req: ForkRequest = match ipc::recv_msg(&mut control) {
             Ok(req) => req,

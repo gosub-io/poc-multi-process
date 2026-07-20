@@ -195,6 +195,7 @@ mod probe_inventory {
         "netns",
         "no-ptrace",
         "forkserver-can-fork",
+        "forkserver-canary-gap",
         "forkserver-no-exec",
         "forkserver-no-socket",
     ];
@@ -294,6 +295,16 @@ mod sandbox_enforcement {
     fn fork_server_can_still_fork_and_reap() {
         let st = probe("forkserver-can-fork");
         assert!(st.success(), "the zygote cannot do its job under its filter: {st:?}");
+    }
+
+    /// The canary has to *detect*, not just pass. This runs it against a filter
+    /// missing `set_robust_list` — one of the three syscalls that really were
+    /// absent when this filter was written — and requires it to abort. A canary
+    /// that only ever succeeds is indistinguishable from no canary.
+    #[test]
+    fn startup_canary_detects_a_missing_syscall() {
+        let st = probe("forkserver-canary-gap");
+        assert_eq!(st.code(), Some(1), "canary should abort with exit 1, got {st:?}");
     }
 
     #[test]
