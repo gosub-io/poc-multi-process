@@ -101,6 +101,20 @@ pub const PROBES: &[&str] = &[
     "seatbelt-exec",
     #[cfg(target_os = "macos")]
     "seatbelt-net-role-keeps-network",
+    #[cfg(target_os = "macos")]
+    "seatbelt-baseline",
+    #[cfg(target_os = "macos")]
+    "seatbelt-file-write",
+    #[cfg(target_os = "macos")]
+    "seatbelt-fork",
+    #[cfg(target_os = "macos")]
+    "seatbelt-signal-other",
+    #[cfg(target_os = "macos")]
+    "seatbelt-sysctl",
+    #[cfg(target_os = "macos")]
+    "rlimits",
+    #[cfg(target_os = "macos")]
+    "no-ptrace",
 ];
 
 /// Entry point for the `selftest <probe>` role.
@@ -142,6 +156,74 @@ mod code {
     /// Denied, but not by the sandbox (some other errno) — reported separately
     /// so a misleading pass cannot come from an unrelated failure.
     pub const WRONG_ERROR: i32 = 92;
+    /// A cap was applied but did not take the value it claims to.
+    pub const WRONG_VALUE: i32 = 93;
+}
+
+/// Read back one rlimit's soft value.
+#[cfg(target_os = "macos")]
+fn rlimit_soft(resource: libc::c_int) -> libc::rlim_t {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: valid resource id and a valid out-pointer.
+    if unsafe { libc::getrlimit(resource, &mut rl) } < 0 {
+        return libc::rlim_t::MAX;
+    }
+    rl.rlim_cur
+}
+
+/// Can this process signal another one? Uses the target's own parent and
+/// signal 0 (an existence check that still counts as a `signal` operation to
+/// Seatbelt), so nothing is actually delivered.
+#[cfg(target_os = "macos")]
+fn try_signal_parent() -> i32 {
+    // SAFETY: getppid is infallible; kill with signal 0 sends nothing.
+    unsafe {
+        let ppid = libc::getppid();
+        if libc::kill(ppid, 0) == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        }
+    }
+}
+
+/// Can this process read a sysctl? `hw.memsize` is a plain read-only value.
+#[cfg(target_os = "macos")]
+fn try_sysctl() -> i32 {
+    let name = c"hw.memsize";
+    let mut out: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: NUL-terminated name, correctly sized out-buffer and length.
+    unsafe {
+        if libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!(out).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        ) == 0
+        {
+            0
+        } else {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        }
+    }
+}
+
+/// Fork a child that immediately exits. Returns `Ok` if the fork was permitted.
+#[cfg(target_os = "macos")]
+fn try_fork() -> Result<(), i32> {
+    // SAFETY: the child does nothing but _exit, which is async-signal-safe.
+    unsafe {
+        match libc::fork() {
+            -1 => Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)),
+            0 => libc::_exit(0),
+            pid => {
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Can this process open a well-known readable file? `Ok` = yes.
@@ -182,6 +264,59 @@ fn try_connect() -> i32 {
         libc::close(fd);
         errno
     }
+}
+
+/// Fork a child that optionally calls `PT_DENY_ATTACH`, then try to attach to
+/// it from here. Returns `None` if the attach succeeded, `Some(errno)` if it
+/// was refused. The child is killed either way.
+///
+/// Parent→child, like the Linux counterpart: attaching to an arbitrary process
+/// on macOS runs into SIP and task-port entitlements, whereas a parent tracing
+/// its own unsigned child is the ordinary debugger case.
+#[cfg(target_os = "macos")]
+fn attach_refused(protect: bool) -> Option<i32> {
+    let mut ready = [0 as libc::c_int; 2];
+    assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "pipe");
+    let (rd, wr) = (ready[0], ready[1]);
+
+    // SAFETY: single-threaded here, so the child may run normal code.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork");
+    if pid == 0 {
+        unsafe { libc::close(rd) };
+        if protect {
+            crate::sandbox::deny_debugger_attach();
+        }
+        // Signal readiness only after the flag is set, so the parent cannot
+        // race ahead and attach to a child that has not protected itself yet.
+        unsafe {
+            libc::write(wr, [1u8].as_ptr().cast(), 1);
+            loop {
+                libc::pause();
+            }
+        }
+    }
+
+    unsafe { libc::close(wr) };
+    let mut byte = [0u8; 1];
+    assert_eq!(unsafe { libc::read(rd, byte.as_mut_ptr().cast(), 1) }, 1, "child never signalled");
+    unsafe { libc::close(rd) };
+
+    // SAFETY: PT_ATTACH takes the target pid; addr/data are unused.
+    let rc = unsafe { libc::ptrace(libc::PT_ATTACH, pid, std::ptr::null_mut(), 0) };
+    let outcome = if rc == -1 {
+        Some(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+    } else {
+        // A successful attach stops the tracee; reap that stop before killing.
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        None
+    };
+
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        libc::waitpid(pid, std::ptr::null_mut(), 0);
+    }
+    outcome
 }
 
 /// The macOS probe set: Seatbelt profile enforcement.
@@ -253,6 +388,124 @@ fn run_macos_probe(probe: &str) {
                 e if e == libc::ECONNREFUSED => std::process::exit(0),
                 e if e == libc::EPERM => std::process::exit(code::NOT_DENIED),
                 _ => std::process::exit(code::WRONG_ERROR),
+            }
+        }
+
+        // The control for every "denied" probe above: normal work must still
+        // run under the profile. Without this, all the denials are equally
+        // consistent with a profile so tight the component cannot function —
+        // which would pass every negative test and ship a broken renderer.
+        "seatbelt-baseline" => {
+            crate::sandbox::lock_down_renderer();
+            // Allocate, compute, and write to an already-open fd: exactly what
+            // a rasterizing renderer does between messages.
+            let buf: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+            let sum: u64 = buf.iter().map(|b| *b as u64).sum();
+            eprintln!("[selftest] baseline computed {sum} under the profile");
+            std::process::exit(0);
+        }
+
+        // `file-read*` and `file-write*` are separate SBPL operations, so a
+        // read-only denial does not imply a write denial. A renderer that could
+        // create files could stage a payload even without being able to read.
+        "seatbelt-file-write" => {
+            let path = std::env::temp_dir().join("gosub-seatbelt-probe");
+            if std::fs::write(&path, b"control").is_err() {
+                std::process::exit(code::CONTROL_FAILED);
+            }
+            let _ = std::fs::remove_file(&path);
+            crate::sandbox::lock_down_renderer();
+            match std::fs::write(&path, b"after") {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&path);
+                    std::process::exit(code::NOT_DENIED)
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) => std::process::exit(0),
+                Err(_) => std::process::exit(code::WRONG_ERROR),
+            }
+        }
+
+        // `process-fork` is distinct from `process-exec`: a renderer that can
+        // fork can multiply itself even with exec denied.
+        "seatbelt-fork" => {
+            if try_fork().is_err() {
+                std::process::exit(code::CONTROL_FAILED);
+            }
+            crate::sandbox::lock_down_renderer();
+            match try_fork() {
+                Ok(()) => std::process::exit(code::NOT_DENIED),
+                Err(_) => std::process::exit(0),
+            }
+        }
+
+        // Tests the *precision* of the profile, not just its existence. The
+        // grant is `(allow signal (target self))` — scoped deliberately — so
+        // signalling any other process must still be refused. If `(target
+        // self)` were dropped or widened, every other probe here would still
+        // pass and only this one would notice.
+        "seatbelt-signal-other" => {
+            if try_signal_parent() != 0 {
+                std::process::exit(code::CONTROL_FAILED);
+            }
+            crate::sandbox::lock_down_renderer();
+            match try_signal_parent() {
+                0 => std::process::exit(code::NOT_DENIED),
+                e if e == libc::EPERM => std::process::exit(0),
+                _ => std::process::exit(code::WRONG_ERROR),
+            }
+        }
+
+        // The module docs claim the profile grants no `sysctl-read`. Nothing
+        // verified that claim; sysctls leak host details (memory size, CPU
+        // count, boot time) useful for fingerprinting and exploit tuning.
+        "seatbelt-sysctl" => {
+            if try_sysctl() != 0 {
+                std::process::exit(code::CONTROL_FAILED);
+            }
+            crate::sandbox::lock_down_renderer();
+            match try_sysctl() {
+                0 => std::process::exit(code::NOT_DENIED),
+                e if e == libc::EPERM => std::process::exit(0),
+                _ => std::process::exit(code::WRONG_ERROR),
+            }
+        }
+
+        // The rlimits are a mechanism entirely separate from Seatbelt and were
+        // wholly unverified on macOS. Checks the two caps that actually change
+        // a value here — note `RLIMIT_CORE` is deliberately not asserted,
+        // because macOS already defaults it to 0 and proving a no-op proves
+        // nothing. `RLIMIT_AS` is absent by design (see the backend docs).
+        "rlimits" => {
+            let nofile_before = rlimit_soft(libc::RLIMIT_NOFILE);
+            // SAFETY: PRIO_PROCESS with pid 0 targets this process.
+            let prio_before = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+            if nofile_before == 128 || prio_before == 10 {
+                // Already at the target value: the check below would pass
+                // without the call having done anything.
+                std::process::exit(code::CONTROL_FAILED);
+            }
+            if crate::sandbox::apply_child_rlimits().is_err() {
+                std::process::exit(code::WRONG_ERROR);
+            }
+            let prio_after = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+            if rlimit_soft(libc::RLIMIT_NOFILE) != 128 || prio_after != 10 {
+                std::process::exit(code::WRONG_VALUE);
+            }
+            std::process::exit(0);
+        }
+
+        // The inbound direction, and the one mechanism here that is not
+        // Seatbelt: `ptrace(PT_DENY_ATTACH)` refusing a debugger. The control
+        // matters more than usual — if an unprotected child cannot be attached
+        // to either (SIP, entitlements, a hardened runtime), this probe proves
+        // nothing, and saying so is better than a green tick.
+        "no-ptrace" => {
+            if attach_refused(false).is_some() {
+                std::process::exit(code::CONTROL_FAILED);
+            }
+            match attach_refused(true) {
+                None => std::process::exit(code::NOT_DENIED),
+                Some(_) => std::process::exit(0),
             }
         }
 

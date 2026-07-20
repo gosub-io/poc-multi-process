@@ -218,6 +218,7 @@ mod seatbelt_enforcement {
     const CONTROL_FAILED: i32 = 90;
     const NOT_DENIED: i32 = 91;
     const WRONG_ERROR: i32 = 92;
+    const WRONG_VALUE: i32 = 93;
 
     fn probe(name: &str) -> i32 {
         let st = Command::new(bin()).args(["selftest", name]).status().expect("spawn selftest");
@@ -236,6 +237,7 @@ mod seatbelt_enforcement {
             ),
             NOT_DENIED => panic!("{name}: the operation SUCCEEDED under the profile — not enforcing"),
             WRONG_ERROR => panic!("{name}: denied, but not with EPERM — something else refused it"),
+            WRONG_VALUE => panic!("{name}: the cap was applied but did not take the expected value"),
             other => panic!("{name}: unexpected exit {other}"),
         }
     }
@@ -267,6 +269,60 @@ mod seatbelt_enforcement {
     #[test]
     fn net_component_keeps_its_network() {
         check("seatbelt-net-role-keeps-network");
+    }
+
+    /// The control for every denial in this module: ordinary work must still
+    /// run under the profile. A profile so tight the renderer cannot function
+    /// would satisfy every negative test above and ship a broken component.
+    #[test]
+    fn ordinary_work_survives_the_profile() {
+        check("seatbelt-baseline");
+    }
+
+    /// `file-read*` and `file-write*` are separate SBPL operations — denying
+    /// reads does not imply denying writes.
+    #[test]
+    fn renderer_cannot_write_files() {
+        check("seatbelt-file-write");
+    }
+
+    /// `process-fork` is distinct from `process-exec`: forking without exec is
+    /// still process creation.
+    #[test]
+    fn renderer_cannot_fork() {
+        check("seatbelt-fork");
+    }
+
+    /// Tests the profile's *precision*, not merely that one exists. The grant
+    /// is `(allow signal (target self))`; if that scope were widened or lost,
+    /// every other test here would still pass and only this one would notice.
+    #[test]
+    fn renderer_cannot_signal_other_processes() {
+        check("seatbelt-signal-other");
+    }
+
+    /// The backend docs claim the profile grants no `sysctl-read`. Nothing
+    /// checked that until now; sysctls leak host details useful for
+    /// fingerprinting and exploit tuning.
+    #[test]
+    fn renderer_cannot_read_sysctls() {
+        check("seatbelt-sysctl");
+    }
+
+    /// The rlimits are a mechanism wholly separate from Seatbelt, and were
+    /// entirely unverified on macOS.
+    #[test]
+    fn child_rlimits_are_applied() {
+        check("rlimits");
+    }
+
+    /// The inbound direction: `PT_DENY_ATTACH` must actually refuse a
+    /// debugger. Parent→child, with a control, because attaching on macOS runs
+    /// into SIP and task-port entitlements — if the unprotected case cannot be
+    /// attached to either, this reports that rather than passing vacuously.
+    #[test]
+    fn children_refuse_debugger_attach() {
+        check("no-ptrace");
     }
 }
 
@@ -315,6 +371,13 @@ mod probe_inventory {
         "seatbelt-network",
         "seatbelt-exec",
         "seatbelt-net-role-keeps-network",
+        "seatbelt-baseline",
+        "seatbelt-file-write",
+        "seatbelt-fork",
+        "seatbelt-signal-other",
+        "seatbelt-sysctl",
+        "rlimits",
+        "no-ptrace",
     ];
 
     /// Windows has no sandbox backend at all yet: children run unconfined
