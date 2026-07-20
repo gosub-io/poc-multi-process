@@ -373,12 +373,24 @@ The security *mechanisms* are real (see the isolation section); what's
 simplified is the surrounding browser. What each entry below still needs:
 
 - **Sandboxing**: the seccomp filter is production-shaped (fail-closed
-  allowlist, `KillProcess`, W^X via `PROT_EXEC` argument-filtering). Still
-  missing for a real deployment: a per-arch baseline tested across libc/kernel
-  versions, filesystem restriction (Landlock), and namespaces/`pivot_root` for
-  defense in depth. A real JS JIT needs executable memory, so it would carve out
-  a dedicated JIT exception rather than deny `PROT_EXEC` outright.
-  macOS/Windows need their own mechanisms (Seatbelt, AppContainer).
+  allowlist, `KillProcess`, W^X via `PROT_EXEC` argument-filtering), and
+  renderers additionally run in an empty **network namespace** — unshared on
+  the fork server at spawn and inherited by every renderer it `fork()`s, so
+  "a renderer cannot reach the network" no longer rests on the syscall
+  allowlist alone. The two layers fail independently: an allowlist gap is
+  survivable when the namespace has no interfaces to connect through. The net
+  component is the one role that keeps the host netns. Still missing for a real
+  deployment: a per-arch baseline tested across libc/kernel versions,
+  filesystem restriction (Landlock), and the remaining namespaces
+  (mount/PID/IPC) plus `pivot_root`. A real JS JIT needs executable memory, so
+  it would carve out a dedicated JIT exception rather than deny `PROT_EXEC`
+  outright. macOS/Windows need their own mechanisms (Seatbelt, AppContainer).
+
+  Note the netns is obtained via `CLONE_NEWUSER | CLONE_NEWNET` (an unprivileged
+  `CLONE_NEWNET` alone needs `CAP_SYS_ADMIN`) and the uid map is deliberately
+  left unwritten, so children run as the overflow uid. This makes multi-process
+  mode require unprivileged user namespaces, the same way it already requires
+  seccomp — hosts without them use `--single-process`.
 - **Fetching**: synthesized responses instead of real HTTP; the net component
   handles one request at a time (the engine doesn't block on it, but a real
   daemon would fetch concurrently — with the ring transport that matters

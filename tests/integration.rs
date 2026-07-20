@@ -164,6 +164,16 @@ mod sandbox_enforcement {
         assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (no network), got {st:?}");
     }
 
+    /// Defense in depth beneath the allowlist: even if `socket()` were somehow
+    /// reachable, the renderer's network namespace has nothing in it. This
+    /// probe unshares and then enumerates interfaces, so it fails loudly if the
+    /// namespace was never actually created.
+    #[test]
+    fn renderer_network_namespace_is_empty() {
+        let st = probe("netns");
+        assert!(st.success(), "expected an empty netns, got {st:?}");
+    }
+
     #[test]
     fn sealed_memfd_tile_survives_the_sandbox() {
         // The shared-memory tile producer path (memfd_create → ftruncate →

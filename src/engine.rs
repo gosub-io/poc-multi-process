@@ -778,7 +778,11 @@ impl Spawner {
                 // without exec.
                 let (fork_control, fs_end) =
                     std::os::unix::net::UnixStream::pair().expect("socketpair");
-                let fork_child = spawn_inherited(&exe, &["fork-server"], fs_end);
+                // The fork server needs no network of its own, and every
+                // renderer it forks inherits the empty netns — which is how
+                // renderers get network isolation without ever passing through
+                // `spawn_inherited` themselves.
+                let fork_child = spawn_inherited(&exe, &["fork-server"], fs_end, true);
                 Spawner::Multi { exe, fork_control, fork_child }
             }
             #[cfg(all(feature = "multi-process", not(target_os = "linux")))]
@@ -810,7 +814,9 @@ impl Spawner {
                 Role::Net => {
                     let (parent_end, child_end) =
                         std::os::unix::net::UnixStream::pair().expect("socketpair");
-                    let child = spawn_inherited(exe, &["net-daemon"], child_end);
+                    // The one role that keeps its network namespace: it is the
+                    // component whose entire job is outbound fetching.
+                    let child = spawn_inherited(exe, &["net-daemon"], child_end, false);
                     let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
                     (ChildHandle::Process(child), ep)
                 }
@@ -845,7 +851,9 @@ impl Spawner {
                 };
                 let (parent_end, child_end) =
                     std::os::unix::net::UnixStream::pair().expect("socketpair");
-                let child = spawn_inherited(exe, &role_args, child_end);
+                // No-op off Linux (no namespaces), but kept truthful per role.
+                let isolate_network = matches!(role, Role::Renderer(_));
+                let child = spawn_inherited(exe, &role_args, child_end, isolate_network);
                 let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
                 (ChildHandle::Process(child), ep)
             }
@@ -871,11 +879,18 @@ impl Spawner {
 /// travels on argv, which is not a secret. Resource ceilings are imposed in
 /// `pre_exec`, before the child runs its own code, and are inherited across
 /// exec (and, for the fork server, across its later `fork()`s).
+///
+/// `isolate_network` additionally drops the child into an empty network
+/// namespace. Like the rlimits, it is inherited across exec *and* across the
+/// fork server's later `fork()`s — which is precisely how renderers get it,
+/// since they are forked rather than spawned through this function. The net
+/// component is the one role that must not have it.
 #[cfg(feature = "multi-process")]
 fn spawn_inherited(
     exe: &std::path::Path,
     args: &[&str],
     child_end: std::os::unix::net::UnixStream,
+    isolate_network: bool,
 ) -> std::process::Child {
     use std::os::fd::IntoRawFd;
     use std::os::unix::process::CommandExt;
@@ -888,6 +903,16 @@ fn spawn_inherited(
     unsafe {
         cmd.pre_exec(move || {
             crate::sandbox::apply_child_rlimits()?;
+            // Fail-closed, matching the seccomp precedent: a child that was
+            // meant to be network-isolated and silently isn't is worse than an
+            // honest refusal to start. Environments without unprivileged user
+            // namespaces use `--single-process` / `--no-default-features`.
+            #[cfg(target_os = "linux")]
+            if isolate_network {
+                crate::sandbox::unshare_network()?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = isolate_network;
             let flags = libc::fcntl(child_fd, libc::F_GETFD);
             if flags < 0 {
                 return Err(std::io::Error::last_os_error());

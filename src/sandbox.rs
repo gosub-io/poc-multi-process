@@ -238,6 +238,39 @@ pub fn apply_child_rlimits() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Move the calling process into a fresh, empty network namespace.
+///
+/// This is defense in depth for the *same* property the seccomp allowlist
+/// already provides: a renderer must never reach the network. The two fail
+/// independently. seccomp's guarantee is "we enumerated the syscalls correctly"
+/// — one missing entry on a new architecture, one novel socket-obtaining path,
+/// and it is gone. An empty netns has no interfaces at all, so there is nothing
+/// to connect *to* even if a syscall slips through the filter.
+///
+/// `CLONE_NEWNET` on its own requires `CAP_SYS_ADMIN`. Pairing it with
+/// `CLONE_NEWUSER` gets it unprivileged: the new user namespace grants a full
+/// capability set *within itself*, which is enough to create the netns.
+///
+/// We deliberately do **not** write `/proc/self/uid_map`. Leaving it unmapped
+/// means the process runs as the overflow uid (`nobody`) inside the namespace,
+/// which is strictly better than an identity map — and on distributions that
+/// restrict unprivileged user namespaces via AppArmor (Ubuntu 24.04+,
+/// `kernel.apparmor_restrict_unprivileged_userns=1`) the map write is refused
+/// with `EPERM` even though the `unshare` itself succeeds. The one consequence
+/// is that the exec'd binary must be world-executable, since the file's owner
+/// no longer maps to this process's credentials.
+///
+/// Called from the post-fork/pre-exec context, so it must stay
+/// async-signal-safe: a single `unshare` syscall, nothing else.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn unshare_network() -> std::io::Result<()> {
+    // SAFETY: unshare with valid flags; affects only the calling process.
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Lower the calling process's scheduling priority (higher nice = lower
 /// priority). Async-signal-safe (a single syscall), so usable pre-exec.
 #[cfg(all(feature = "multi-process", target_os = "linux"))]

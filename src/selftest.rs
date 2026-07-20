@@ -9,6 +9,40 @@
 
 /// Entry point for the `selftest <probe>` role.
 pub fn run(probe: &str) {
+    // The netns probe must run *before* the seccomp lockdown: verifying the
+    // namespace is empty means enumerating interfaces, and a locked-down
+    // renderer has no `openat`/`socket` with which to look. It asserts the
+    // layer underneath the filter, so it is checked underneath it too.
+    if probe == "netns" {
+        // Read the interface list from procfs, NOT `/sys/class/net`: sysfs
+        // reports the namespace it was *mounted* in, so it keeps showing the
+        // host's interfaces after an unshare and would make this probe pass
+        // vacuously. `/proc/self/net` follows the calling task's netns.
+        let interfaces = || -> Vec<String> {
+            let dev = std::fs::read_to_string("/proc/self/net/dev").expect("read /proc/self/net/dev");
+            let mut names: Vec<String> = dev
+                .lines()
+                .skip(2) // two header lines
+                .filter_map(|l| l.split(':').next())
+                .map(|n| n.trim().to_string())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let before = std::fs::read_link("/proc/self/ns/net").expect("read netns link");
+        assert!(interfaces().len() > 1, "host netns looks empty already — probe proves nothing");
+
+        crate::sandbox::unshare_network().expect("unshare netns");
+
+        // The namespace must actually have changed, and the new one must hold
+        // nothing but loopback: no route off this machine exists at all.
+        let after = std::fs::read_link("/proc/self/ns/net").expect("read netns link");
+        assert_ne!(before, after, "still in the host network namespace");
+        assert_eq!(interfaces(), vec!["lo".to_string()], "netns is not empty");
+        std::process::exit(0);
+    }
+
     // Drop to the renderer's privileges, exactly as a real renderer does.
     crate::sandbox::lock_down_renderer();
 
