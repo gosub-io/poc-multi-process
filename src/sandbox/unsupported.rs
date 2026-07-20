@@ -12,16 +12,9 @@
 //!   confinement is not. Wiring up `pledge`/`unveil` or Capsicum would be a
 //!   backend-shaped piece of work, like the macOS one.
 //!
-//! * **Windows**: multi-process mode does not compile at all, so this backend
-//!   is never reached with the feature on. The transport layer is POSIX to the
-//!   core — `std::os::unix`, `std::os::fd`, `socketpair`, `SCM_RIGHTS`,
-//!   `fork()` for the zygote — and `libc` itself is a `cfg(unix)` dependency.
-//!   Only `--no-default-features` (single-process) builds there, where the one
-//!   operation that still applies is `deny_debugger_attach`, a no-op below.
-//!   A port needs a new transport and spawn model *and* a parent-side sandbox
-//!   hook the current contract has no place for — see the seam notes in
-//!   `mod.rs`. Do not read "unsupported" as "runs unconfined" on Windows; it
-//!   does not run multi-process at all.
+//! Windows is **not** one of these cases any more: it has its own transport
+//! (`channel/windows.rs`) and its own backend (`sandbox/windows.rs`), so it
+//! never reaches this file.
 
 /// No sandbox mechanism here — run unconfined and be honest about it.
 #[cfg(feature = "multi-process")]

@@ -17,13 +17,13 @@
 //! `ReadFile`/`WriteFile` — precisely what a pipe handle wants — and closes on
 //! drop. No hand-rolled I/O.
 //!
-//! ## Not yet validated on Windows
+//! ## Validation
 //!
-//! Everything here type-checks against `x86_64-pc-windows-*` but has never
-//! been executed: it was written on Linux. Treat first-run failures as
-//! expected. The sandbox backend for Windows is deliberately *not* part of
-//! this — components run under `sandbox::unsupported`, unconfined and saying
-//! so, rather than under a plausible-looking sandbox nobody has verified.
+//! Written on Linux and verified on real Windows through CI: the transport
+//! carries the demo end to end. Confinement is a separate concern handled by
+//! `sandbox/windows.rs`, which installs process mitigation policies — see
+//! there for which half of a Windows sandbox that is, and which half is still
+//! missing.
 
 use std::fs::File;
 use std::io;

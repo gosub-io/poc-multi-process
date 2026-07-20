@@ -90,8 +90,8 @@ jobs:
           - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
           - { os: macos-latest, target: aarch64-apple-darwin }
           - { os: macos-latest, target: aarch64-apple-darwin, features: --no-default-features }
-          # Windows builds and spawns, but has no sandbox backend: its children
-          # run unconfined. See src/sandbox/unsupported.rs.
+          # Windows installs process mitigation policies but not the
+          # parent-side access confinement. See src/sandbox/windows.rs.
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, features: --no-default-features }
     steps:
@@ -100,9 +100,9 @@ jobs:
       - run: cargo check --all-targets --target ${{ matrix.target }} ${{ matrix.features }}
 
   # The platforms whose sandbox backend can actually be *run*, rather than only
-  # type-checked. macOS has a Seatbelt backend and Windows has none; both are
-  # currently probe-free, which the suite's inventory guard asserts explicitly
-  # rather than letting a green run imply coverage that is not there.
+  # type-checked. All three now carry probes; the suite's inventory guard
+  # asserts the expected set per platform, so a backend losing its coverage to
+  # a `cfg` fails here instead of passing quietly.
   native-tests:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

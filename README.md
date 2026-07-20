@@ -413,16 +413,22 @@ simplified is the surrounding browser. What each entry below still needs:
   it would carve out a dedicated JIT exception rather than deny `PROT_EXEC`
   outright.
 
-  **Platform status.** Linux is the reference implementation. macOS runs
-  multi-process with a Seatbelt profile. Windows *builds and spawns* — the
-  transport is a pair of anonymous pipes rather than a socketpair (see
-  `src/channel/`) — but has **no sandbox backend at all**: its children run
-  under `sandbox::unsupported`, unconfined. Confining them needs a job object,
-  a restricted token and an AppContainer, all attached by the parent at
-  `CreateProcess` time, which the sandbox contract has no hook for yet; see
-  the seam notes in `src/sandbox/mod.rs`. The Windows transport is also
-  **untested** — it type-checks against `x86_64-pc-windows-*` but has never
-  been executed.
+  **Platform status.** Linux is the reference implementation: seccomp, an empty
+  netns, rlimits, non-dumpable processes, 12 probes. macOS runs a Seatbelt
+  profile with 11 probes. Windows spawns over a pair of anonymous pipes (see
+  `src/channel/`) and installs **process mitigation policies** — no dynamic
+  code (the W^X analogue), no child processes, no injection extension points,
+  plus win32k lockdown — with 4 probes.
+
+  Windows is deliberately **half a sandbox**, and worth reading as such. Its
+  mitigation policies are self-applied, so they fit the existing contract; the
+  access-confining half — a restricted token, an integrity level, an
+  AppContainer, a job object — is attached by the *parent* at `CreateProcess`
+  and is not implemented. So a Windows renderer cannot run injected code or
+  spawn programs, but it can still read files and reach the network, and the
+  renderer/net distinction the other backends enforce does not exist there.
+  Closing that needs the sixth, parent-side operation described in
+  `src/sandbox/mod.rs`.
 
   Note the netns is obtained via `CLONE_NEWUSER | CLONE_NEWNET` (an unprivileged
   `CLONE_NEWNET` alone needs `CAP_SYS_ADMIN`) and the uid map is deliberately

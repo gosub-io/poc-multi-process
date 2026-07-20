@@ -166,7 +166,9 @@ fn unknown_argument_is_rejected() {
 const LOCKDOWN_BANNER: &str = "seccomp allowlist active";
 #[cfg(target_os = "macos")]
 const LOCKDOWN_BANNER: &str = "seatbelt profile active";
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+const LOCKDOWN_BANNER: &str = "mitigation policies active";
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 const LOCKDOWN_BANNER: &str = "no sandbox on this platform";
 
 /// Multi-process mode must actually spawn *processes* — and this is the only
