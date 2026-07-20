@@ -410,6 +410,14 @@ mod mitigation_enforcement {
     fn job_object_caps_memory() {
         check("job-memory-limit");
     }
+
+    /// The token handed to a child must carry fewer privileges than the one
+    /// the engine runs with. Privileges are the ambient ACL-override rights; a
+    /// renderer needs none of them.
+    #[test]
+    fn child_token_drops_privileges() {
+        check("restricted-token");
+    }
 }
 
 /// Guards the enforcement suite against silently shrinking.
@@ -478,6 +486,7 @@ mod probe_inventory {
         "mitigation-policies-readback",
         "low-integrity",
         "job-memory-limit",
+        "restricted-token",
     ];
 
     /// Everything else has no sandbox backend: components run unconfined under

@@ -386,3 +386,103 @@ pub fn isolate_network(_enable: bool) -> std::io::Result<()> {
 /// Windows-signed certificate a normal application will not have. So the honest
 /// answer for this row is "weaker than both other platforms", not a workaround.
 pub fn deny_debugger_attach() {}
+
+/// Build a restricted primary token for a child, or `None` if the platform
+/// refuses (in which case the caller spawns with the inherited token).
+///
+/// ## What this restricts, and what it deliberately does not
+///
+/// Two things are removed:
+///
+/// * **Every privilege but `SeChangeNotifyPrivilege`** (`DISABLE_MAX_PRIVILEGE`).
+///   Privileges are the ambient "you may override an ACL" rights — debugging
+///   other processes, loading drivers, taking ownership, bypassing traverse
+///   checks. A renderer needs none of them, and stripping them is free.
+/// * **Group-granted access**, by marking the powerful groups *deny-only*. A
+///   deny-only SID can still match a `DENY` ace but never an `ALLOW` one, so
+///   any access the user holds by virtue of being an Administrator stops
+///   applying. On a developer's own machine that is often most of the
+///   interesting access.
+///
+/// What is **not** done is the strong form: making the *user's own* SID
+/// deny-only, or supplying restricting SIDs. Either would close the remaining
+/// gap — a renderer reading the user's documents — and either would also stop
+/// the child reading its own executable, so `CreateProcess` fails outright
+/// before any of our code runs.
+///
+/// Closing that needs one of two things, and both are real work rather than a
+/// flag: granting a restricted SID an ACE on the binary (Chromium ACLs its
+/// install directory for exactly this), or Chromium's two-phase drop — create
+/// the process with the restricted primary token *plus* a permissive
+/// impersonation token, let the runtime warm up, then drop the impersonation.
+/// Neither is implemented, so this is a partial confinement and the module
+/// docs say so.
+#[cfg(feature = "multi-process")]
+pub fn restricted_token() -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        CreateRestrictedToken, CreateWellKnownSid, SID_AND_ATTRIBUTES, DISABLE_MAX_PRIVILEGE,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, WinBuiltinAdministratorsSid,
+    };
+    // Filed under SystemServices in windows-sys, like SE_GROUP_INTEGRITY.
+    use windows_sys::Win32::System::SystemServices::SE_GROUP_USE_FOR_DENY_ONLY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // A well-known SID fits comfortably in SECURITY_MAX_SID_SIZE (68 bytes).
+    let mut admins = [0u8; 68];
+    let mut len = admins.len() as u32;
+    // SAFETY: a correctly sized buffer with its length passed by pointer.
+    let made = unsafe {
+        CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            std::ptr::null_mut(),
+            admins.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if made == 0 {
+        return None;
+    }
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: pseudo-handle for self; token handle out.
+    let opened = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+            &mut token,
+        )
+    };
+    if opened == 0 {
+        return None;
+    }
+
+    let deny = [SID_AND_ATTRIBUTES {
+        Sid: admins.as_mut_ptr().cast(),
+        Attributes: SE_GROUP_USE_FOR_DENY_ONLY as u32,
+    }];
+
+    let mut restricted: HANDLE = std::ptr::null_mut();
+    // SAFETY: `token` is a valid token we opened; the deny array lives across
+    // the call; no privileges or restricting SIDs are supplied.
+    let ok = unsafe {
+        CreateRestrictedToken(
+            token,
+            DISABLE_MAX_PRIVILEGE,
+            deny.len() as u32,
+            deny.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            &mut restricted,
+        )
+    };
+    // SAFETY: opened above and no longer needed.
+    unsafe { CloseHandle(token) };
+
+    if ok == 0 {
+        return None;
+    }
+    Some(restricted)
+}

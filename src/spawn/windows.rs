@@ -23,13 +23,13 @@
 
 use std::ffi::c_void;
 use std::io;
-use std::os::windows::io::RawHandle;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-    UpdateProcThreadAttribute, WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTUPINFOEXW,
+    CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList,
+    InitializeProcThreadAttributeList, UpdateProcThreadAttribute, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTUPINFOEXW,
 };
 
 /// A spawned child process. Owns the process handle and closes it on drop.
@@ -192,23 +192,52 @@ pub fn spawn(
     // SAFETY: zeroed out-param, filled by CreateProcessW on success.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
+    // Spawn under a restricted token when one can be built: privileges
+    // stripped, group-granted access denied. Falling back to the inherited
+    // token if not is deliberate — a host or policy that refuses token
+    // creation should get a less-confined child rather than no browser, the
+    // same call made for low integrity and win32k lockdown. The child's own
+    // lockdown still applies either way.
+    let token = crate::sandbox::restricted_token();
+
     // SAFETY: `exe_w` and `line_w` are NUL-terminated and live across the call;
     // `bInheritHandles = TRUE` is required for the handle list to apply.
     let ok = unsafe {
-        CreateProcessW(
-            exe_w.as_mut_ptr(),
-            line_w.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1, // inherit handles — scoped by the list above
-            EXTENDED_STARTUPINFO_PRESENT,
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::addr_of!(si).cast(),
-            &mut pi,
-        )
+        match token {
+            Some(t) => CreateProcessAsUserW(
+                t,
+                exe_w.as_mut_ptr(),
+                line_w.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1, // inherit handles — scoped by the list above
+                EXTENDED_STARTUPINFO_PRESENT,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::addr_of!(si).cast(),
+                &mut pi,
+            ),
+            None => CreateProcessW(
+                exe_w.as_mut_ptr(),
+                line_w.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                EXTENDED_STARTUPINFO_PRESENT,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::addr_of!(si).cast(),
+                &mut pi,
+            ),
+        }
     };
     let err = io::Error::last_os_error();
+
+    if let Some(t) = token {
+        // SAFETY: created by `restricted_token`; the process holds its own
+        // reference now.
+        unsafe { CloseHandle(t) };
+    }
 
     // SAFETY: initialized above and no longer needed either way.
     unsafe { DeleteProcThreadAttributeList(attr_list) };

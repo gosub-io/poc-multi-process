@@ -175,6 +175,14 @@ pub fn confine_spawned_child(child: &crate::spawn::Child) -> std::io::Result<()>
     }
 }
 
+/// Build a restricted primary token for a child, or `None` if the host refuses
+/// (the spawner then falls back to the inherited token). Windows only — the
+/// other backends have no notion of a token handed to a child at creation.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub fn restricted_token() -> Option<::windows_sys::Win32::Foundation::HANDLE> {
+    imp::restricted_token()
+}
+
 /// Apply a job-object memory cap to a process. Exposed for the probe suite,
 /// which assigns the caps to itself to verify they bind. Windows only.
 #[cfg(all(feature = "multi-process", target_os = "windows"))]

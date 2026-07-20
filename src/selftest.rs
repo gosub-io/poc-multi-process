@@ -127,6 +127,8 @@ pub const PROBES: &[&str] = &[
     "low-integrity",
     #[cfg(target_os = "windows")]
     "job-memory-limit",
+    #[cfg(target_os = "windows")]
+    "restricted-token",
 ];
 
 /// Outcome codes for the Windows probes, mirroring the macOS set.
@@ -140,6 +142,30 @@ mod wcode {
     pub const CONTROL_FAILED: i32 = 90;
     pub const NOT_DENIED: i32 = 91;
     pub const WRONG_VALUE: i32 = 93;
+}
+
+/// How many privileges a token carries. The first `DWORD` of
+/// `TOKEN_PRIVILEGES` is the count, so a modest buffer reads it even when the
+/// full list would not fit.
+#[cfg(target_os = "windows")]
+fn privilege_count(token: windows_sys::Win32::Foundation::HANDLE) -> Option<u32> {
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenPrivileges};
+    let mut buf = [0u8; 4096];
+    let mut needed = 0u32;
+    // SAFETY: correctly sized buffer with its length and an out-param.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenPrivileges,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            &mut needed,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]))
 }
 
 /// Try to allocate memory that is writable *and* executable — the allocation a
@@ -313,6 +339,53 @@ fn run_windows_probe(probe: &str) {
                 }
             };
             if after {
+                std::process::exit(wcode::NOT_DENIED);
+            }
+            std::process::exit(0);
+        }
+
+        // Privileges are the ambient "may override an ACL" rights — debug
+        // other processes, load drivers, take ownership. A renderer needs
+        // none, and `DISABLE_MAX_PRIVILEGE` leaves exactly one
+        // (SeChangeNotifyPrivilege).
+        //
+        // The control here is the *current* process's own token rather than a
+        // before/after on one token: a restricted token is built fresh rather
+        // than applied in place, so the comparison is between what we inherited
+        // and what a child would be given. That the spawner actually uses it is
+        // covered by the demo running at all — `CreateProcessAsUserW` failing
+        // would abort the spawn rather than quietly fall back.
+        "restricted-token" => {
+            // SAFETY: pseudo-handle for self; token handle out.
+            let mut mine = std::ptr::null_mut();
+            let opened = unsafe {
+                windows_sys::Win32::System::Threading::OpenProcessToken(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    windows_sys::Win32::Security::TOKEN_QUERY,
+                    &mut mine,
+                )
+            };
+            if opened == 0 {
+                std::process::exit(wcode::WRONG_VALUE);
+            }
+            let Some(before) = privilege_count(mine) else {
+                std::process::exit(wcode::WRONG_VALUE);
+            };
+            if before <= 1 {
+                // Already privilege-free: restricting further would prove
+                // nothing, so report a broken control rather than a pass.
+                std::process::exit(wcode::CONTROL_FAILED);
+            }
+
+            let Some(restricted) = crate::sandbox::restricted_token() else {
+                std::process::exit(wcode::WRONG_VALUE);
+            };
+            let Some(after) = privilege_count(restricted) else {
+                std::process::exit(wcode::WRONG_VALUE);
+            };
+
+            eprintln!("[selftest] privileges: {before} -> {after}");
+            if after >= before {
                 std::process::exit(wcode::NOT_DENIED);
             }
             std::process::exit(0);
