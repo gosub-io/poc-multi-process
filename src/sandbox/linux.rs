@@ -1,4 +1,9 @@
-//! OS-level privilege capping for child components (Linux, multi-process only).
+//! Linux backend: seccomp-BPF confinement, network namespaces, rlimits, and
+//! `prctl(PR_SET_DUMPABLE)`. This is the reference implementation of the
+//! privilege model; the public surface it satisfies lives in
+//! [`crate::sandbox`]. Every item here is unconditionally Linux — the parent
+//! module only compiles this file on `target_os = "linux"`, so nothing inside
+//! carries a `target_os` guard.
 //!
 //! Process isolation is only worth as much as the privileges you drop inside
 //! each process. After a child has connected its IPC link we install a
@@ -46,7 +51,7 @@
 /// time, teardown. Deliberately ABSENT: `socket`/`connect` (no new network),
 /// `openat` (no file opens), `execve`/`clone` (no new programs/processes),
 /// `io_uring_*` (no async-submission network bypass), `ptrace`.
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[cfg(feature = "multi-process")]
 const BASELINE: &[libc::c_long] = &[
     // I/O on existing fds only — a new socket/file fd cannot be obtained
     // because socket()/openat() are not on this list.
@@ -113,7 +118,7 @@ const BASELINE: &[libc::c_long] = &[
 /// seccomp — `connect` takes a pointer argument seccomp can't dereference — so
 /// a real deployment additionally confines egress with a network namespace +
 /// firewall rules rather than trusting the in-process SSRF check alone.)
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[cfg(feature = "multi-process")]
 const NET_EXTRA: &[libc::c_long] = &[
     libc::SYS_socket,
     libc::SYS_socketpair,
@@ -125,21 +130,21 @@ const NET_EXTRA: &[libc::c_long] = &[
 ];
 
 /// Cap a renderer: pixels only — the baseline, no network, files, or exec.
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[cfg(feature = "multi-process")]
 pub fn lock_down_renderer() {
     deny_debugger_attach();
     enforce("renderer", install(BASELINE.to_vec()));
 }
 
 /// Cap the net component: the baseline plus the socket family.
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[cfg(feature = "multi-process")]
 pub fn lock_down_net() {
     deny_debugger_attach();
     let allowed: Vec<libc::c_long> = BASELINE.iter().chain(NET_EXTRA).copied().collect();
     enforce("net", install(allowed));
 }
 
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[cfg(feature = "multi-process")]
 fn enforce(role: &str, result: Result<(), Box<dyn std::error::Error>>) {
     match result {
         Ok(()) => eprintln!("[{role}] seccomp allowlist active (default-deny, KillProcess)"),
@@ -155,7 +160,7 @@ fn enforce(role: &str, result: Result<(), Box<dyn std::error::Error>>) {
 /// Build and apply a default-deny allowlist: syscalls in `allowed` pass (subject
 /// to any argument filter), every other syscall — and any allowed syscall whose
 /// arguments fail its filter — is a fatal `SIGSYS`.
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[cfg(feature = "multi-process")]
 fn install(allowed: Vec<libc::c_long>) -> Result<(), Box<dyn std::error::Error>> {
     use seccompiler::{
         apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
@@ -220,7 +225,7 @@ fn install(allowed: Vec<libc::c_long>) -> Result<(), Box<dyn std::error::Error>>
 ///
 /// Called from the post-fork/pre-exec context, so it must stay
 /// async-signal-safe: nothing but `setrlimit` syscalls here.
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[cfg(feature = "multi-process")]
 pub fn apply_child_rlimits() -> std::io::Result<()> {
     // Address space: enough for legitimate rendering, but a renderer that
     // tries to allocate the host to death instead hits a failed mmap → Rust's
@@ -240,7 +245,9 @@ pub fn apply_child_rlimits() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Move the calling process into a fresh, empty network namespace.
+/// Move the calling process into a fresh, empty network namespace when
+/// `enable` is set (renderers); a no-op otherwise (the net component, which is
+/// the one role that must keep the network).
 ///
 /// This is defense in depth for the *same* property the seccomp allowlist
 /// already provides: a renderer must never reach the network. The two fail
@@ -264,8 +271,11 @@ pub fn apply_child_rlimits() -> std::io::Result<()> {
 ///
 /// Called from the post-fork/pre-exec context, so it must stay
 /// async-signal-safe: a single `unshare` syscall, nothing else.
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
-pub fn unshare_network() -> std::io::Result<()> {
+#[cfg(feature = "multi-process")]
+pub fn isolate_network(enable: bool) -> std::io::Result<()> {
+    if !enable {
+        return Ok(());
+    }
     // SAFETY: unshare with valid flags; affects only the calling process.
     if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } < 0 {
         return Err(std::io::Error::last_os_error());
@@ -301,7 +311,6 @@ pub fn unshare_network() -> std::io::Result<()> {
 /// The fork server calls it once and every renderer it forks inherits it.
 /// Applies in single-process mode too: that build has no children to confine,
 /// but it still holds the cookie jar in its address space.
-#[cfg(target_os = "linux")]
 pub fn deny_debugger_attach() {
     // SAFETY: PR_SET_DUMPABLE takes one value argument and affects only the
     // calling process.
@@ -319,7 +328,7 @@ pub fn deny_debugger_attach() {
 
 /// Lower the calling process's scheduling priority (higher nice = lower
 /// priority). Async-signal-safe (a single syscall), so usable pre-exec.
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[cfg(feature = "multi-process")]
 fn set_priority(nice: libc::c_int) -> std::io::Result<()> {
     // SAFETY: PRIO_PROCESS with pid 0 targets the calling process.
     if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) } < 0 {
@@ -328,32 +337,12 @@ fn set_priority(nice: libc::c_int) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[cfg(feature = "multi-process")]
 fn set_rlimit(resource: libc::__rlimit_resource_t, limit: libc::rlim_t) -> std::io::Result<()> {
     let rl = libc::rlimit { rlim_cur: limit, rlim_max: limit };
     // SAFETY: valid resource id and a valid rlimit pointer.
     if unsafe { libc::setrlimit(resource, &rl) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(())
-}
-
-/// No-op off Linux. macOS has `PT_DENY_ATTACH` and Windows has process
-/// mitigation policies; both would go here.
-#[cfg(not(target_os = "linux"))]
-pub fn deny_debugger_attach() {}
-
-// On non-Linux (multi-process still builds over Unix sockets on e.g. macOS)
-// there is no seccomp; the caps are no-ops with a note.
-#[cfg(all(feature = "multi-process", not(target_os = "linux")))]
-pub fn lock_down_renderer() {
-    eprintln!("[renderer] no seccomp on this platform — running unconfined");
-}
-
-#[cfg(all(feature = "multi-process", not(target_os = "linux")))]
-pub fn lock_down_net() {}
-
-#[cfg(all(feature = "multi-process", not(target_os = "linux")))]
-pub fn apply_child_rlimits() -> std::io::Result<()> {
     Ok(())
 }

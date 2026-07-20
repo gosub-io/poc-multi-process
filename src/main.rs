@@ -29,9 +29,10 @@ mod ip_utils;
 mod ipc;
 mod net_daemon;
 mod renderer;
-// Unconditional: the seccomp/rlimit machinery inside is feature-gated, but
+// Unconditional: the per-OS confinement machinery inside is feature-gated, but
 // `deny_debugger_attach` applies to the single-process build too — that build
-// still holds the cookie jar in its address space.
+// still holds the cookie jar in its address space. The platform backend
+// (seccomp / Seatbelt / none) is selected inside the module.
 mod sandbox;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 mod ring;

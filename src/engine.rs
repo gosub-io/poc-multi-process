@@ -902,6 +902,19 @@ fn spawn_inherited(
     let child_fd = child_end.into_raw_fd();
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args).arg(child_fd.to_string());
+    // Strip the dynamic-loader injection vectors from the child's environment
+    // before it execs: DYLD_INSERT_LIBRARIES (macOS) and LD_PRELOAD/LD_* (glibc)
+    // are the runtime-linker's "load this code into every new process" knobs. A
+    // child inheriting one would run attacker-supplied library code *before* it
+    // reaches its own lockdown, sidestepping the sandbox entirely. The OS ignores
+    // these for signed/hardened binaries, but scrubbing them is cheap defense in
+    // depth and keeps the guarantee from depending on how the engine was signed.
+    for (key, _) in std::env::vars_os() {
+        let drop = key.to_str().is_some_and(|k| k.starts_with("DYLD_") || k.starts_with("LD_"));
+        if drop {
+            cmd.env_remove(&key);
+        }
+    }
     // Clear FD_CLOEXEC on the child's end so it survives exec. Every other fd
     // the engine holds keeps CLOEXEC and is NOT leaked into the child.
     unsafe {
@@ -911,12 +924,10 @@ fn spawn_inherited(
             // meant to be network-isolated and silently isn't is worse than an
             // honest refusal to start. Environments without unprivileged user
             // namespaces use `--single-process` / `--no-default-features`.
-            #[cfg(target_os = "linux")]
-            if isolate_network {
-                crate::sandbox::unshare_network()?;
-            }
-            #[cfg(not(target_os = "linux"))]
-            let _ = isolate_network;
+            // Platform-neutral: on Linux this enters an empty netns for
+            // renderers; where there are no namespaces it defers to the
+            // lockdown profile and is a no-op here.
+            crate::sandbox::isolate_network(isolate_network)?;
             let flags = libc::fcntl(child_fd, libc::F_GETFD);
             if flags < 0 {
                 return Err(std::io::Error::last_os_error());

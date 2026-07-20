@@ -86,7 +86,7 @@ pub fn run(probe: &str) {
         let before = std::fs::read_link("/proc/self/ns/net").expect("read netns link");
         assert!(interfaces().len() > 1, "host netns looks empty already — probe proves nothing");
 
-        crate::sandbox::unshare_network().expect("unshare netns");
+        crate::sandbox::isolate_network(true).expect("unshare netns");
 
         // The namespace must actually have changed, and the new one must hold
         // nothing but loopback: no route off this machine exists at all.
