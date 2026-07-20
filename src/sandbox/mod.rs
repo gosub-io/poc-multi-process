@@ -175,9 +175,15 @@ pub fn confine_spawned_child(child: &crate::spawn::Child) -> std::io::Result<()>
     }
 }
 
-/// Build a restricted primary token for a child, or `None` if the host refuses
-/// (the spawner then falls back to the inherited token). Windows only — the
-/// other backends have no notion of a token handed to a child at creation.
+/// Build the lockdown/initial token pair for a two-phase drop, or `None` if
+/// the host refuses. Windows only. See the backend for why two are needed.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub fn token_pair() -> Option<windows::TokenPair> {
+    imp::token_pair()
+}
+
+/// Build a single restricted token — the fallback when a pair cannot be made.
+/// Windows only.
 #[cfg(all(feature = "multi-process", target_os = "windows"))]
 pub fn restricted_token() -> Option<::windows_sys::Win32::Foundation::HANDLE> {
     imp::restricted_token()

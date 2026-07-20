@@ -147,6 +147,14 @@ pub fn get_policy(policy: PROCESS_MITIGATION_POLICY) -> std::io::Result<u32> {
 /// elsewhere. The `win32k` probe reports whether it actually took.
 #[cfg(feature = "multi-process")]
 fn lock_down(role: &str) {
+    // Phase two of the two-phase drop, and it must come first: the child has
+    // been running under a permissive impersonation token so that startup could
+    // complete. Dropping it here — at the moment the component is warm and
+    // about to touch untrusted input — leaves only the heavily restricted
+    // primary token it was created with. A no-op when the spawner fell back to
+    // a single token.
+    lower_token();
+
     for (policy, flags, name) in ESSENTIAL {
         if let Err(e) = set_policy(*policy, *flags) {
             // Fail closed: never run a component that was meant to be confined
@@ -179,7 +187,7 @@ fn lock_down(role: &str) {
     };
 
     eprintln!(
-        "[{role}] mitigation policies active (no dynamic code, no child processes, {win32k}, {integrity})"
+        "[{role}] mitigation policies active (no dynamic code, no child processes, {win32k}, {integrity}, token-lowered)"
     );
 }
 
@@ -387,62 +395,72 @@ pub fn isolate_network(_enable: bool) -> std::io::Result<()> {
 /// answer for this row is "weaker than both other platforms", not a workaround.
 pub fn deny_debugger_attach() {}
 
-/// Build a restricted primary token for a child, or `None` if the platform
-/// refuses (in which case the caller spawns with the inherited token).
+/// The two tokens a two-phase drop needs.
 ///
-/// ## What this restricts, and what it deliberately does not
+/// ## Why two
 ///
-/// Two things are removed:
+/// A maximally restricted token cannot complete process startup. Loading the
+/// CRT and the system DLLs needs read access that a token with restricting
+/// SIDs no longer has, so a child created with only the lockdown token dies
+/// during initialization — before any of our code runs, which makes it
+/// undebuggable from the inside.
 ///
-/// * **Every privilege but `SeChangeNotifyPrivilege`** (`DISABLE_MAX_PRIVILEGE`).
-///   Privileges are the ambient "you may override an ACL" rights — debugging
-///   other processes, loading drivers, taking ownership, bypassing traverse
-///   checks. A renderer needs none of them, and stripping them is free.
-/// * **Group-granted access**, by marking the powerful groups *deny-only*. A
-///   deny-only SID can still match a `DENY` ace but never an `ALLOW` one, so
-///   any access the user holds by virtue of being an Administrator stops
-///   applying. On a developer's own machine that is often most of the
-///   interesting access.
+/// Chromium's answer, and the one used here: give the child the **lockdown**
+/// token as its permanent identity, and additionally impersonate a more
+/// permissive **initial** token on its first thread. Windows uses the
+/// impersonation token for access checks while it is present, so startup
+/// succeeds. Once warm, the child calls `RevertToSelf` (see [`lower_token`])
+/// and from that moment only the lockdown token applies.
 ///
-/// What is **not** done is the strong form: making the *user's own* SID
-/// deny-only, or supplying restricting SIDs. Either would close the remaining
-/// gap — a renderer reading the user's documents — and either would also stop
-/// the child reading its own executable, so `CreateProcess` fails outright
-/// before any of our code runs.
-///
-/// Closing that needs one of two things, and both are real work rather than a
-/// flag: granting a restricted SID an ACE on the binary (Chromium ACLs its
-/// install directory for exactly this), or Chromium's two-phase drop — create
-/// the process with the restricted primary token *plus* a permissive
-/// impersonation token, let the runtime warm up, then drop the impersonation.
-/// Neither is implemented, so this is a partial confinement and the module
-/// docs say so.
+/// This is what makes a strong token usable at all — without it the only
+/// alternative is weakening the *executable's* ACL to compensate for the token,
+/// which is a worse trade: it makes the file permanently more accessible to
+/// everything, rather than sequencing one process's drop correctly.
 #[cfg(feature = "multi-process")]
-pub fn restricted_token() -> Option<windows_sys::Win32::Foundation::HANDLE> {
+pub struct TokenPair {
+    /// The child's permanent, heavily restricted primary token.
+    pub lockdown: windows_sys::Win32::Foundation::HANDLE,
+    /// A more permissive impersonation token, dropped once the child is warm.
+    pub initial: windows_sys::Win32::Foundation::HANDLE,
+}
+
+/// Build one restricted token from this process's own.
+///
+/// `restricting` adds the RESTRICTED SID as a *restricting* SID, which is the
+/// strong form: access then requires the object's ACL to satisfy **both** the
+/// normal check and a second check against the restricted set. Almost nothing
+/// on the system grants RESTRICTED, so this is close to "no file access at
+/// all" — correct for a warmed-up renderer, fatal during startup.
+///
+/// Without `restricting` the token still has every privilege stripped
+/// (`DISABLE_MAX_PRIVILEGE`) and Administrators marked deny-only, so
+/// group-granted access no longer applies. That is the permissive half of the
+/// pair: confined, but still able to start a process.
+#[cfg(feature = "multi-process")]
+fn build_token(restricting: bool) -> Option<windows_sys::Win32::Foundation::HANDLE> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
         CreateRestrictedToken, CreateWellKnownSid, SID_AND_ATTRIBUTES, DISABLE_MAX_PRIVILEGE,
         TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, WinBuiltinAdministratorsSid,
+        WinRestrictedCodeSid,
     };
     // Filed under SystemServices in windows-sys, like SE_GROUP_INTEGRITY.
     use windows_sys::Win32::System::SystemServices::SE_GROUP_USE_FOR_DENY_ONLY;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    // A well-known SID fits comfortably in SECURITY_MAX_SID_SIZE (68 bytes).
-    let mut admins = [0u8; 68];
-    let mut len = admins.len() as u32;
-    // SAFETY: a correctly sized buffer with its length passed by pointer.
-    let made = unsafe {
-        CreateWellKnownSid(
-            WinBuiltinAdministratorsSid,
-            std::ptr::null_mut(),
-            admins.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    if made == 0 {
-        return None;
+    /// A well-known SID fits comfortably in SECURITY_MAX_SID_SIZE (68 bytes).
+    fn well_known(kind: i32) -> Option<[u8; 68]> {
+        let mut sid = [0u8; 68];
+        let mut len = sid.len() as u32;
+        // SAFETY: a correctly sized buffer with its length passed by pointer.
+        let ok = unsafe {
+            CreateWellKnownSid(kind, std::ptr::null_mut(), sid.as_mut_ptr().cast(), &mut len)
+        };
+        (ok != 0).then_some(sid)
     }
+
+    let mut admins = well_known(WinBuiltinAdministratorsSid)?;
+    let mut restricted_sid = well_known(WinRestrictedCodeSid)?;
 
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: pseudo-handle for self; token handle out.
@@ -461,10 +479,13 @@ pub fn restricted_token() -> Option<windows_sys::Win32::Foundation::HANDLE> {
         Sid: admins.as_mut_ptr().cast(),
         Attributes: SE_GROUP_USE_FOR_DENY_ONLY as u32,
     }];
+    let restrict = [SID_AND_ATTRIBUTES {
+        Sid: restricted_sid.as_mut_ptr().cast(),
+        Attributes: 0,
+    }];
 
-    let mut restricted: HANDLE = std::ptr::null_mut();
-    // SAFETY: `token` is a valid token we opened; the deny array lives across
-    // the call; no privileges or restricting SIDs are supplied.
+    let mut out: HANDLE = std::ptr::null_mut();
+    // SAFETY: `token` is valid; both SID arrays live across the call.
     let ok = unsafe {
         CreateRestrictedToken(
             token,
@@ -473,16 +494,60 @@ pub fn restricted_token() -> Option<windows_sys::Win32::Foundation::HANDLE> {
             deny.as_ptr(),
             0,
             std::ptr::null(),
-            0,
-            std::ptr::null(),
-            &mut restricted,
+            if restricting { restrict.len() as u32 } else { 0 },
+            if restricting { restrict.as_ptr() } else { std::ptr::null() },
+            &mut out,
         )
     };
     // SAFETY: opened above and no longer needed.
     unsafe { CloseHandle(token) };
 
-    if ok == 0 {
-        return None;
+    (ok != 0).then_some(out)
+}
+
+/// Build both tokens, or `None` if either cannot be made.
+///
+/// All-or-nothing on purpose. A half-built pair would mean creating the child
+/// with the lockdown token and no way to let it start — a browser that refuses
+/// to run. Returning `None` instead lets the spawner fall back to the
+/// single-token path, which is less confined but works.
+#[cfg(feature = "multi-process")]
+pub fn token_pair() -> Option<TokenPair> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    let lockdown = build_token(true)?;
+    match build_token(false) {
+        Some(initial) => Some(TokenPair { lockdown, initial }),
+        None => {
+            // SAFETY: built just above and otherwise leaked.
+            unsafe { CloseHandle(lockdown) };
+            None
+        }
     }
-    Some(restricted)
+}
+
+/// Build a single restricted token, the fallback when the pair cannot be made.
+#[cfg(feature = "multi-process")]
+pub fn restricted_token() -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    build_token(false)
+}
+
+/// Drop the permissive impersonation token, leaving only the lockdown token.
+///
+/// This is phase two, and the reason it lives here rather than in the spawner
+/// is that only the child knows when it is warm. Called at the top of the
+/// lockdown, which is precisely the point the component has finished
+/// initializing and is about to start handling untrusted input.
+///
+/// Harmless when the child was spawned by the single-token fallback: there is
+/// no impersonation token to drop and `RevertToSelf` succeeds trivially.
+#[cfg(feature = "multi-process")]
+fn lower_token() {
+    use windows_sys::Win32::Security::RevertToSelf;
+    // SAFETY: affects only the calling thread's impersonation state.
+    if unsafe { RevertToSelf() } == 0 {
+        eprintln!(
+            "[sandbox] warning: could not lower token: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 }
