@@ -28,7 +28,7 @@ enumerated and everything else is a fatal `SIGSYS` (`KillProcess`, not `EPERM`
 — a killed process can't probe the sandbox and adapt). This is fail-closed — a
 syscall we never considered (a new one, or a bypass such as io_uring-based
 networking) is denied for free — which is what real renderer sandboxes
-(Chromium, Firefox) do. `src/sandbox.rs` holds the curated baseline.
+(Chromium, Firefox) do. `src/sandbox/linux.rs` holds the curated baseline.
 
 A few allowed syscalls are **argument-filtered**: `mmap`/`mprotect` are
 permitted only when `PROT_EXEC` is clear, so a renderer can never turn writable
@@ -130,7 +130,7 @@ engine event loop (broker — owns cookie jar & policy)
   only a curated baseline (I/O on existing fds, memory, futex, signals, time).
   A renderer — even one fully code-exec'd by an exploit — physically cannot
   open a socket, an io_uring instance, a file, or a subprocess; the kernel
-  returns `EPERM`. See `src/sandbox.rs`. The net component gets the same
+  returns `EPERM`. See `src/sandbox/linux.rs`. The net component gets the same
   baseline plus the socket family.
 - Children run under **OS resource caps** the engine sets at spawn (Linux):
   `RLIMIT_AS` (512 MiB address space), `RLIMIT_NOFILE`, and `RLIMIT_CORE=0`.
@@ -355,14 +355,15 @@ covers the bounding mechanism itself deterministically.
 |------|----------|
 | `src/events.rs` | Public vocabulary: `EngineCommand`, `TabCommand`, `EngineEvent`, `TabId`, `Tile` |
 | `src/engine.rs` | `start(mode)`, `EngineHandle`, the event loop (broker + policy), `Spawner` |
-| `src/ipc.rs` | `Endpoint` tx/rx halves (socket/local transports), wire messages, bincode framing, `SCM_RIGHTS` fd-passing |
+| `src/ipc.rs` | `Endpoint` tx/rx halves (channel/local transports), wire messages, bincode framing, `SCM_RIGHTS` fd-passing (Linux) |
+| `src/channel/` | Transport seam: the duplex byte channel a link runs over — `unix.rs` (socketpair), `windows.rs` (anonymous pipe pair) |
 | `src/net_daemon.rs` | Net component: `serve` loop, (synthesized) fetching |
 | `src/ip_utils.rs` | SSRF policy: URL host extraction, IP-literal parsing (incl. `inet_aton` encodings), blocked-range classification |
 | `src/renderer.rs` | Per-`(zone,origin)` renderer: `serve` loop, placeholder render pipeline |
 | `src/fork_server.rs` | Fork server (Linux): `fork()`s renderers without exec |
 | `src/shm.rs` | Shared-memory tiles (Linux): sealed-`memfd` producer + validating consumer |
 | `src/ring.rs` | Shared-memory ring (Linux): streams large fetch bodies, futex wakeups, hostile-cursor validation |
-| `src/sandbox.rs` | seccomp-BPF privilege capping for the child processes (Linux) |
+| `src/sandbox/` | Privilege capping seam: `linux.rs` (seccomp-BPF, netns, rlimits), `macos.rs` (Seatbelt), `unsupported.rs` (no-ops) |
 | `src/selftest.rs` | Sandbox-enforcement probes spawned by the integration tests (Linux) |
 | `src/main.rs` | Child-role dispatch for re-exec + minimal event-driven usage |
 | `tests/integration.rs` | End-to-end tests running the built binary (both modes + sandbox) |
@@ -390,7 +391,18 @@ simplified is the surrounding browser. What each entry below still needs:
   filesystem restriction (Landlock), and the remaining namespaces
   (mount/PID/IPC) plus `pivot_root`. A real JS JIT needs executable memory, so
   it would carve out a dedicated JIT exception rather than deny `PROT_EXEC`
-  outright. macOS/Windows need their own mechanisms (Seatbelt, AppContainer).
+  outright.
+
+  **Platform status.** Linux is the reference implementation. macOS runs
+  multi-process with a Seatbelt profile. Windows *builds and spawns* — the
+  transport is a pair of anonymous pipes rather than a socketpair (see
+  `src/channel/`) — but has **no sandbox backend at all**: its children run
+  under `sandbox::unsupported`, unconfined. Confining them needs a job object,
+  a restricted token and an AppContainer, all attached by the parent at
+  `CreateProcess` time, which the sandbox contract has no hook for yet; see
+  the seam notes in `src/sandbox/mod.rs`. The Windows transport is also
+  **untested** — it type-checks against `x86_64-pc-windows-*` but has never
+  been executed.
 
   Note the netns is obtained via `CLONE_NEWUSER | CLONE_NEWNET` (an unprivileged
   `CLONE_NEWNET` alone needs `CAP_SYS_ADMIN`) and the uid map is deliberately

@@ -786,7 +786,12 @@ impl Spawner {
                 // renderer it forks inherits the empty netns — which is how
                 // renderers get network isolation without ever passing through
                 // `spawn_inherited` themselves.
-                let fork_child = spawn_inherited(&exe, &["fork-server"], fs_end, true);
+                let fork_child = spawn_inherited(
+                    &exe,
+                    &["fork-server"],
+                    crate::channel::Channel::from_stream(fs_end),
+                    true,
+                );
                 Spawner::Multi { exe, fork_control, fork_child }
             }
             #[cfg(all(feature = "multi-process", not(target_os = "linux")))]
@@ -817,11 +822,11 @@ impl Spawner {
             Spawner::Multi { exe, fork_control, .. } => match role {
                 Role::Net => {
                     let (parent_end, child_end) =
-                        std::os::unix::net::UnixStream::pair().expect("socketpair");
+                        crate::channel::Channel::pair().expect("channel pair");
                     // The one role that keeps its network namespace: it is the
                     // component whose entire job is outbound fetching.
                     let child = spawn_inherited(exe, &["net-daemon"], child_end, false);
-                    let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
+                    let ep = Endpoint::from_channel(parent_end).expect("wrap parent end");
                     (ChildHandle::Process(child), ep)
                 }
                 Role::Renderer(origin) => {
@@ -840,7 +845,8 @@ impl Spawner {
                     unsafe { ipc::send_fd(fork_control.as_raw_fd(), child_end.as_raw_fd()) }
                         .expect("send fd");
                     drop(child_end);
-                    let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
+                    let ep = Endpoint::from_channel(crate::channel::Channel::from_stream(parent_end))
+                        .expect("wrap parent end");
                     (ChildHandle::ForkServed, ep)
                 }
             },
@@ -854,11 +860,11 @@ impl Spawner {
                     Role::Renderer(origin) => vec!["renderer", origin],
                 };
                 let (parent_end, child_end) =
-                    std::os::unix::net::UnixStream::pair().expect("socketpair");
+                    crate::channel::Channel::pair().expect("channel pair");
                 // No-op off Linux (no namespaces), but kept truthful per role.
                 let isolate_network = matches!(role, Role::Renderer(_));
                 let child = spawn_inherited(exe, &role_args, child_end, isolate_network);
-                let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
+                let ep = Endpoint::from_channel(parent_end).expect("wrap parent end");
                 (ChildHandle::Process(child), ep)
             }
         }
@@ -893,15 +899,11 @@ impl Spawner {
 fn spawn_inherited(
     exe: &std::path::Path,
     args: &[&str],
-    child_end: std::os::unix::net::UnixStream,
+    child_end: crate::channel::Channel,
     isolate_network: bool,
 ) -> std::process::Child {
-    use std::os::fd::IntoRawFd;
-    use std::os::unix::process::CommandExt;
-
-    let child_fd = child_end.into_raw_fd();
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(args).arg(child_fd.to_string());
+    cmd.args(args).arg(child_end.to_argv());
     // Strip the dynamic-loader injection vectors from the child's environment
     // before it execs: DYLD_INSERT_LIBRARIES (macOS) and LD_PRELOAD/LD_* (glibc)
     // are the runtime-linker's "load this code into every new process" knobs. A
@@ -915,9 +917,16 @@ fn spawn_inherited(
             cmd.env_remove(&key);
         }
     }
-    // Clear FD_CLOEXEC on the child's end so it survives exec. Every other fd
-    // the engine holds keeps CLOEXEC and is NOT leaked into the child.
+    // --- Unix: cap privileges in `pre_exec`, between fork and exec ---
+    //
+    // Everything here runs in the forked child, which is both why the rlimits
+    // and netns land on the child alone, and why the channel's inheritance is
+    // granted here rather than in the parent: clearing FD_CLOEXEC in the
+    // parent would expose that fd to every other concurrent spawn as well.
+    #[cfg(unix)]
     unsafe {
+        use std::os::unix::process::CommandExt;
+        let raw = child_end.raw();
         cmd.pre_exec(move || {
             crate::sandbox::apply_child_rlimits()?;
             // Fail-closed, matching the seccomp precedent: a child that was
@@ -928,18 +937,34 @@ fn spawn_inherited(
             // renderers; where there are no namespaces it defers to the
             // lockdown profile and is a no-op here.
             crate::sandbox::isolate_network(isolate_network)?;
-            let flags = libc::fcntl(child_fd, libc::F_GETFD);
-            if flags < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            crate::channel::Channel::make_inheritable(raw)?;
             Ok(())
         });
     }
+
+    // --- Windows: no `pre_exec`, so inheritance is granted here ---
+    //
+    // Safe with this spawner because it is driven only by the single-threaded
+    // engine loop, so no other `CreateProcess` can be in flight to pick the
+    // handles up (see `channel/windows.rs`).
+    //
+    // Note what is *missing* relative to the Unix path: there is no hook in
+    // which to apply `apply_child_rlimits` or `isolate_network`. Windows caps
+    // a child with a job object, a restricted token and an AppContainer, all
+    // attached by the parent at creation time — which the sandbox contract has
+    // no place for yet (see `sandbox/mod.rs`). Until it does, Windows children
+    // run under the `unsupported` backend: unconfined, and saying so.
+    #[cfg(windows)]
+    {
+        let _ = isolate_network;
+        crate::channel::Channel::make_inheritable(child_end.raw())
+            .expect("grant handle inheritance");
+    }
+
     let child = cmd.spawn().expect("spawn child process");
-    unsafe { libc::close(child_fd) };
+    // The child holds its own copy now; drop ours so a dead child is seen as
+    // EOF rather than a link the engine is itself holding open.
+    drop(child_end);
     child
 }
 

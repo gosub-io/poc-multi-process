@@ -21,6 +21,11 @@
 //! - run time: when the feature is compiled in, `--single-process` still
 //!   selects the thread-based setup (like Chromium's `--single-process`).
 
+// The transport seam, mirroring `sandbox`: the only place a `target_os` cfg
+// for the IPC byte channel lives. Multi-process only — single-process links
+// are in-process channels.
+#[cfg(feature = "multi-process")]
+mod channel;
 mod engine;
 mod events;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
@@ -36,7 +41,10 @@ mod renderer;
 mod sandbox;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 mod ring;
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+// Compiled on every platform (not just Linux) so the integration suite can
+// query the probe inventory anywhere — a platform with no probes must fail
+// loudly rather than silently skip its enforcement tests.
+#[cfg(feature = "multi-process")]
 mod selftest;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 mod shm;
@@ -73,7 +81,7 @@ fn main() {
         #[cfg(all(feature = "multi-process", target_os = "linux"))]
         Some("fork-server") => fork_server::run(&args[2]),
         // Internal sandbox self-test, spawned only by the integration suite.
-        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        #[cfg(feature = "multi-process")]
         Some("selftest") => selftest::run(&args[2]),
         // Tile-transport measurement: render N frames over one tab and report
         // time + engine memory, via shared memory or the socket-copy path.

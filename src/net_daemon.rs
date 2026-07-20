@@ -9,19 +9,15 @@
 use crate::ip_utils::ssrf_block_reason;
 use crate::ipc::{Endpoint, FetchOutcome, NetRequest, NetResponse};
 
-/// Multi-process entry point: adopt the inherited IPC fd, sandbox, serve.
-/// `fd` is the `socketpair(2)` end the engine handed us — possessing it is our
-/// authentication (see [`crate::renderer::run`]).
+/// Multi-process entry point: adopt the inherited IPC link, sandbox, serve.
+/// `link` is the transport's argv token for the channel end the engine handed
+/// us — possessing it is our authentication (see [`crate::renderer::run`]).
 #[cfg(feature = "multi-process")]
-pub fn run(fd: &str) {
-    use std::os::fd::FromRawFd;
-    use std::os::unix::net::UnixStream;
-
-    let fd: std::os::fd::RawFd = fd.parse().expect("net: bad fd arg");
-    // SAFETY: the engine passed us sole ownership of this inherited fd.
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    // Split before sandboxing (try_clone's dup is not on the allowlist).
-    let ep = Endpoint::from_stream(stream).expect("net: wrap fd");
+pub fn run(link: &str) {
+    // SAFETY: the engine passed us sole ownership of this inherited channel.
+    let ch = unsafe { crate::channel::Channel::from_argv(link) }.expect("net: bad link arg");
+    // Split before sandboxing (on Unix the split's dup is not on the allowlist).
+    let ep = Endpoint::from_channel(ch).expect("net: wrap link");
     // The net component keeps network access (it is the one process that has
     // it) but still drops exec/io_uring/openat/etc.
     crate::sandbox::lock_down_net();

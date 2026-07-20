@@ -79,8 +79,8 @@ fn fork_renderer(control_fd: RawFd, comp_fd: OwnedFd, origin: String) {
             // Child — this IS the renderer now. It inherited the fork server's
             // warm runtime via copy-on-write; no exec, no re-init.
             unsafe { libc::close(control_fd) }; // never touch the engine's control channel
-            let stream = UnixStream::from(comp_fd);
-            let ep = Endpoint::from_stream(stream).expect("fork-server child: wrap fd");
+            let ch = crate::channel::Channel::from_stream(UnixStream::from(comp_fd));
+            let ep = Endpoint::from_channel(ch).expect("fork-server child: wrap fd");
             // Drop privileges, then serve. rlimits were inherited from the
             // fork server; seccomp is per-process, applied here.
             crate::sandbox::lock_down_renderer();

@@ -127,6 +127,67 @@ fn multi_process_children_are_sandboxed() {
     assert!(stderr.contains("seccomp allowlist active"), "children not sandboxed:\n{stderr}");
 }
 
+/// Guards the enforcement suite against silently shrinking.
+///
+/// Every test below this point is `cfg`'d to Linux, so on another platform
+/// they do not fail — they cease to exist, and the run still reports success.
+/// That is not a hypothetical: the Windows port compiled out 13 of these 16
+/// tests and `cargo test` was green. A green suite that tests nothing is worse
+/// than a red one.
+///
+/// So the binary reports which probes it actually has, and this asserts that
+/// inventory against a per-platform expectation. Adding a probe fails here
+/// until the list is updated (which is the prompt to also add a test for it);
+/// losing one to a `cfg` fails here too. A platform whose expected set is
+/// empty is making an explicit, reviewable claim: *nothing about this
+/// platform's sandbox is verified.*
+#[cfg(feature = "multi-process")]
+mod probe_inventory {
+    use super::bin;
+    use std::process::Command;
+
+    /// What this platform is expected to verify. Keep in sync with
+    /// `selftest::PROBES` — that is the point of the test.
+    #[cfg(target_os = "linux")]
+    const EXPECTED: &[&str] = &[
+        "baseline",
+        "mprotect-exec",
+        "socket",
+        "memfd-seal",
+        "fcntl-dupfd",
+        "ring",
+        "netns",
+        "no-ptrace",
+    ];
+
+    /// macOS applies a Seatbelt profile, `PT_DENY_ATTACH` and rlimits — none
+    /// of it covered by a probe yet. The empty list records that honestly
+    /// rather than letting a green run imply otherwise.
+    #[cfg(target_os = "macos")]
+    const EXPECTED: &[&str] = &[];
+
+    /// Windows has no sandbox backend at all yet: children run unconfined
+    /// under `sandbox::unsupported`. Nothing to probe until a measure lands —
+    /// and when one does, this list is what forces a probe to land with it.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const EXPECTED: &[&str] = &[];
+
+    #[test]
+    fn compiled_probes_match_this_platform() {
+        let out = Command::new(bin()).args(["selftest", "list"]).output().expect("spawn selftest");
+        assert!(out.status.success(), "selftest list failed: {out:?}");
+        let got: Vec<String> =
+            String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().to_string()).collect();
+        assert_eq!(
+            got,
+            EXPECTED,
+            "sandbox probe inventory changed.\n\
+             If you added a measure, add a probe AND a test for it, then update EXPECTED.\n\
+             If a probe vanished, a `cfg` is hiding it — that is the bug this test exists to catch."
+        );
+    }
+}
+
 /// The sandbox must *enforce*, not just announce. These run the `selftest`
 /// probes in a child that applies the renderer lockdown and then attempts one
 /// operation; a forbidden op is killed by `SIGSYS`, an allowed one exits clean.

@@ -60,8 +60,71 @@ fn attach_refused(protect: bool) -> Option<i32> {
     outcome
 }
 
+/// Every probe compiled into *this* binary, for this platform.
+///
+/// The integration suite asserts this list against a per-platform expectation,
+/// so a probe that silently disappears behind a `cfg` fails the build instead
+/// of vanishing from a green test run. That is not hypothetical: the Windows
+/// port compiled out 13 of 16 integration tests, and the suite still reported
+/// success. An empty list for a platform is therefore a *finding* — it means
+/// whatever that platform's sandbox backend does is currently unverified.
+pub const PROBES: &[&str] = &[
+    #[cfg(target_os = "linux")]
+    "baseline",
+    #[cfg(target_os = "linux")]
+    "mprotect-exec",
+    #[cfg(target_os = "linux")]
+    "socket",
+    #[cfg(target_os = "linux")]
+    "memfd-seal",
+    #[cfg(target_os = "linux")]
+    "fcntl-dupfd",
+    #[cfg(target_os = "linux")]
+    "ring",
+    #[cfg(target_os = "linux")]
+    "netns",
+    #[cfg(target_os = "linux")]
+    "no-ptrace",
+];
+
 /// Entry point for the `selftest <probe>` role.
+///
+/// `list` prints the compiled-in probe names, one per line — the inventory the
+/// harness checks. Everything else is a platform probe.
 pub fn run(probe: &str) {
+    if probe == "list" {
+        for name in PROBES {
+            println!("{name}");
+        }
+        std::process::exit(0);
+    }
+    #[cfg(target_os = "linux")]
+    run_platform_probe(probe);
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!("no sandbox probes are compiled in for this platform: {probe}");
+        std::process::exit(2);
+    }
+}
+
+/// The Linux probe set. Each either exits 0 (property holds) or dies on
+/// `SIGSYS` (the sandbox killed a forbidden operation), which the harness
+/// observes from outside.
+///
+/// ## Shape note for other platforms
+///
+/// This works because seccomp is *self-applied* and violations are fatal: a
+/// probe can confine itself and then attempt one operation. Windows cannot use
+/// this shape — a job object, restricted token and AppContainer are attached
+/// by the parent at `CreateProcess` time, and a denial surfaces as
+/// `ACCESS_DENIED` from the call rather than as a killed process. A Windows
+/// probe is therefore just the *attempt*, run twice: once in an unconfined
+/// child (must succeed) and once in a confined one (must be denied). Only the
+/// pair proves anything — "the call failed" alone is satisfied by a call that
+/// would have failed anyway, which is exactly how the first `netns` probe here
+/// passed vacuously against `/sys/class/net`.
+#[cfg(target_os = "linux")]
+fn run_platform_probe(probe: &str) {
     // The netns probe must run *before* the seccomp lockdown: verifying the
     // namespace is empty means enumerating interfaces, and a locked-down
     // renderer has no `openat`/`socket` with which to look. It asserts the
