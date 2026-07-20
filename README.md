@@ -40,9 +40,29 @@ mode requires seccomp support (use `--single-process` where it's unavailable).
 The renderer gets the baseline only: no `socket`/`connect` (no network), no
 `openat` (no file opens — so the filesystem is capped without Landlock), no
 `execve`/`clone` (no subprocesses), no `io_uring_*`. The net component gets the
-same baseline plus the socket family, since it owns network access. The engine
-(parent) is unsandboxed on purpose — it is the trusted core that spawns
-processes and holds secrets, and it never parses untrusted bytes.
+same baseline plus the socket family, since it owns network access.
+
+The engine (parent) is unsandboxed, because the privileges a filter would drop
+are exactly the ones it exists to exercise: it spawns processes, opens sockets,
+and holds the cookie jar. It is *not* unsandboxed because it is safe from
+hostile input — it plainly is not. Every frame a renderer or the net component
+sends is `bincode::deserialize`d inside the engine (`rx.recv::<FromRenderer>()`
+in the loop's reader threads), so a compromised child's bytes are parsed by the
+one process holding every secret, with full ambient authority and no filter
+behind it.
+
+What bounds that today: frames are length-prefixed and capped at 16 MiB with
+the length checked *before* allocating, the wire types are closed enums, and
+bincode has no type-directed dispatch — it cannot be steered into constructing
+arbitrary types the way a gadget-bearing format (pickle, Java serialization,
+`serde_yaml` tags) can. So this is a narrow surface, not an open one. It is
+still the sharpest edge in the model, because the whole architecture rests on
+the broker being uncompromisable and this is the one place untrusted bytes
+reach it.
+
+A production engine would confine the broker too — Chromium sandboxes its
+browser process, just far more loosely than a renderer — and would keep the
+parser minimal and fuzzed. Neither is done here.
 
 ## Event-driven engine
 
