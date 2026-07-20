@@ -114,7 +114,7 @@ pub const PROBES: &[&str] = &[
     #[cfg(target_os = "macos")]
     "rlimits",
     #[cfg(target_os = "macos")]
-    "no-ptrace",
+    "ptrace-deny-accepted",
 ];
 
 /// Entry point for the `selftest <probe>` role.
@@ -264,59 +264,6 @@ fn try_connect() -> i32 {
         libc::close(fd);
         errno
     }
-}
-
-/// Fork a child that optionally calls `PT_DENY_ATTACH`, then try to attach to
-/// it from here. Returns `None` if the attach succeeded, `Some(errno)` if it
-/// was refused. The child is killed either way.
-///
-/// Parent→child, like the Linux counterpart: attaching to an arbitrary process
-/// on macOS runs into SIP and task-port entitlements, whereas a parent tracing
-/// its own unsigned child is the ordinary debugger case.
-#[cfg(target_os = "macos")]
-fn attach_refused(protect: bool) -> Option<i32> {
-    let mut ready = [0 as libc::c_int; 2];
-    assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "pipe");
-    let (rd, wr) = (ready[0], ready[1]);
-
-    // SAFETY: single-threaded here, so the child may run normal code.
-    let pid = unsafe { libc::fork() };
-    assert!(pid >= 0, "fork");
-    if pid == 0 {
-        unsafe { libc::close(rd) };
-        if protect {
-            crate::sandbox::deny_debugger_attach();
-        }
-        // Signal readiness only after the flag is set, so the parent cannot
-        // race ahead and attach to a child that has not protected itself yet.
-        unsafe {
-            libc::write(wr, [1u8].as_ptr().cast(), 1);
-            loop {
-                libc::pause();
-            }
-        }
-    }
-
-    unsafe { libc::close(wr) };
-    let mut byte = [0u8; 1];
-    assert_eq!(unsafe { libc::read(rd, byte.as_mut_ptr().cast(), 1) }, 1, "child never signalled");
-    unsafe { libc::close(rd) };
-
-    // SAFETY: PT_ATTACH takes the target pid; addr/data are unused.
-    let rc = unsafe { libc::ptrace(libc::PT_ATTACH, pid, std::ptr::null_mut(), 0) };
-    let outcome = if rc == -1 {
-        Some(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
-    } else {
-        // A successful attach stops the tracee; reap that stop before killing.
-        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
-        None
-    };
-
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-        libc::waitpid(pid, std::ptr::null_mut(), 0);
-    }
-    outcome
 }
 
 /// The macOS probe set: Seatbelt profile enforcement.
@@ -495,18 +442,28 @@ fn run_macos_probe(probe: &str) {
         }
 
         // The inbound direction, and the one mechanism here that is not
-        // Seatbelt: `ptrace(PT_DENY_ATTACH)` refusing a debugger. The control
-        // matters more than usual — if an unprotected child cannot be attached
-        // to either (SIP, entitlements, a hardened runtime), this probe proves
-        // nothing, and saying so is better than a green tick.
-        "no-ptrace" => {
-            if attach_refused(false).is_some() {
-                std::process::exit(code::CONTROL_FAILED);
+        // Seatbelt. This verifies only that the kernel *accepts*
+        // `PT_DENY_ATTACH` — deliberately a weaker claim than the Linux
+        // `no-ptrace` probe makes, and named so it cannot be misread as more.
+        //
+        // The stronger test (attach to a protected child and be refused) is not
+        // available to us: on macOS an unprivileged process cannot `PT_ATTACH`
+        // even to its own child without SIP disabled or task-port entitlements,
+        // so the *control* fails and the probe proves nothing either way. An
+        // earlier version tried exactly that and reported CONTROL_FAILED on CI,
+        // which is the honest outcome but not a usable test.
+        //
+        // What this still catches: the request being rejected outright — a
+        // wrong constant, or a future macOS dropping support. That matters
+        // because `deny_debugger_attach` only *warns* on failure, so a silent
+        // regression would otherwise go unnoticed.
+        "ptrace-deny-accepted" => {
+            // SAFETY: PT_DENY_ATTACH takes no addr/data and affects only us.
+            let rc = unsafe { libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) };
+            if rc < 0 {
+                std::process::exit(code::NOT_DENIED);
             }
-            match attach_refused(true) {
-                None => std::process::exit(code::NOT_DENIED),
-                Some(_) => std::process::exit(0),
-            }
+            std::process::exit(0);
         }
 
         other => {

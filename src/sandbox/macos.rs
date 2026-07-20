@@ -168,6 +168,14 @@ pub fn isolate_network(_enable: bool) -> std::io::Result<()> {
 /// compromised child, so (like the Linux version) it warns rather than aborts
 /// on failure. Applies to the single-process build too, which still holds the
 /// jar in its address space.
+///
+/// **Verification limit.** The probe suite checks only that the kernel accepts
+/// this request, not that an attach is subsequently refused — unlike Linux,
+/// where the equivalent probe performs a real `PTRACE_ATTACH` and requires
+/// `EPERM`. An unprivileged macOS process cannot `PT_ATTACH` even to its own
+/// child without SIP disabled or task-port entitlements, so the control case
+/// for such a test fails and it proves nothing either way. Confirming the
+/// effect needs a privileged host.
 pub fn deny_debugger_attach() {
     // SAFETY: PT_DENY_ATTACH takes no addr/data and affects only the caller.
     if unsafe { libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) } < 0 {
