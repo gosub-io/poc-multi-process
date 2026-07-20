@@ -6,7 +6,7 @@
 //! single-process mode the very same `serve` loop runs as a thread: the
 //! policy checks still apply, but there is no hard boundary behind them.
 
-use crate::ip_utils::ssrf_block_reason;
+use crate::ip_utils::{resolve_and_pin, Resolver};
 use crate::ipc::{Endpoint, FetchOutcome, NetRequest, NetResponse};
 
 /// Multi-process entry point: adopt the inherited IPC link, sandbox, serve.
@@ -25,6 +25,31 @@ pub fn run(link: &str) {
 }
 
 /// The component loop — transport-agnostic, identical in both modes.
+/// The resolver this PoC runs against.
+///
+/// The net component synthesizes its responses offline and deterministically,
+/// so it must not perform real DNS — a test host with no network would other-
+/// wise fail every fetch. This stands in for a resolver without weakening the
+/// policy it feeds: loopback names still answer loopback, so they are still
+/// refused, and they are refused by the *same* resolution path a real deploy-
+/// ment uses rather than by a special-case string match.
+///
+/// A real net component swaps in `ip_utils::SystemResolver` and connects to
+/// the returned `Pinned::addr` — connecting to the *name* instead would
+/// re-resolve and undo the pin.
+struct SyntheticResolver;
+
+impl Resolver for SyntheticResolver {
+    fn resolve(&self, host: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+        let lower = host.to_ascii_lowercase();
+        if lower == "localhost" || lower.ends_with(".localhost") {
+            return Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]);
+        }
+        // Any other name answers one fixed public address.
+        Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34))])
+    }
+}
+
 pub fn serve(mut ep: Endpoint) {
     loop {
         let req: NetRequest = match ep.recv() {
@@ -39,7 +64,7 @@ pub fn serve(mut ep: Endpoint) {
                 // first). `GOSUB_BODY_TRANSPORT=socket` forces the in-band
                 // copy so the bench can compare the two.
                 #[cfg(all(feature = "multi-process", target_os = "linux"))]
-                if ssrf_block_reason(&url).is_none()
+                if resolve_and_pin(&url, &SyntheticResolver).is_ok()
                     && ep.tx.supports_fd_passing()
                     && !std::env::var_os("GOSUB_BODY_TRANSPORT").is_some_and(|v| v == "socket")
                 {
@@ -136,9 +161,12 @@ fn stream_blob(ep: &mut Endpoint, request_id: u64, body_len: u64) -> std::io::Re
 /// this request — the net component is the only process outside the engine
 /// that sees their values.
 fn handle_fetch(_requester: &str, url: &str, cookies: &[(String, String)]) -> FetchOutcome {
-    if let Some(reason) = ssrf_block_reason(url) {
-        return FetchOutcome::Denied { reason };
-    }
+    // Policy and destination in one step: what comes back is the address a
+    // real component would connect to, not a verdict it would then re-resolve.
+    let _pinned = match resolve_and_pin(url, &SyntheticResolver) {
+        Ok(pinned) => pinned,
+        Err(reason) => return FetchOutcome::Denied { reason },
+    };
     // A large body on a transport without fd passing (single-process mode,
     // or the bench's forced-socket comparison) is copied in-band — if it
     // fits. The 16 MiB frame cap is DoS protection and stays authoritative:
