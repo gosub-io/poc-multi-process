@@ -333,6 +333,66 @@ mod seatbelt_enforcement {
     }
 }
 
+/// Windows process mitigation policies must *enforce*, not merely install.
+///
+/// Same shape as the macOS module: a denied operation returns an error rather
+/// than killing the process, so each probe runs its operation before and after
+/// the lockdown and reports the transition through an exit code.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+mod mitigation_enforcement {
+    use super::bin;
+    use std::process::Command;
+
+    /// Mirrors `selftest::wcode`.
+    const CONTROL_FAILED: i32 = 90;
+    const NOT_DENIED: i32 = 91;
+    const WRONG_VALUE: i32 = 93;
+
+    fn check(name: &str) {
+        let st = Command::new(bin()).args(["selftest", name]).status().expect("spawn selftest");
+        match st.code().unwrap_or_else(|| panic!("{name}: no exit code")) {
+            0 => {}
+            CONTROL_FAILED => panic!(
+                "{name}: the operation already failed BEFORE lockdown, so this proves \
+                 nothing about the policy — the control is broken, not the sandbox"
+            ),
+            NOT_DENIED => panic!("{name}: the operation SUCCEEDED under the policy — not enforcing"),
+            WRONG_VALUE => panic!("{name}: the kernel did not record the policy we set"),
+            other => panic!("{name}: unexpected exit {other}"),
+        }
+    }
+
+    /// The control for the denials below: ordinary work must still run. A
+    /// policy set that broke the component would satisfy every negative test
+    /// while shipping a renderer that cannot render.
+    #[test]
+    fn ordinary_work_survives_the_policies() {
+        check("mitigation-baseline");
+    }
+
+    /// W^X: the counterpart of the seccomp `PROT_EXEC` argument filter, and the
+    /// step most memory-corruption chains need to execute injected code.
+    #[test]
+    fn renderer_cannot_allocate_executable_memory() {
+        check("mitigation-dynamic-code");
+    }
+
+    /// The analogue of `execve`/`clone` being absent from the allowlist.
+    #[test]
+    fn renderer_cannot_spawn_child_processes() {
+        check("mitigation-child-process");
+    }
+
+    /// Behaviour is the real test, but the kernel's own readback catches a
+    /// policy word assembled wrongly — including extension-point disabling,
+    /// which has no convenient behavioural probe (it would need a third party
+    /// to attempt an injection).
+    #[test]
+    fn kernel_recorded_the_policies() {
+        check("mitigation-policies-readback");
+    }
+}
+
 /// Guards the enforcement suite against silently shrinking.
 ///
 /// Every test below this point is `cfg`'d to Linux, so on another platform
@@ -387,10 +447,22 @@ mod probe_inventory {
         "ptrace-deny-accepted",
     ];
 
-    /// Windows has no sandbox backend at all yet: children run unconfined
-    /// under `sandbox::unsupported`. Nothing to probe until a measure lands —
-    /// and when one does, this list is what forces a probe to land with it.
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    /// Windows: the process mitigation policies. The access-confining half
+    /// (restricted token, AppContainer, job object) is parent-side and not
+    /// implemented, so there is nothing yet to probe for file or network
+    /// confinement — see `sandbox/windows.rs`.
+    #[cfg(target_os = "windows")]
+    const EXPECTED: &[&str] = &[
+        "mitigation-baseline",
+        "mitigation-dynamic-code",
+        "mitigation-child-process",
+        "mitigation-policies-readback",
+    ];
+
+    /// Everything else has no sandbox backend: components run unconfined under
+    /// `sandbox::unsupported`. Nothing to probe until a measure lands — and
+    /// when one does, this list is what forces a probe to land with it.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     const EXPECTED: &[&str] = &[];
 
     #[test]

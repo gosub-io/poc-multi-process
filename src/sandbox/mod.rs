@@ -17,10 +17,14 @@
 //!   `PT_DENY_ATTACH`, and rlimits. Same guarantees, different primitives (see
 //!   that module for where the seams don't line up 1:1 — network isolation
 //!   folds into the profile, and there is no W^X argument filtering).
-//! * `unsupported.rs` — honest no-ops elsewhere. On the other Unixes
-//!   multi-process still runs over Unix sockets with components unconfined and
-//!   saying so; on Windows it does not build at all. See that module — the two
-//!   cases are not interchangeable.
+//! * `windows.rs` — **process mitigation policies** (no dynamic code, no child
+//!   processes, no injection extension points). Self-applied, so it fits this
+//!   contract unchanged — but it is only half a sandbox: the access-confining
+//!   half (restricted token, integrity level, AppContainer, job object) is
+//!   parent-side and not implemented, so a Windows renderer can still reach
+//!   files and the network. See that module.
+//! * `unsupported.rs` — honest no-ops on the other Unixes: multi-process still
+//!   runs over Unix sockets with components unconfined and saying so.
 //!
 //! The privilege model itself (why a default-deny allowlist, why fail-closed,
 //! why the placement of each call matters) is documented on the Linux backend,
@@ -83,9 +87,14 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as imp;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+use windows as imp;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod unsupported;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use unsupported as imp;
 
 // --- public API: thin, cfg-free wrappers over the selected backend ---
@@ -130,6 +139,15 @@ pub fn lock_down_renderer() {
 #[cfg(feature = "multi-process")]
 pub fn lock_down_net() {
     imp::lock_down_net();
+}
+
+/// Read back a Windows process mitigation policy's flag word, so a probe can
+/// confirm the kernel recorded what the backend asked for. Windows only.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub fn get_mitigation_policy(
+    policy: ::windows_sys::Win32::System::Threading::PROCESS_MITIGATION_POLICY,
+) -> std::io::Result<u32> {
+    imp::get_policy(policy)
 }
 
 /// Cap the fork server (Linux only — it is the one platform with a zygote).

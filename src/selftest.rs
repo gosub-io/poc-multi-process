@@ -115,7 +115,139 @@ pub const PROBES: &[&str] = &[
     "rlimits",
     #[cfg(target_os = "macos")]
     "ptrace-deny-accepted",
+    #[cfg(target_os = "windows")]
+    "mitigation-baseline",
+    #[cfg(target_os = "windows")]
+    "mitigation-dynamic-code",
+    #[cfg(target_os = "windows")]
+    "mitigation-child-process",
+    #[cfg(target_os = "windows")]
+    "mitigation-policies-readback",
 ];
+
+/// Outcome codes for the Windows probes, mirroring the macOS set.
+///
+/// Windows mitigation policies behave like Seatbelt rather than seccomp: a
+/// denied operation returns an error and the process keeps running, so these
+/// probes must report what they observed instead of dying in a way the harness
+/// could read from outside.
+#[cfg(target_os = "windows")]
+mod wcode {
+    pub const CONTROL_FAILED: i32 = 90;
+    pub const NOT_DENIED: i32 = 91;
+    pub const WRONG_VALUE: i32 = 93;
+}
+
+/// Try to allocate memory that is writable *and* executable — the allocation a
+/// memory-corruption exploit needs in order to run injected code, and exactly
+/// what `ProhibitDynamicCode` exists to refuse.
+#[cfg(target_os = "windows")]
+fn try_alloc_executable() -> bool {
+    use windows_sys::Win32::System::Memory::{
+        VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+    };
+    // SAFETY: a standard anonymous reserve+commit; the pointer is freed below.
+    unsafe {
+        let p = VirtualAlloc(
+            std::ptr::null(),
+            4096,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        );
+        if p.is_null() {
+            return false;
+        }
+        VirtualFree(p, 0, MEM_RELEASE);
+        true
+    }
+}
+
+/// The Windows probe set: process mitigation policy enforcement.
+///
+/// Like the macOS probes, each performs its operation before and after the
+/// lockdown and requires success then refusal. The pairing is what separates
+/// "the policy blocked it" from "it never worked here anyway" — and on Windows
+/// that matters more than anywhere else, because a denial arrives as an
+/// ordinary `NULL` return or error code rather than a fatal signal.
+#[cfg(target_os = "windows")]
+fn run_windows_probe(probe: &str) {
+    use windows_sys::Win32::System::Threading::{
+        ProcessChildProcessPolicy, ProcessDynamicCodePolicy, ProcessExtensionPointDisablePolicy,
+    };
+
+    match probe {
+        // The control for every denial below: ordinary work must still run.
+        // A policy set that broke the component would satisfy each negative
+        // probe while shipping a renderer that cannot render.
+        "mitigation-baseline" => {
+            crate::sandbox::lock_down_renderer();
+            let buf: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+            let sum: u64 = buf.iter().map(|b| *b as u64).sum();
+            eprintln!("[selftest] baseline computed {sum} under the policies");
+            std::process::exit(0);
+        }
+
+        // W^X. The direct counterpart of the seccomp `PROT_EXEC` argument
+        // filter, and the step most exploit chains need in order to execute
+        // injected code.
+        "mitigation-dynamic-code" => {
+            if !try_alloc_executable() {
+                std::process::exit(wcode::CONTROL_FAILED);
+            }
+            crate::sandbox::lock_down_renderer();
+            if try_alloc_executable() {
+                std::process::exit(wcode::NOT_DENIED);
+            }
+            std::process::exit(0);
+        }
+
+        // No new programs — the analogue of `execve`/`clone` being absent from
+        // the seccomp allowlist.
+        "mitigation-child-process" => {
+            if std::process::Command::new("cmd.exe").args(["/C", "exit"]).status().is_err() {
+                std::process::exit(wcode::CONTROL_FAILED);
+            }
+            crate::sandbox::lock_down_renderer();
+            match std::process::Command::new("cmd.exe").args(["/C", "exit"]).status() {
+                Ok(_) => std::process::exit(wcode::NOT_DENIED),
+                Err(_) => std::process::exit(0),
+            }
+        }
+
+        // Behaviour is the real test, but the kernel also reports what it
+        // recorded — and the two can disagree if a policy word is assembled
+        // wrongly. This checks the flags actually took, including the one
+        // mitigation with no convenient behavioural probe (extension points,
+        // which needs a third party to attempt an injection).
+        "mitigation-policies-readback" => {
+            crate::sandbox::lock_down_renderer();
+            let expect: [(_, u32, &str); 3] = [
+                (ProcessDynamicCodePolicy, 1, "dynamic-code"),
+                (ProcessChildProcessPolicy, 1, "child-process"),
+                (ProcessExtensionPointDisablePolicy, 1, "extension-points"),
+            ];
+            for (policy, bit, name) in expect {
+                match crate::sandbox::get_mitigation_policy(policy) {
+                    Ok(flags) if flags & bit == bit => {}
+                    Ok(flags) => {
+                        eprintln!("[selftest] {name}: expected bit {bit}, read {flags:#x}");
+                        std::process::exit(wcode::WRONG_VALUE);
+                    }
+                    Err(e) => {
+                        eprintln!("[selftest] {name}: could not read policy: {e}");
+                        std::process::exit(wcode::WRONG_VALUE);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+
+        other => {
+            eprintln!("unknown Windows probe: {other}");
+            std::process::exit(2);
+        }
+    }
+}
 
 /// Entry point for the `selftest <probe>` role.
 ///
@@ -132,7 +264,9 @@ pub fn run(probe: &str) {
     run_platform_probe(probe);
     #[cfg(target_os = "macos")]
     run_macos_probe(probe);
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    run_windows_probe(probe);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         eprintln!("no sandbox probes are compiled in for this platform: {probe}");
         std::process::exit(2);
