@@ -40,12 +40,12 @@
 //! * Windows: in the parent, before `CreateProcess` — there is no `pre_exec`
 //!   hook, so it cannot be deferred.
 //!
-//! The Windows ordering means an inheritable handle is briefly visible to any
-//! concurrently-created child. That is safe *here* because spawning happens
-//! only from the single-threaded engine loop, so there is never a concurrent
-//! `CreateProcess`. A multi-threaded spawner would need
-//! `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` to bound inheritance per-child; see
-//! `windows.rs`.
+//! The Windows ordering would leave an inheritable handle briefly visible to
+//! any concurrently created child, since the flag is process-wide. That is why
+//! [`crate::spawn`] names these handles in a
+//! `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: the flag makes inheritance *possible*,
+//! the list makes it *per-child*. Without the list the arrangement would be
+//! safe only by accident of the engine being single-threaded.
 
 #[cfg(unix)]
 mod unix;

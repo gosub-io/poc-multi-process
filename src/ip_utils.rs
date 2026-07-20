@@ -17,7 +17,7 @@
 //! there is no second lookup to poison.
 //!
 //! Resolution goes through the [`Resolver`] seam so the policy is testable
-//! without a network: the tests inject hostile answer sets ([`FixedResolver`])
+//! without a network: the tests inject hostile answer sets (a fixed resolver)
 //! that a real DNS server would have to be compromised to produce.
 
 use std::net::{IpAddr, Ipv4Addr};

@@ -46,6 +46,11 @@ mod ring;
 // loudly rather than silently skip its enforcement tests.
 #[cfg(feature = "multi-process")]
 mod selftest;
+// The spawn seam: how a child process is created. Owned rather than delegated
+// to std::process::Command because Windows access controls must be supplied at
+// CreateProcess time.
+#[cfg(feature = "multi-process")]
+mod spawn;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 mod shm;
 

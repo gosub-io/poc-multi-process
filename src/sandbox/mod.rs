@@ -80,11 +80,12 @@
 //! * Parent-side but *post*-spawn — a job object, which can be attached to a
 //!   process that already exists. This is the one new hook.
 //! * Parent-side and *pre*-create — a restricted token and an AppContainer,
-//!   which must be supplied to `CreateProcess` itself. These still have no
-//!   home: `std::process::Command` cannot pass a token or a
-//!   `PROC_THREAD_ATTRIBUTE_LIST`, so they need a bespoke Windows spawn path,
-//!   and with it Chromium's two-phase drop (create suspended and confined,
-//!   warm up, then `LowerToken`). Not implemented.
+//!   which must be supplied to `CreateProcess` itself. [`crate::spawn`] now
+//!   owns that call, so they have somewhere to go; neither is implemented yet.
+//!   Both will also want Chromium's two-phase drop, because a fully restricted
+//!   process often cannot complete its own startup: create it with the
+//!   restricted primary token plus a more permissive impersonation token, then
+//!   drop the latter once the runtime is warm.
 
 // --- platform seam: the only place a sandbox `target_os` cfg lives ---
 #[cfg(target_os = "linux")]
@@ -162,11 +163,10 @@ pub fn lock_down_net() {
 ///
 /// Called immediately after spawn, before the child has done any work.
 #[cfg(feature = "multi-process")]
-pub fn confine_spawned_child(child: &std::process::Child) -> std::io::Result<()> {
+pub fn confine_spawned_child(child: &crate::spawn::Child) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::io::AsRawHandle;
-        return imp::confine_spawned_child(child.as_raw_handle() as _);
+        return imp::confine_spawned_child(child.raw_handle());
     }
     #[cfg(not(target_os = "windows"))]
     {

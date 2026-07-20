@@ -132,7 +132,7 @@ enum LoopMsg {
 enum ChildHandle {
     Thread(std::thread::JoinHandle<()>),
     #[cfg(feature = "multi-process")]
-    Process(std::process::Child),
+    Process(crate::spawn::Child),
     /// A renderer `fork()`ed by the fork server, which owns and reaps it. The
     /// engine has no `Child` for it; it detects death via IPC-socket EOF.
     #[cfg(all(feature = "multi-process", target_os = "linux"))]
@@ -765,7 +765,7 @@ enum Spawner {
         #[cfg(target_os = "linux")]
         fork_control: std::os::unix::net::UnixStream,
         #[cfg(target_os = "linux")]
-        fork_child: std::process::Child,
+        fork_child: crate::spawn::Child,
     },
 }
 
@@ -901,67 +901,9 @@ fn spawn_inherited(
     args: &[&str],
     child_end: crate::channel::Channel,
     isolate_network: bool,
-) -> std::process::Child {
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(args).arg(child_end.to_argv());
-    // Strip the dynamic-loader injection vectors from the child's environment
-    // before it execs: DYLD_INSERT_LIBRARIES (macOS) and LD_PRELOAD/LD_* (glibc)
-    // are the runtime-linker's "load this code into every new process" knobs. A
-    // child inheriting one would run attacker-supplied library code *before* it
-    // reaches its own lockdown, sidestepping the sandbox entirely. The OS ignores
-    // these for signed/hardened binaries, but scrubbing them is cheap defense in
-    // depth and keeps the guarantee from depending on how the engine was signed.
-    for (key, _) in std::env::vars_os() {
-        let drop = key.to_str().is_some_and(|k| k.starts_with("DYLD_") || k.starts_with("LD_"));
-        if drop {
-            cmd.env_remove(&key);
-        }
-    }
-    // --- Unix: cap privileges in `pre_exec`, between fork and exec ---
-    //
-    // Everything here runs in the forked child, which is both why the rlimits
-    // and netns land on the child alone, and why the channel's inheritance is
-    // granted here rather than in the parent: clearing FD_CLOEXEC in the
-    // parent would expose that fd to every other concurrent spawn as well.
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        let raw = child_end.raw();
-        cmd.pre_exec(move || {
-            crate::sandbox::apply_child_rlimits()?;
-            // Fail-closed, matching the seccomp precedent: a child that was
-            // meant to be network-isolated and silently isn't is worse than an
-            // honest refusal to start. Environments without unprivileged user
-            // namespaces use `--single-process` / `--no-default-features`.
-            // Platform-neutral: on Linux this enters an empty netns for
-            // renderers; where there are no namespaces it defers to the
-            // lockdown profile and is a no-op here.
-            crate::sandbox::isolate_network(isolate_network)?;
-            crate::channel::Channel::make_inheritable(raw)?;
-            Ok(())
-        });
-    }
-
-    // --- Windows: no `pre_exec`, so inheritance is granted here ---
-    //
-    // Safe with this spawner because it is driven only by the single-threaded
-    // engine loop, so no other `CreateProcess` can be in flight to pick the
-    // handles up (see `channel/windows.rs`).
-    //
-    // Note what is *missing* relative to the Unix path: there is no hook in
-    // which to apply `apply_child_rlimits` or `isolate_network`. Windows caps
-    // a child with a job object, a restricted token and an AppContainer, all
-    // attached by the parent at creation time — which the sandbox contract has
-    // no place for yet (see `sandbox/mod.rs`). Until it does, Windows children
-    // run under the `unsupported` backend: unconfined, and saying so.
-    #[cfg(windows)]
-    {
-        let _ = isolate_network;
-        crate::channel::Channel::make_inheritable(child_end.raw())
-            .expect("grant handle inheritance");
-    }
-
-    let child = cmd.spawn().expect("spawn child process");
+) -> crate::spawn::Child {
+    let child = crate::spawn::spawn(exe, args, child_end, isolate_network)
+        .expect("spawn child process");
     // Parent-side confinement, for the mechanisms a child cannot apply to
     // itself. A no-op outside Windows, where everything is self-applied.
     if let Err(e) = crate::sandbox::confine_spawned_child(&child) {
@@ -969,9 +911,6 @@ fn spawn_inherited(
         // to be capped and silently is not is worse than an honest refusal.
         panic!("could not confine spawned child: {e}");
     }
-    // The child holds its own copy now; drop ours so a dead child is seen as
-    // EOF rather than a link the engine is itself holding open.
-    drop(child_end);
     child
 }
 
