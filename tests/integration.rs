@@ -118,13 +118,49 @@ fn unknown_argument_is_rejected() {
     assert!(!out.status.success(), "unknown arg should be an error");
 }
 
-/// In multi-process mode on Linux the children announce their seccomp sandbox.
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+/// What each platform's lockdown prints when a *child process* starts up.
+/// Only a real child emits this — in single-process mode the components are
+/// threads and no lockdown runs at all — which is what makes it a usable
+/// signal that multi-process mode really spawned processes.
+#[cfg(target_os = "linux")]
+const LOCKDOWN_BANNER: &str = "seccomp allowlist active";
+#[cfg(target_os = "macos")]
+const LOCKDOWN_BANNER: &str = "seatbelt profile active";
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const LOCKDOWN_BANNER: &str = "no sandbox on this platform";
+
+/// Multi-process mode must actually spawn *processes* — and this is the only
+/// test that checks it.
+///
+/// It used to be Linux-only, asserting the seccomp banner. That left a hole
+/// everywhere else: on a platform with no shared memory, multi-process and
+/// single-process runs produce byte-identical output ("via message copy"), so
+/// a silent degradation to threads would pass every other test in this file.
+/// Windows exposed that — all four of its tests passed without anything
+/// confirming a child had been spawned.
+///
+/// The negative half matters as much as the positive one: asserting the banner
+/// is *absent* from a single-process run is what proves the banner distinguishes
+/// the two modes, rather than being something the engine prints regardless.
+#[cfg(feature = "multi-process")]
 #[test]
-fn multi_process_children_are_sandboxed() {
+fn multi_process_spawns_real_children() {
     let out = run(&[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("seccomp allowlist active"), "children not sandboxed:\n{stderr}");
+    assert!(
+        stderr.contains(LOCKDOWN_BANNER),
+        "no child announced its lockdown ({LOCKDOWN_BANNER:?}) — did multi-process \
+         mode silently run its components as threads?\n{stderr}"
+    );
+
+    let out = run(&["--single-process"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains(LOCKDOWN_BANNER),
+        "single-process mode announced a lockdown ({LOCKDOWN_BANNER:?}), so this \
+         banner does not distinguish the two modes and the check above proves \
+         nothing:\n{stderr}"
+    );
 }
 
 /// Guards the enforcement suite against silently shrinking.
