@@ -446,7 +446,7 @@ pub struct TokenPair {
 /// group-granted access no longer applies. That is the permissive half of the
 /// pair: confined, but still able to start a process.
 #[cfg(feature = "multi-process")]
-fn build_token(restricting: bool) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+fn build_token(restricting: bool) -> std::io::Result<windows_sys::Win32::Foundation::HANDLE> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
         CreateRestrictedToken, CreateWellKnownSid, SID_AND_ATTRIBUTES, DISABLE_MAX_PRIVILEGE,
@@ -458,14 +458,17 @@ fn build_token(restricting: bool) -> Option<windows_sys::Win32::Foundation::HAND
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// A well-known SID fits comfortably in SECURITY_MAX_SID_SIZE (68 bytes).
-    fn well_known(kind: i32) -> Option<[u8; 68]> {
+    fn well_known(kind: i32) -> std::io::Result<[u8; 68]> {
         let mut sid = [0u8; 68];
         let mut len = sid.len() as u32;
         // SAFETY: a correctly sized buffer with its length passed by pointer.
         let ok = unsafe {
             CreateWellKnownSid(kind, std::ptr::null_mut(), sid.as_mut_ptr().cast(), &mut len)
         };
-        (ok != 0).then_some(sid)
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(sid)
     }
 
     let mut admins = well_known(WinBuiltinAdministratorsSid)?;
@@ -481,7 +484,7 @@ fn build_token(restricting: bool) -> Option<windows_sys::Win32::Foundation::HAND
         )
     };
     if opened == 0 {
-        return None;
+        return Err(std::io::Error::last_os_error());
     }
 
     let deny = [SID_AND_ATTRIBUTES {
@@ -508,10 +511,14 @@ fn build_token(restricting: bool) -> Option<windows_sys::Win32::Foundation::HAND
             &mut out,
         )
     };
+    let err = std::io::Error::last_os_error();
     // SAFETY: opened above and no longer needed.
     unsafe { CloseHandle(token) };
 
-    (ok != 0).then_some(out)
+    if ok == 0 {
+        return Err(err);
+    }
+    Ok(out)
 }
 
 /// Build both tokens, or `None` if either cannot be made.
@@ -523,10 +530,20 @@ fn build_token(restricting: bool) -> Option<windows_sys::Win32::Foundation::HAND
 #[cfg(feature = "multi-process")]
 pub fn token_pair() -> Option<TokenPair> {
     use windows_sys::Win32::Foundation::CloseHandle;
-    let lockdown = build_token(true)?;
+    let lockdown = match build_token(true) {
+        Ok(t) => t,
+        Err(e) => {
+            // Say why, and say it loudly: a silent fallback here means every
+            // Windows child runs less confined than intended, and nothing else
+            // in the output would reveal it.
+            eprintln!("[sandbox] lockdown token unavailable ({e}) — falling back");
+            return None;
+        }
+    };
     match build_token(false) {
-        Some(initial) => Some(TokenPair { lockdown, initial }),
-        None => {
+        Ok(initial) => Some(TokenPair { lockdown, initial }),
+        Err(e) => {
+            eprintln!("[sandbox] initial token unavailable ({e}) — falling back");
             // SAFETY: built just above and otherwise leaked.
             unsafe { CloseHandle(lockdown) };
             None
@@ -537,7 +554,13 @@ pub fn token_pair() -> Option<TokenPair> {
 /// Build a single restricted token, the fallback when the pair cannot be made.
 #[cfg(feature = "multi-process")]
 pub fn restricted_token() -> Option<windows_sys::Win32::Foundation::HANDLE> {
-    build_token(false)
+    match build_token(false) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            eprintln!("[sandbox] restricted token unavailable ({e}) — using inherited token");
+            None
+        }
+    }
 }
 
 /// How many *restricting* SIDs this process's token carries.

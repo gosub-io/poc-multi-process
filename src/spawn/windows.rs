@@ -250,6 +250,16 @@ pub fn spawn(
     //    integrity still apply.
     let pair = crate::sandbox::token_pair();
     let single = if pair.is_none() { crate::sandbox::restricted_token() } else { None };
+    // Name the shape. Without this the three paths are indistinguishable from
+    // outside the process, which is how a fallback went unnoticed once already.
+    eprintln!(
+        "[spawn] token: {}",
+        match (&pair, &single) {
+            (Some(_), _) => "two-phase (lockdown + initial)",
+            (None, Some(_)) => "single restricted",
+            (None, None) => "inherited",
+        }
+    );
 
     let flags = if pair.is_some() {
         EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
