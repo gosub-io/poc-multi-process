@@ -93,6 +93,14 @@ pub const PROBES: &[&str] = &[
     "forkserver-no-exec",
     #[cfg(target_os = "linux")]
     "forkserver-no-socket",
+    #[cfg(target_os = "macos")]
+    "seatbelt-file",
+    #[cfg(target_os = "macos")]
+    "seatbelt-network",
+    #[cfg(target_os = "macos")]
+    "seatbelt-exec",
+    #[cfg(target_os = "macos")]
+    "seatbelt-net-role-keeps-network",
 ];
 
 /// Entry point for the `selftest <probe>` role.
@@ -108,10 +116,150 @@ pub fn run(probe: &str) {
     }
     #[cfg(target_os = "linux")]
     run_platform_probe(probe);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    run_macos_probe(probe);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         eprintln!("no sandbox probes are compiled in for this platform: {probe}");
         std::process::exit(2);
+    }
+}
+
+/// Outcome codes shared by the macOS probes. They exist because a Seatbelt
+/// denial is *not* fatal: unlike seccomp's `KillProcess`, the call simply
+/// returns `EPERM` and the process runs on. So the harness cannot read a signal
+/// from outside — the probe has to report what it observed, and distinguishing
+/// "correctly denied" from "the operation never worked anyway" is the whole
+/// point.
+#[cfg(target_os = "macos")]
+mod code {
+    /// The operation failed *before* lockdown, so the probe proves nothing:
+    /// a denial afterwards would have happened regardless of the profile.
+    pub const CONTROL_FAILED: i32 = 90;
+    /// The operation still succeeded after lockdown — the profile is not
+    /// enforcing what it claims to.
+    pub const NOT_DENIED: i32 = 91;
+    /// Denied, but not by the sandbox (some other errno) — reported separately
+    /// so a misleading pass cannot come from an unrelated failure.
+    pub const WRONG_ERROR: i32 = 92;
+}
+
+/// Can this process open a well-known readable file? `Ok` = yes.
+#[cfg(target_os = "macos")]
+fn try_open_file() -> std::io::Result<()> {
+    std::fs::File::open("/etc/hosts").map(|_| ())
+}
+
+/// Attempt an outbound TCP connect, returning the raw errno (0 = connected).
+///
+/// The target is a closed port on loopback, so *unconfined* this fails fast
+/// with `ECONNREFUSED` — a definite "the network stack let me try". Confined,
+/// the socket or connect is refused with `EPERM` before any packet moves. The
+/// two errnos are what separates "the sandbox blocked it" from "there was
+/// nothing to connect to", which a bare success/failure check cannot do.
+#[cfg(target_os = "macos")]
+fn try_connect() -> i32 {
+    // SAFETY: a plain AF_INET socket and a fully initialized sockaddr_in.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        }
+        let addr = libc::sockaddr_in {
+            sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 9u16.to_be(), // discard, expected closed
+            sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes([127, 0, 0, 1]) },
+            sin_zero: [0; 8],
+        };
+        let rc = libc::connect(
+            fd,
+            std::ptr::addr_of!(addr).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        let errno =
+            if rc == 0 { 0 } else { std::io::Error::last_os_error().raw_os_error().unwrap_or(-1) };
+        libc::close(fd);
+        errno
+    }
+}
+
+/// The macOS probe set: Seatbelt profile enforcement.
+///
+/// Every probe runs its operation **twice** — once before `sandbox_init` and
+/// once after — and requires success then denial. The pairing is not ceremony.
+/// A Seatbelt denial surfaces as an ordinary error, so a one-sided check is
+/// satisfied by an operation that was broken to begin with (no network in the
+/// CI sandbox, a missing file, a busy port). Only the transition from working
+/// to refused shows the *profile* is what changed.
+///
+/// Note the probes avoid `assert!` after lockdown and exit with codes instead:
+/// panicking would run formatting and backtrace machinery inside a process that
+/// has just had its file access removed, which is a poor place to discover a
+/// second failure.
+#[cfg(target_os = "macos")]
+fn run_macos_probe(probe: &str) {
+    match probe {
+        // A renderer has no filesystem: `(deny default)` withholds `file-read*`,
+        // the SBPL counterpart of `openat` being absent from the seccomp list.
+        "seatbelt-file" => {
+            if try_open_file().is_err() {
+                std::process::exit(code::CONTROL_FAILED);
+            }
+            crate::sandbox::lock_down_renderer();
+            match try_open_file() {
+                Ok(()) => std::process::exit(code::NOT_DENIED),
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) => std::process::exit(0),
+                Err(_) => std::process::exit(code::WRONG_ERROR),
+            }
+        }
+
+        // A renderer has no network. On Linux this is the empty netns plus the
+        // missing socket syscalls; here it is the profile omitting
+        // `network-outbound`, which is why it is worth testing separately.
+        "seatbelt-network" => {
+            if try_connect() != libc::ECONNREFUSED {
+                std::process::exit(code::CONTROL_FAILED);
+            }
+            crate::sandbox::lock_down_renderer();
+            match try_connect() {
+                0 => std::process::exit(code::NOT_DENIED),
+                e if e == libc::EPERM => std::process::exit(0),
+                _ => std::process::exit(code::WRONG_ERROR),
+            }
+        }
+
+        // No new programs: the analogue of `execve`/`clone` being off the
+        // seccomp list. `(deny default)` covers process-fork and process-exec,
+        // so spawning must fail rather than replace this process.
+        "seatbelt-exec" => {
+            if std::process::Command::new("/usr/bin/true").status().is_err() {
+                std::process::exit(code::CONTROL_FAILED);
+            }
+            crate::sandbox::lock_down_renderer();
+            match std::process::Command::new("/usr/bin/true").status() {
+                Ok(_) => std::process::exit(code::NOT_DENIED),
+                Err(_) => std::process::exit(0),
+            }
+        }
+
+        // The positive half, and the one that keeps the others honest: the net
+        // component's profile *does* grant `network-outbound`. Without this, a
+        // green "renderer cannot reach the network" would be equally consistent
+        // with the host having no network at all.
+        "seatbelt-net-role-keeps-network" => {
+            crate::sandbox::lock_down_net();
+            match try_connect() {
+                e if e == libc::ECONNREFUSED => std::process::exit(0),
+                e if e == libc::EPERM => std::process::exit(code::NOT_DENIED),
+                _ => std::process::exit(code::WRONG_ERROR),
+            }
+        }
+
+        other => {
+            eprintln!("unknown macOS probe: {other}");
+            std::process::exit(2);
+        }
     }
 }
 

@@ -203,6 +203,73 @@ fn multi_process_spawns_real_children() {
     );
 }
 
+/// Seatbelt must *enforce*, not just install.
+///
+/// Unlike seccomp, a Seatbelt denial is not fatal — the call returns `EPERM`
+/// and the process continues — so these probes cannot be judged from a signal.
+/// Each performs its operation before and after `sandbox_init` and reports the
+/// transition through an exit code; the codes below are what those mean.
+#[cfg(all(feature = "multi-process", target_os = "macos"))]
+mod seatbelt_enforcement {
+    use super::bin;
+    use std::process::Command;
+
+    /// Mirrors `selftest::code`.
+    const CONTROL_FAILED: i32 = 90;
+    const NOT_DENIED: i32 = 91;
+    const WRONG_ERROR: i32 = 92;
+
+    fn probe(name: &str) -> i32 {
+        let st = Command::new(bin()).args(["selftest", name]).status().expect("spawn selftest");
+        st.code().unwrap_or_else(|| panic!("{name}: killed by a signal, expected an exit code"))
+    }
+
+    /// Turn a probe's exit code into a message that says which half failed —
+    /// "the sandbox let it through" and "it never worked anyway" are very
+    /// different bugs and a bare assertion cannot tell them apart.
+    fn check(name: &str) {
+        match probe(name) {
+            0 => {}
+            CONTROL_FAILED => panic!(
+                "{name}: the operation already failed BEFORE lockdown, so this proves \
+                 nothing about the profile — the control is broken, not the sandbox"
+            ),
+            NOT_DENIED => panic!("{name}: the operation SUCCEEDED under the profile — not enforcing"),
+            WRONG_ERROR => panic!("{name}: denied, but not with EPERM — something else refused it"),
+            other => panic!("{name}: unexpected exit {other}"),
+        }
+    }
+
+    /// A renderer has no filesystem — `(deny default)` withholding `file-read*`
+    /// is the SBPL counterpart of `openat` being off the seccomp list.
+    #[test]
+    fn renderer_cannot_open_files() {
+        check("seatbelt-file");
+    }
+
+    /// A renderer has no network. On Linux that is an empty netns plus missing
+    /// socket syscalls; here it is the profile omitting `network-outbound`, so
+    /// it needs its own test rather than inheriting the Linux one's assurance.
+    #[test]
+    fn renderer_cannot_reach_the_network() {
+        check("seatbelt-network");
+    }
+
+    /// No new programs, the analogue of `execve`/`clone` being off the list.
+    #[test]
+    fn renderer_cannot_spawn_programs() {
+        check("seatbelt-exec");
+    }
+
+    /// The control for the test above it: the net component's profile *does*
+    /// grant outbound access. Without this, "the renderer cannot reach the
+    /// network" would be equally satisfied by a machine with no network.
+    #[test]
+    fn net_component_keeps_its_network() {
+        check("seatbelt-net-role-keeps-network");
+    }
+}
+
 /// Guards the enforcement suite against silently shrinking.
 ///
 /// Every test below this point is `cfg`'d to Linux, so on another platform
@@ -240,11 +307,15 @@ mod probe_inventory {
         "forkserver-no-socket",
     ];
 
-    /// macOS applies a Seatbelt profile, `PT_DENY_ATTACH` and rlimits — none
-    /// of it covered by a probe yet. The empty list records that honestly
-    /// rather than letting a green run imply otherwise.
+    /// The Seatbelt profile's enforcement. `PT_DENY_ATTACH` and the rlimits
+    /// are still unprobed — the list says so rather than implying coverage.
     #[cfg(target_os = "macos")]
-    const EXPECTED: &[&str] = &[];
+    const EXPECTED: &[&str] = &[
+        "seatbelt-file",
+        "seatbelt-network",
+        "seatbelt-exec",
+        "seatbelt-net-role-keeps-network",
+    ];
 
     /// Windows has no sandbox backend at all yet: children run unconfined
     /// under `sandbox::unsupported`. Nothing to probe until a measure lands —
