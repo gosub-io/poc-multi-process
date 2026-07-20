@@ -153,6 +153,11 @@ fn lock_down(role: &str) {
     // about to touch untrusted input — leaves only the heavily restricted
     // primary token it was created with. A no-op when the spawner fell back to
     // a single token.
+    // Read the primary token's restricting-SID set *before* anything else, so
+    // the banner reports what the parent actually gave us rather than what it
+    // intended to.
+    let restricting = restricted_sid_count().unwrap_or(0);
+
     lower_token();
 
     for (policy, flags, name) in ESSENTIAL {
@@ -186,8 +191,12 @@ fn lock_down(role: &str) {
         }
     };
 
+    // `restricting-sids=N` is the one field here that reports the *parent's*
+    // work rather than our own: non-zero means we were spawned two-phase under
+    // the lockdown token, zero means the spawner fell back.
     eprintln!(
-        "[{role}] mitigation policies active (no dynamic code, no child processes, {win32k}, {integrity}, token-lowered)"
+        "[{role}] mitigation policies active (no dynamic code, no child processes, \
+         {win32k}, {integrity}, token-lowered, restricting-sids={restricting})"
     );
 }
 
@@ -529,6 +538,48 @@ pub fn token_pair() -> Option<TokenPair> {
 #[cfg(feature = "multi-process")]
 pub fn restricted_token() -> Option<windows_sys::Win32::Foundation::HANDLE> {
     build_token(false)
+}
+
+/// How many *restricting* SIDs this process's token carries.
+///
+/// This is the observable that distinguishes a two-phase spawn from its
+/// fallbacks, and it exists because nothing else did. `lower_token` runs on
+/// every path and `RevertToSelf` succeeds trivially when there is no
+/// impersonation to drop, so the lockdown banner alone cannot tell whether the
+/// strong token was ever applied — a silent fallback would look exactly like
+/// success. Only the primary token's restricted-SID set differs, and only the
+/// child can see it.
+///
+/// Non-zero means the child is running under the lockdown token: access
+/// requires both the normal ACL check and a second check against this set.
+#[cfg(feature = "multi-process")]
+fn restricted_sid_count() -> Option<u32> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenRestrictedSids, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = std::ptr::null_mut();
+    // SAFETY: pseudo-handle for self; token handle out.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    // The first DWORD of TOKEN_GROUPS is the count; a modest buffer reads it
+    // even when the full list would not fit.
+    let mut buf = [0u8; 4096];
+    let mut needed = 0u32;
+    // SAFETY: correctly sized buffer with its length and an out-param.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenRestrictedSids,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+            &mut needed,
+        )
+    };
+    // SAFETY: opened above.
+    unsafe { CloseHandle(token) };
+    (ok != 0).then(|| u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]))
 }
 
 /// Drop the permissive impersonation token, leaving only the lockdown token.

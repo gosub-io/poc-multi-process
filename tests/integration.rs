@@ -420,6 +420,35 @@ mod mitigation_enforcement {
     }
 }
 
+/// The two-phase token drop must actually have happened.
+///
+/// Every other signal is satisfied by the fallback paths: `lower_token` runs
+/// on all three, and `RevertToSelf` succeeds trivially with no impersonation to
+/// drop, so the lockdown banner looks identical whether the child got the
+/// lockdown token or the engine quietly spawned it with a weaker one. The
+/// restricting-SID count is the only thing that differs, and only the child can
+/// read it.
+///
+/// A zero here is not a crash — it means Windows children are running less
+/// confined than intended, silently. That is precisely the failure this suite
+/// exists to make loud.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+#[test]
+fn windows_children_get_the_lockdown_token() {
+    let out = run(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("restricting-sids="),
+        "no child reported its token state:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("restricting-sids=0"),
+        "a child was spawned WITHOUT the lockdown token — the two-phase drop \
+         fell back silently, so Windows renderers are less confined than \
+         intended:\n{stderr}"
+    );
+}
+
 /// Guards the enforcement suite against silently shrinking.
 ///
 /// Every test below this point is `cfg`'d to Linux, so on another platform
