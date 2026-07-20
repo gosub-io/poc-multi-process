@@ -64,7 +64,15 @@ const BASELINE: &[libc::c_long] = &[
     libc::SYS_recvmsg,
     libc::SYS_sendmsg,
     libc::SYS_close,
+    // Both spellings of fstat: which one `fstat()` becomes is a glibc
+    // decision, not ours. Debian bookworm's 2.36 issues `newfstatat` with
+    // AT_EMPTY_PATH; Ubuntu 24.04's 2.39 issues `fstat`. Allowing only the
+    // one the build host happens to use kills the ring and tile consumers on
+    // the other — found by running these probes under a different libc, not
+    // by reading the code.
     libc::SYS_fstat,
+    libc::SYS_newfstatat,
+    libc::SYS_statx,
     libc::SYS_lseek,
     // memory — mmap/mprotect are argument-filtered in `install` to forbid
     // PROT_EXEC (mremap preserves an existing mapping's protection, so it can't
@@ -530,8 +538,18 @@ fn set_priority(nice: libc::c_int) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The first argument of `setrlimit(2)`, whose Rust type is libc-dependent:
+/// glibc exposes a dedicated `__rlimit_resource_t` enum, musl uses a plain
+/// `c_int`. Naming either one directly makes the crate uncompilable on the
+/// other — a portability break the type checker only reports when something
+/// actually builds against that libc.
+#[cfg(target_env = "gnu")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(target_env = "gnu"))]
+type RlimitResource = libc::c_int;
+
 #[cfg(feature = "multi-process")]
-fn set_rlimit(resource: libc::__rlimit_resource_t, limit: libc::rlim_t) -> std::io::Result<()> {
+fn set_rlimit(resource: RlimitResource, limit: libc::rlim_t) -> std::io::Result<()> {
     let rl = libc::rlimit { rlim_cur: limit, rlim_max: limit };
     // SAFETY: valid resource id and a valid rlimit pointer.
     if unsafe { libc::setrlimit(resource, &rl) } < 0 {

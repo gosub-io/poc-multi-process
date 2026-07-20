@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The point of this matrix is the *sandbox*, not the code.
+  #
+  # The seccomp allowlist is a list of syscalls the C library happens to issue,
+  # and that varies by libc and version in ways nothing in our source reveals:
+  # `fork()` reaches the kernel as `clone3` on newer glibc and `clone` on older
+  # and on musl; `fstat()` reaches it as `newfstatat` on glibc 2.36 but `fstat`
+  # on 2.39; the child calls `set_robust_list` before any of our code runs. Each
+  # of those, when missing, kills a renderer with SIGSYS and surfaces to the
+  # engine as TabCrashed — a symptom that points at the transport rather than
+  # the sandbox.
+  #
+  # Two of those were found by running this suite under a libc other than the
+  # developer's, and would not have been found any other way. That is what this
+  # job is for.
+  linux-libc-matrix:
+    name: linux (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+      # Docker's default seccomp profile denies unshare(CLONE_NEWUSER), which
+      # `isolate_network` needs. It is fail-closed, so without this every spawn
+      # fails with EPERM and the whole suite collapses for a reason that has
+      # nothing to do with the code under test. Note this opts the *container*
+      # out of Docker's filter — it does not weaken the filters this project
+      # installs, which are what the tests actually exercise.
+      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: glibc 2.36 (debian bookworm)
+            image: rust:1-bookworm
+          - name: glibc 2.39 (debian trixie)
+            image: rust:1-trixie
+          - name: musl (alpine)
+            image: rust:1-alpine
+            setup: apk add --no-cache musl-dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        if: matrix.setup != ''
+        run: ${{ matrix.setup }}
+
+      - name: Report the libc actually in use
+        # Printed for the log, not asserted: when a sandbox test fails here,
+        # this line is the first thing worth looking at.
+        run: ldd --version | head -1 || true
+
+      - name: Test
+        run: cargo test --all-targets
+
+      # The probe inventory is asserted per-platform inside the suite, but a
+      # count in the log makes an accidental shrink visible at a glance.
+      - name: Report sandbox probe coverage
+        run: |
+          echo "probes compiled in:"
+          cargo run --quiet -- selftest list
+
+  # Every combination that must keep compiling. Cheap, and it is what catches
+  # portability breaks in code no single platform exercises — musl not having
+  # glibc's `__rlimit_resource_t`, for instance, made the crate uncompilable on
+  # Alpine while every Linux test on the developer's machine passed.
+  cross-compile:
+    name: check (${{ matrix.target }}${{ matrix.features && ' single-process' }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, features: --no-default-features }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: aarch64-apple-darwin, features: --no-default-features }
+          # Windows builds and spawns, but has no sandbox backend: its children
+          # run unconfined. See src/sandbox/unsupported.rs.
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, features: --no-default-features }
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo check --all-targets --target ${{ matrix.target }} ${{ matrix.features }}
+
+  # The platforms whose sandbox backend can actually be *run*, rather than only
+  # type-checked. macOS has a Seatbelt backend and Windows has none; both are
+  # currently probe-free, which the suite's inventory guard asserts explicitly
+  # rather than letting a green run imply coverage that is not there.
+  native-tests:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --all-targets
+
+  # Advisory, deliberately: the tree is not currently clean under either tool.
+  # There is no rustfmt.toml and the code is written wider than default rustfmt
+  # wants, so `--check` demands a whole-repo reformat; clippy has ~10 pre-existing
+  # style nits. Gating on those would make this workflow red on its first run for
+  # reasons unrelated to what it exists to test, and would pressure a large
+  # unrelated diff. Flip `continue-on-error` off once the tree is clean and, for
+  # fmt, once a rustfmt.toml pins the style the code actually uses.
+  lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --check
+        continue-on-error: true
+      - run: cargo clippy --all-targets
+        continue-on-error: true
