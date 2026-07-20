@@ -6,15 +6,21 @@
 //! selected once, here, so no caller — and no other module — carries a
 //! `#[cfg(target_os = ...)]` for sandboxing:
 //!
-//! * [`linux`] — a default-deny **seccomp-BPF** syscall allowlist, an empty
+//! (Plain paths rather than intra-doc links below: only one backend is
+//! compiled per target, so a link to the other two would dangle — on whichever
+//! platform the docs happen to be built.)
+//!
+//! * `linux.rs` — a default-deny **seccomp-BPF** syscall allowlist, an empty
 //!   **network namespace** for renderers, `prctl(PR_SET_DUMPABLE)`, and
 //!   rlimits. The reference implementation of the model.
-//! * [`macos`] — a **Seatbelt** (`sandbox_init`) SBPL profile, `PT_DENY_ATTACH`,
-//!   and rlimits. Same guarantees, different primitives (see that module for
-//!   where the seams don't line up 1:1 — network isolation folds into the
-//!   profile, and there is no W^X argument filtering).
-//! * [`unsupported`] — honest no-ops elsewhere: multi-process still runs over
-//!   Unix sockets, but components run unconfined and say so.
+//! * `macos.rs` — a **Seatbelt** (`sandbox_init`) SBPL profile,
+//!   `PT_DENY_ATTACH`, and rlimits. Same guarantees, different primitives (see
+//!   that module for where the seams don't line up 1:1 — network isolation
+//!   folds into the profile, and there is no W^X argument filtering).
+//! * `unsupported.rs` — honest no-ops elsewhere. On the other Unixes
+//!   multi-process still runs over Unix sockets with components unconfined and
+//!   saying so; on Windows it does not build at all. See that module — the two
+//!   cases are not interchangeable.
 //!
 //! The privilege model itself (why a default-deny allowlist, why fail-closed,
 //! why the placement of each call matters) is documented on the Linux backend,
@@ -37,6 +43,31 @@
 //! engine has no children to confine but still holds the cookie jar in its own
 //! address space. The other four exist only under the `multi-process` feature,
 //! where there are separate processes to cap.
+//!
+//! ### The contract assumes self-application
+//!
+//! Every operation above is invoked *by the process being confined*, on itself,
+//! after `fork`/`exec`. That is a POSIX assumption, and both current backends
+//! satisfy it: seccomp, `unshare`, `prctl`, `sandbox_init` and `PT_DENY_ATTACH`
+//! are all self-applied, and a process may always restrict itself further
+//! without privilege. The additions each backend still wants (Landlock on
+//! Linux, a tighter profile on macOS) are self-applied too, so they fit the
+//! contract as it stands.
+//!
+//! Windows does not work this way, so the table above is not portable as
+//! written. Its primary mechanisms — a restricted token, a job object, an
+//! AppContainer, and the process mitigation policies (`ProhibitDynamicCode`,
+//! `NoChildProcessCreation`) — are attached by the *parent* at
+//! `CreateProcess` time, before the child executes an instruction. They cannot
+//! be expressed as a `lock_down_*` call from inside the child.
+//!
+//! Adding Windows therefore means adding a sixth, parent-side operation that
+//! the spawner applies at creation time, with `lock_down_*` demoted to the
+//! second stage of a two-phase drop (Chromium's model: create suspended and
+//! already-confined, warm up, then `LowerToken()` to the final restricted
+//! token). That is a change to *this* contract, not a detail a backend can
+//! absorb — which is the main reason a Windows port is a larger job than the
+//! macOS one was. See `unsupported.rs` for what happens there today.
 
 // --- platform seam: the only place a sandbox `target_os` cfg lives ---
 #[cfg(target_os = "linux")]
