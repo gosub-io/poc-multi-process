@@ -148,13 +148,17 @@ const NET_EXTRA: &[libc::c_long] = &[
 ///
 /// `clone3` matters as much as `clone` — glibc's `fork()` issues `clone3` on
 /// current versions, so an allowlist carrying only `clone` kills the zygote at
-/// its first fork. It cannot be argument-filtered either: `clone3` passes its
+/// its first fork. It cannot be argument-filtered directly: `clone3` passes its
 /// flags in a struct in memory rather than in registers, and seccomp can only
-/// see registers. (The trick production sandboxes use is to return `ENOSYS`
-/// for `clone3` so glibc falls back to the filterable `clone`; not done here.)
-/// Coarse is acceptable in this one process because it is minimal, trusted and
-/// secret-free — and because a renderer cannot inherit the privilege: its own
-/// filter, installed straight after the fork, denies both.
+/// see registers. So we use the production trick ([`install_clone3_enosys`]):
+/// return `ENOSYS` for `clone3`, which makes glibc's `fork()` fall back to the
+/// register-based `clone` — and *that* we argument-filter (see the `clone` rule
+/// in [`install_with`]) to a plain fork, forbidding the namespace-creation and
+/// thread/VM-sharing flags. `clone3` stays on this list as *allowed* on purpose:
+/// the `ENOSYS` is delivered by a stacked pre-filter whose `Errno` outranks this
+/// `Allow`, so removing it here would instead make `clone3` a fatal `SIGSYS` and
+/// defeat the fallback. musl (`SYS_fork` on x86, `clone` on aarch64) and pre-2.34
+/// glibc never issue `clone3`, so for them the pre-filter is simply inert.
 ///
 /// `prctl`/`seccomp` are here for the *children*, not for the fork server
 /// itself. A forked renderer's first act is to install its own filter, which
@@ -287,7 +291,9 @@ pub fn canary_must_detect_a_missing_syscall() -> ! {
     // failed for being wrong rather than the code being wrong. Every libc needs
     // to clone a descriptor here, so denying that is a gap everywhere.
     let full: Vec<libc::c_long> = BASELINE.iter().chain(FORK_SERVER_EXTRA).copied().collect();
-    if install_with(full, false).is_err() {
+    // `fork_server: false` here: the gap under test is the missing
+    // `F_DUPFD_CLOEXEC`, and the `clone` argument-filter is orthogonal to it.
+    if install_with(full, false, false).is_err() {
         eprintln!("could not install the crippled filter");
         std::process::exit(2);
     }
@@ -329,9 +335,18 @@ fn fail_canary(detail: &str) -> ! {
 #[cfg(feature = "multi-process")]
 pub fn lock_down_fork_server() {
     deny_debugger_attach();
+    // Stack the `clone3` → `ENOSYS` pre-filter *first*, so glibc's `fork()` uses
+    // the register-based `clone` the main filter can constrain. Best-effort: if
+    // it cannot install, `clone3` stays allowed (coarse but safe, the prior
+    // behaviour) rather than the fork server refusing to start. If it installs
+    // but a libc does not honour the fallback, `verify_fork_server_filter`
+    // catches it at startup.
+    if let Err(e) = install_clone3_enosys() {
+        eprintln!("[fork-server] warning: could not install clone3->ENOSYS filter ({e}); clone3 stays coarse");
+    }
     let allowed: Vec<libc::c_long> =
         BASELINE.iter().chain(FORK_SERVER_EXTRA).copied().collect();
-    enforce("fork-server", install_with(allowed, true));
+    enforce("fork-server", install_fork_server(allowed));
 }
 
 /// Cap a renderer: pixels only — the baseline, no network, files, or exec.
@@ -647,16 +662,26 @@ fn enforce(role: &str, result: Result<(), Box<dyn std::error::Error>>) {
 /// arguments fail its filter — is a fatal `SIGSYS`.
 #[cfg(feature = "multi-process")]
 fn install(allowed: Vec<libc::c_long>) -> Result<(), Box<dyn std::error::Error>> {
-    install_with(allowed, false)
+    install_with(allowed, false, false)
+}
+
+/// The fork server's main filter: as [`install`], but `F_DUPFD_CLOEXEC` is
+/// permitted (its forked children clone a descriptor before their own lockdown)
+/// and `clone` is argument-filtered to a plain fork (see [`install_with`]).
+/// Pair with [`install_clone3_enosys`], installed first.
+#[cfg(feature = "multi-process")]
+fn install_fork_server(allowed: Vec<libc::c_long>) -> Result<(), Box<dyn std::error::Error>> {
+    install_with(allowed, true, true)
 }
 
 /// As [`install`], but `allow_dup_fd` additionally permits
-/// `fcntl(F_DUPFD_CLOEXEC)` — needed only by the fork server, whose forked
-/// children must clone a descriptor before installing their own filter.
+/// `fcntl(F_DUPFD_CLOEXEC)` and `fork_server` argument-filters `clone` — both
+/// needed only by the fork server.
 #[cfg(feature = "multi-process")]
 fn install_with(
     allowed: Vec<libc::c_long>,
     allow_dup_fd: bool,
+    fork_server: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use seccompiler::{
         apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
@@ -738,6 +763,47 @@ fn install_with(
         SeccompCondition::new(2, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, libc::SIGSYS as u64)?;
     rules.insert(libc::SYS_tgkill as i64, vec![SeccompRule::new(vec![sig_is_sigsys])?]);
 
+    // …and, for the fork server only, `clone` — argument-filtered to a plain
+    // fork. Once `clone3` is `ENOSYS`'d ([`install_clone3_enosys`]), glibc's
+    // `fork()` reaches the kernel as `clone` with `flags` in a *register* we can
+    // finally inspect (`flags` is argument index 0). `MaskedEq(DANGEROUS, 0)`
+    // means "(flags & DANGEROUS) == 0": a plain `fork()` — glibc or musl — sets
+    // only `SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID`, none of them in
+    // the mask, so it passes on every libc; a `clone` that tries to unshare a
+    // namespace (`CLONE_NEW*`) or spawn a thread / share the address space
+    // (`CLONE_THREAD` / `CLONE_VM`) hits the default action. So even a fork
+    // server subverted through its one input (the engine's `ForkRequest`) cannot
+    // escalate via `clone` flags. The empty `clone` allow that `allowed` would
+    // otherwise produce is replaced here.
+    if fork_server {
+        // Kernel CLONE_* bits (stable UAPI). Declared locally rather than via
+        // `libc` so the mask does not depend on which constants a given `libc`
+        // version happens to export.
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        const CLONE_NEWTIME: u64 = 0x0000_0080;
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+        const CLONE_NEWUTS: u64 = 0x0400_0000;
+        const CLONE_NEWIPC: u64 = 0x0800_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const CLONE_NEWPID: u64 = 0x2000_0000;
+        const CLONE_NEWNET: u64 = 0x4000_0000;
+        const DANGEROUS: u64 = CLONE_VM
+            | CLONE_THREAD
+            | CLONE_NEWTIME
+            | CLONE_NEWNS
+            | CLONE_NEWCGROUP
+            | CLONE_NEWUTS
+            | CLONE_NEWIPC
+            | CLONE_NEWUSER
+            | CLONE_NEWPID
+            | CLONE_NEWNET;
+        let plain_fork =
+            SeccompCondition::new(0, SeccompCmpArgLen::Qword, SeccompCmpOp::MaskedEq(DANGEROUS), 0)?;
+        rules.insert(libc::SYS_clone as i64, vec![SeccompRule::new(vec![plain_fork])?]);
+    }
+
     // A blocked syscall used to be an immediate `KillProcess` — correct, but it
     // told you nothing about *which* syscall. Switch the default to `Trap`
     // (SECCOMP_RET_TRAP → SIGSYS) and install a handler that names the offending
@@ -754,6 +820,52 @@ fn install_with(
         rules,
         SeccompAction::Trap,  // default & argument-mismatch: SIGSYS → sigsys_handler → re-raised
         SeccompAction::Allow, // matched: allow
+        arch,
+    )?;
+    let program: BpfProgram = filter.try_into()?;
+    apply_filter(&program)?;
+    Ok(())
+}
+
+/// Install a stacked pre-filter that turns `clone3` into `ENOSYS`, so glibc's
+/// `fork()` retries with the register-based `clone` the main fork-server filter
+/// argument-filters. `clone3` cannot be argument-filtered directly — it passes
+/// its flags in a memory struct seccomp cannot dereference — so `ENOSYS`-ing it
+/// is the only way to route fork onto a constrainable path. This is the standard
+/// technique (Chromium, systemd) and relies on a fallback glibc has carried
+/// since it started issuing `clone3`.
+///
+/// **Why a separate filter.** seccomp applies one action per filter, so a single
+/// filter cannot both `Allow` most syscalls and `Errno` one. Stacking solves it:
+/// the kernel runs every installed filter and takes the highest-precedence
+/// return, ordered `KILL > TRAP > ERRNO > ALLOW`. This pre-filter returns
+/// `ERRNO(ENOSYS)` for `clone3` and `Allow` for everything else; the main filter
+/// (installed *after*, so both are active) `Allow`s `clone3`. For `clone3`,
+/// `ERRNO` outranks the main filter's `Allow` → `ENOSYS` is returned. For a
+/// genuinely-blocked syscall the main filter returns `TRAP`, which outranks this
+/// filter's `Allow` → still killed. So the pre-filter can only ever turn
+/// `clone3` into `ENOSYS`; it cannot weaken anything else.
+///
+/// Inert where `clone3` is never issued: musl (`SYS_fork`/`clone`) and pre-2.34
+/// glibc simply never trip the rule.
+#[cfg(feature = "multi-process")]
+fn install_clone3_enosys() -> Result<(), Box<dyn std::error::Error>> {
+    use seccompiler::{apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
+    use std::collections::BTreeMap;
+
+    #[cfg(target_arch = "x86_64")]
+    let arch = seccompiler::TargetArch::x86_64;
+    #[cfg(target_arch = "aarch64")]
+    let arch = seccompiler::TargetArch::aarch64;
+
+    // One rule, any arguments: clone3 → the match action below.
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    rules.insert(libc::SYS_clone3 as i64, Vec::new());
+
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,                       // mismatch: defer to the main filter
+        SeccompAction::Errno(libc::ENOSYS as u32),  // match (clone3): ENOSYS, triggering fork's fallback
         arch,
     )?;
     let program: BpfProgram = filter.try_into()?;

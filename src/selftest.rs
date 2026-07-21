@@ -94,6 +94,8 @@ pub const PROBES: &[&str] = &[
     #[cfg(target_os = "linux")]
     "forkserver-no-socket",
     #[cfg(target_os = "linux")]
+    "forkserver-no-newuser-clone",
+    #[cfg(target_os = "linux")]
     "service-fs-openat",
     #[cfg(target_os = "linux")]
     "service-fs-no-socket",
@@ -963,6 +965,27 @@ fn run_platform_probe(probe: &str) {
             "no-socket" => unsafe {
                 let _ = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
                 std::process::exit(0);
+            },
+
+            // A *plain* fork is allowed (see `can-fork`), but a `clone` that
+            // unshares a namespace is not: once `clone3` is `ENOSYS`'d, the
+            // register-visible `clone` flags are argument-filtered to mask off
+            // CLONE_NEW*/CLONE_THREAD/CLONE_VM. Attempt a clone into a new *user*
+            // namespace directly; the mask must trap it with SIGSYS *before* the
+            // kernel even checks userns permissions. Reached (clean exit) only if
+            // the mask let a dangerous flag through — i.e. the hardening is a
+            // no-op. This is what keeps `install_clone3_enosys` + the `clone`
+            // rule from being an untested pair of moving parts.
+            "no-newuser-clone" => unsafe {
+                // Raw `clone` with SIGCHLD (fork semantics) so a NULL stack is a
+                // copy-on-write fork; `flags` is arg 0 on both x86_64 and
+                // aarch64. If the filter works this never returns.
+                let flags = (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_long;
+                let ret = libc::syscall(libc::SYS_clone, flags, 0, 0, 0, 0);
+                if ret == 0 {
+                    libc::_exit(0); // the child, if the clone wrongly succeeded
+                }
+                std::process::exit(0); // parent reached here → not denied
             },
 
             other => {

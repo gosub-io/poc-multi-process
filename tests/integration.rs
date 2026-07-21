@@ -530,6 +530,7 @@ mod probe_inventory {
         "forkserver-canary-gap",
         "forkserver-no-exec",
         "forkserver-no-socket",
+        "forkserver-no-newuser-clone",
         "service-fs-openat",
         "service-fs-no-socket",
         "service-device-ioctl",
@@ -679,6 +680,16 @@ mod sandbox_enforcement {
     fn fork_server_cannot_open_a_socket() {
         let st = probe("forkserver-no-socket");
         assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (no network), got {st:?}");
+    }
+
+    /// The `clone3`→`ENOSYS` + argument-filtered `clone` hardening actually
+    /// bites: a plain fork works (see `can-fork`), but a `clone` into a new user
+    /// namespace is trapped by the flag mask. If this exited cleanly the mask
+    /// would be a silent no-op.
+    #[test]
+    fn fork_server_cannot_clone_into_a_new_namespace() {
+        let st = probe("forkserver-no-newuser-clone");
+        assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (clone flag filter), got {st:?}");
     }
 
     /// A filesystem service's filter is the baseline *plus* `openat` — the one
