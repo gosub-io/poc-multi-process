@@ -24,11 +24,20 @@ cargo run --release -- --bench-stream 12 socket  # …against the copy path
 
 Each child installs a seccomp-BPF filter after connecting its IPC link. It is
 a default-deny **allowlist**: the component's legitimate syscalls are
-enumerated and everything else is a fatal `SIGSYS` (`KillProcess`, not `EPERM`
-— a killed process can't probe the sandbox and adapt). This is fail-closed — a
-syscall we never considered (a new one, or a bypass such as io_uring-based
-networking) is denied for free — which is what real renderer sandboxes
-(Chromium, Firefox) do. `src/sandbox/linux.rs` holds the curated baseline.
+enumerated and everything else is a fatal `SIGSYS` — the process is killed, not
+handed an `EPERM` it could probe and adapt to. The violation traps through a
+`SECCOMP_RET_TRAP` handler that first names the offending call on stderr
+(`[sandbox] SIGSYS: blocked syscall #N — terminating`) and then re-raises
+SIGSYS, so termination is exactly as before — the process still dies with the
+same signal the selftest probes assert — but you now learn *which* syscall it
+was. That diagnostic earns its keep once V8 lands and the renderer starts
+issuing calls we did not anticipate ("renderer died" becomes "renderer tried
+`openat` (#257), killed"). The handler's only added privilege is `tgkill`,
+argument-filtered to SIGSYS-to-self so it cannot poke any other process or
+signal. This is fail-closed — a syscall we never considered (a new one, or a
+bypass such as io_uring-based networking) is denied for free — which is what
+real renderer sandboxes (Chromium, Firefox) do. `src/sandbox/linux.rs` holds
+the curated baseline.
 
 A few allowed syscalls are **argument-filtered**: `mmap`/`mprotect` are
 permitted only when `PROT_EXEC` is clear, so a renderer can never turn writable
@@ -154,8 +163,13 @@ capability the zygote gave up cannot be its child.
   read-only file. Storage is additionally keyed by the `(zone, origin)` the
   *engine* stamps (never a message claim), and the renderer's key is hashed into
   the filename rather than spliced into a path — so path traversal is guarded at
-  the application level *and* by the kernel. Landlock is best-effort: a kernel
-  without it degrades to seccomp + the hashing, rather than refusing to start.
+  the application level *and* by the kernel. It is also **byte-bounded**: each
+  value is capped (`MAX_VALUE_BYTES`) and the store is held to a lifetime budget
+  (`MAX_STORE_BYTES`) tracked with an in-memory running counter — accounting an
+  overwrite as a delta, and needing no directory-enumeration syscall — so a
+  renderer can't fill the host disk one bounded `Set` at a time. Landlock is
+  best-effort: a kernel without it degrades to seccomp + the hashing, rather
+  than refusing to start.
   **Audio and GPU are honest stubs**: real processes with the correct device
   filter (`baseline + openat + ioctl`) and empty netns, but no real work — a PoC
   has no hardware to drive, and `ioctl` is a large surface seccomp constrains
@@ -197,9 +211,10 @@ capability the zygote gave up cannot be its child.
   IPC link, they install a default-deny seccomp-BPF **allowlist** permitting
   only a curated baseline (I/O on existing fds, memory, futex, signals, time).
   A renderer — even one fully code-exec'd by an exploit — physically cannot
-  open a socket, an io_uring instance, a file, or a subprocess; the kernel
-  returns `EPERM`. See `src/sandbox/linux.rs`. The net component gets the same
-  baseline plus the socket family.
+  open a socket, an io_uring instance, a file, or a subprocess: the attempt
+  traps to `SIGSYS`, is logged with the syscall number, and kills the process.
+  See `src/sandbox/linux.rs`. The net component gets the same baseline plus the
+  socket family.
 - Children run under **OS resource caps** the engine sets at spawn (Linux):
   `RLIMIT_AS` (512 MiB address space), `RLIMIT_NOFILE`, and `RLIMIT_CORE=0`.
   seccomp caps *what* a child may do; these cap *how much*, so a compromised
@@ -214,7 +229,15 @@ capability the zygote gave up cannot be its child.
   *per source*, one compromised renderer flooding any message type pins a fixed
   slice of engine memory and can't crowd out other tabs — without it, a flood
   grows the engine ~90 MB/s to OOM; with it, engine RSS stays flat. In-flight
-  fetches are *additionally* bounded per tab (`MAX_INFLIGHT_FETCHES`).
+  fetches are *additionally* bounded per tab (`MAX_INFLIGHT_FETCHES`), and
+  decodes per tab (`MAX_INFLIGHT_DECODES`, since each forks a process).
+- The engine also caps the **total** live renderer count (`MAX_RENDERERS`).
+  The per-tab bounds limit what one renderer costs; nothing else limits how
+  many renderers a hostile page (`window.open` in a loop) or a buggy embedder
+  can bring into being. Past the cap an `OpenTab` is refused
+  (`OpenTabFailed`) rather than spawning another process, so tab count can't
+  become a PID/memory exhaustion vector — the same finite ceiling Chromium's
+  process limit imposes.
 - A crashed renderer surfaces as `EngineEvent::TabCrashed` for that tab only;
   the engine and all other tabs keep running (in multi-process mode).
 - Children are reached via an **inherited `socketpair(2)` fd**, not a socket on
@@ -390,7 +413,9 @@ a real security boundary with a process behind them.
   SSRF classifier (internal ranges, alternate IP encodings, IPv6,
   userinfo/trailing-dot bypasses), the cookie broker (`(zone, origin)`
   partitioning + HttpOnly hiding), IPC frame round-trip and oversized-length
-  rejection, the per-source backpressure `Gate`, and origin parsing. The
+  rejection, the per-source backpressure `Gate`, the storage quota admission
+  (per-value cap, overwrite-as-delta, saturating arithmetic), and origin
+  parsing. The
   single-process engine is also driven end to end (open → navigate → frame →
   close → shutdown, cross-origin refusal, unparseable URL) — the broker/policy
   code is identical in both modes, so this exercises the real thing.
@@ -446,7 +471,8 @@ The security *mechanisms* are real (see the isolation section); what's
 simplified is the surrounding browser. What each entry below still needs:
 
 - **Sandboxing**: the seccomp filter is production-shaped (fail-closed
-  allowlist, `KillProcess`, W^X via `PROT_EXEC` argument-filtering), and
+  allowlist, SIGSYS-kill-on-violation with the blocked syscall reported, W^X via
+  `PROT_EXEC` argument-filtering), and
   renderers additionally run in an empty **network namespace** — unshared on
   the fork server at spawn and inherited by every renderer it `fork()`s, so
   "a renderer cannot reach the network" no longer rests on the syscall

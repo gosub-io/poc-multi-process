@@ -21,7 +21,20 @@
 //!   syscall level; until then this application-level scoping is the guard.)
 
 use crate::ipc::{Endpoint, StorageOp, StorageRequest, StorageResponse};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// Largest single value the store will persist. Values already ride the 16 MiB
+/// IPC frame cap, but that bounds one *message*, not disk footprint — a
+/// renderer could still write many large values. This caps each one.
+pub const MAX_VALUE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Ceiling on the whole store's on-disk size for one service lifetime. Without
+/// it a renderer can fill the host disk one bounded `Set` at a time. A real
+/// engine keys this per `(zone, origin)` with eviction and persists the
+/// accounting; the PoC caps the store as a whole and tracks usage in memory,
+/// which is enough to make "fill the disk" impossible while the service runs.
+pub const MAX_STORE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The directory every stored value lives in. The engine creates it before the
 /// service starts (the service's filter has `openat` but not `mkdirat`, and the
@@ -60,11 +73,54 @@ fn path_for(zone: u64, origin: &str, key: &str) -> PathBuf {
     storage_dir().join(format!("{:016x}.val", hash(&buf)))
 }
 
-fn handle(zone: u64, origin: &str, op: StorageOp) -> Option<Vec<u8>> {
+/// Decide whether writing `new_len` bytes to a slot currently holding `old`
+/// bytes keeps total usage within `cap`, given `used` bytes stored now. Returns
+/// the projected new total if admitted, `None` if it would exceed `cap`.
+/// Saturating throughout so a hostile length can't wrap the arithmetic.
+fn admit_write(used: u64, old: u64, new_len: u64, cap: u64) -> Option<u64> {
+    let projected = used.saturating_sub(old).saturating_add(new_len);
+    (projected <= cap).then_some(projected)
+}
+
+/// Per-service accounting for the store-wide byte budget. `used` is the running
+/// total; `sizes` remembers each path's current size so an overwrite is counted
+/// as a delta, not a fresh add. In-memory and per service lifetime — see
+/// [`MAX_STORE_BYTES`].
+struct Quota {
+    used: u64,
+    sizes: HashMap<PathBuf, u64>,
+}
+
+impl Quota {
+    fn new() -> Quota {
+        Quota { used: 0, sizes: HashMap::new() }
+    }
+}
+
+fn handle(zone: u64, origin: &str, op: StorageOp, quota: &mut Quota) -> Option<Vec<u8>> {
     match op {
         StorageOp::Get { key } => std::fs::read(path_for(zone, origin, &key)).ok(),
         StorageOp::Set { key, value } => {
-            let _ = std::fs::write(path_for(zone, origin, &key), &value);
+            if value.len() > MAX_VALUE_BYTES {
+                eprintln!(
+                    "[storage] refused oversize value ({} bytes > {MAX_VALUE_BYTES})",
+                    value.len()
+                );
+                return None;
+            }
+            let path = path_for(zone, origin, &key);
+            let old = quota.sizes.get(&path).copied().unwrap_or(0);
+            let Some(projected) =
+                admit_write(quota.used, old, value.len() as u64, MAX_STORE_BYTES)
+            else {
+                eprintln!("[storage] refused write: store budget exceeded ({MAX_STORE_BYTES} bytes)");
+                return None;
+            };
+            // Only commit the accounting if the write actually landed.
+            if std::fs::write(&path, &value).is_ok() {
+                quota.used = projected;
+                quota.sizes.insert(path, value.len() as u64);
+            }
             None
         }
     }
@@ -72,9 +128,10 @@ fn handle(zone: u64, origin: &str, op: StorageOp) -> Option<Vec<u8>> {
 
 /// The service loop — transport-agnostic, identical in both modes.
 pub fn serve(mut ep: Endpoint) {
+    let mut quota = Quota::new();
     // Loop ends when `recv` errors (engine went away) or on `Shutdown`.
     while let Ok(StorageRequest::Op { request_id, zone, origin, op }) = ep.recv::<StorageRequest>() {
-        let value = handle(zone, &origin, op);
+        let value = handle(zone, &origin, op, &mut quota);
         if ep.send(&StorageResponse { request_id, value }).is_err() {
             break;
         }
@@ -111,6 +168,31 @@ mod tests {
         let c = path_for(1, "a", "b");
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn admit_write_enforces_the_store_budget() {
+        // Fresh slot: admitted while it fits, refused once it would exceed.
+        assert_eq!(admit_write(0, 0, 100, 1000), Some(100));
+        assert_eq!(admit_write(950, 0, 50, 1000), Some(1000)); // exactly at cap
+        assert_eq!(admit_write(950, 0, 51, 1000), None); // one over
+    }
+
+    #[test]
+    fn admit_write_counts_an_overwrite_as_a_delta() {
+        // A slot already holding 800 bytes, store full to the brim: rewriting
+        // that same slot smaller must be admitted (net frees space), and a
+        // same-size rewrite must still fit even though used == cap.
+        assert_eq!(admit_write(1000, 800, 200, 1000), Some(400));
+        assert_eq!(admit_write(1000, 800, 800, 1000), Some(1000));
+        // ...but growing it past what freeing the old value allows is refused.
+        assert_eq!(admit_write(1000, 800, 801, 1000), None);
+    }
+
+    #[test]
+    fn admit_write_saturates_on_hostile_lengths() {
+        // A near-u64::MAX length cannot wrap the arithmetic into admitting.
+        assert_eq!(admit_write(0, 0, u64::MAX, MAX_STORE_BYTES), None);
     }
 
     #[test]

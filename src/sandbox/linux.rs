@@ -11,11 +11,17 @@
 //! renderers.
 //!
 //! The filter is a default-deny **allowlist**: we enumerate the syscalls a
-//! component legitimately needs and everything else is a fatal `SIGSYS`
-//! (`KillProcess`). This is fail-closed — a syscall we never considered (a new
-//! one, or an obscure bypass such as io_uring-based networking) is denied for
-//! free — and killing on violation, rather than returning `EPERM`, denies an
-//! exploit the chance to probe the sandbox and adapt.
+//! component legitimately needs and everything else is a fatal `SIGSYS`. This
+//! is fail-closed — a syscall we never considered (a new one, or an obscure
+//! bypass such as io_uring-based networking) is denied for free — and killing
+//! on violation, rather than returning `EPERM`, denies an exploit the chance to
+//! probe the sandbox and adapt.
+//!
+//! The default action is `SECCOMP_RET_TRAP`, not `KillProcess`, so a small
+//! handler (`sigsys_handler`) can name the blocked syscall on stderr before
+//! re-raising SIGSYS — the process still dies with the same signal, we just
+//! learn *which* call it was. The only cost is `tgkill`, argument-filtered to
+//! SIGSYS-to-self so it cannot be used for anything else.
 //!
 //! A handful of allowed syscalls are additionally **argument-filtered**:
 //! `mmap`/`mprotect` are permitted only when `PROT_EXEC` is clear, so a
@@ -603,7 +609,7 @@ pub fn lock_down_service(name: &str, filesystem: bool, device: bool, fs_allow: &
 #[cfg(feature = "multi-process")]
 fn enforce(role: &str, result: Result<(), Box<dyn std::error::Error>>) {
     match result {
-        Ok(()) => eprintln!("[{role}] seccomp allowlist active (default-deny, KillProcess)"),
+        Ok(()) => eprintln!("[{role}] seccomp allowlist active (default-deny, SIGSYS + report)"),
         Err(e) => {
             // Fail closed: never run a component that was meant to be confined
             // as if it were unconfined.
@@ -697,15 +703,143 @@ fn install_with(
     }
     rules.insert(libc::SYS_fcntl as i64, fcntl_allowed);
 
+    // tgkill is permitted ONLY to deliver SIGSYS to a thread of this process —
+    // the one thing `sigsys_handler` does to re-raise after logging. `sig` is
+    // argument index 2; every other tgkill (any other signal, or poking another
+    // process) fails the condition and hits the Trap default. This is the whole
+    // cost of the diagnostic: one syscall, argument-pinned to the exact use.
+    let sig_is_sigsys =
+        SeccompCondition::new(2, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, libc::SIGSYS as u64)?;
+    rules.insert(libc::SYS_tgkill as i64, vec![SeccompRule::new(vec![sig_is_sigsys])?]);
+
+    // A blocked syscall used to be an immediate `KillProcess` — correct, but it
+    // told you nothing about *which* syscall. Switch the default to `Trap`
+    // (SECCOMP_RET_TRAP → SIGSYS) and install a handler that names the offending
+    // syscall on stderr, then re-raises SIGSYS so the process still terminates
+    // with the same signal it always did (the selftest probes assert exactly
+    // that). The handler is installed *before* the filter applies, so its own
+    // `sigaction`/`getpid`/`gettid`/`tgkill`/`write` are unfiltered here and are
+    // on the allowlist for when it actually runs. Matters most once V8 lands and
+    // the renderer starts issuing syscalls we did not anticipate: "renderer
+    // died" becomes "renderer tried openat (#257), killed".
+    install_sigsys_reporter();
+
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::KillProcess, // default & argument-mismatch: fatal SIGSYS
-        SeccompAction::Allow,       // matched: allow
+        SeccompAction::Trap,  // default & argument-mismatch: SIGSYS → sigsys_handler → re-raised
+        SeccompAction::Allow, // matched: allow
         arch,
     )?;
     let program: BpfProgram = filter.try_into()?;
     apply_filter(&program)?;
     Ok(())
+}
+
+/// Install the SIGSYS reporter (SA_SIGINFO so the handler sees which syscall
+/// trapped; SA_NODEFER so the re-raised SIGSYS is delivered synchronously
+/// against the restored default disposition). Best-effort: if it cannot be
+/// installed the `Trap` default still terminates the process on a violation —
+/// it just does so without the diagnostic line.
+#[cfg(feature = "multi-process")]
+fn install_sigsys_reporter() {
+    // SAFETY: zeroed sigaction is a valid empty handler; we then set the two
+    // fields we need and register it for SIGSYS only.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigsys_handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGSYS, &sa, std::ptr::null_mut());
+    }
+}
+
+/// SIGSYS handler for `SECCOMP_RET_TRAP`: name the blocked syscall, then
+/// terminate with SIGSYS exactly as `KillProcess` would have.
+///
+/// Runs in signal context, so it touches only async-signal-safe operations: a
+/// fixed stack buffer, a hand-rolled integer formatter, one `write(2)`, then
+/// `sigaction`/`tgkill` (both on the allowlist). No allocation, no formatting
+/// machinery, no locks.
+#[cfg(feature = "multi-process")]
+extern "C" fn sigsys_handler(
+    _sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _ctx: *mut libc::c_void,
+) {
+    // `si_syscall` sits at byte offset 24 of `siginfo_t` on LP64 Linux — after
+    // {si_signo, si_errno, si_code, pad} (16 bytes) and the `_call_addr`
+    // pointer (8). Same layout on x86_64 and aarch64, the two arches this
+    // crate builds seccomp for. A wrong read only mislabels the log line; it
+    // cannot affect the termination below.
+    let nr: i32 = if info.is_null() {
+        -1
+    } else {
+        // SAFETY: `info` points at a kernel-filled siginfo_t at least 32 bytes
+        // long; the read is unaligned-safe and within that.
+        unsafe { std::ptr::read_unaligned((info as *const u8).add(24).cast::<i32>()) }
+    };
+
+    let mut buf = [0u8; 80];
+    let mut len = 0usize;
+    for &b in b"[sandbox] SIGSYS: blocked syscall #" {
+        buf[len] = b;
+        len += 1;
+    }
+    len += write_i32(&mut buf[len..], nr);
+    for &b in b" \xe2\x80\x94 terminating\n" {
+        buf[len] = b;
+        len += 1;
+    }
+    // SAFETY: fd 2 (stderr) is open; buf/len describe a valid initialized slice.
+    unsafe {
+        libc::write(2, buf.as_ptr().cast(), len);
+
+        // Restore the default action and re-raise, so the process dies with
+        // SIGSYS (the signal, and the exit semantics the probes check) rather
+        // than returning from the trap and resuming the blocked call.
+        let mut dfl: libc::sigaction = std::mem::zeroed();
+        dfl.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(libc::SIGSYS, &dfl, std::ptr::null_mut());
+        let pid = libc::getpid();
+        let tid = libc::syscall(libc::SYS_gettid) as libc::pid_t;
+        libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGSYS);
+        // Unreachable with SA_NODEFER (SIGSYS delivered synchronously above);
+        // a belt-and-braces exit in case a future change masks it.
+        libc::_exit(159);
+    }
+}
+
+/// Async-signal-safe decimal formatter for the SIGSYS reporter: writes `v`
+/// (handling a negative) into `out` and returns the byte count. No allocation.
+#[cfg(feature = "multi-process")]
+fn write_i32(out: &mut [u8], v: i32) -> usize {
+    let mut n = v as i64;
+    let neg = n < 0;
+    if neg {
+        n = -n;
+    }
+    let mut digits = [0u8; 10];
+    let mut d = 0usize;
+    if n == 0 {
+        digits[d] = b'0';
+        d += 1;
+    }
+    while n > 0 {
+        digits[d] = b'0' + (n % 10) as u8;
+        n /= 10;
+        d += 1;
+    }
+    let mut len = 0usize;
+    if neg {
+        out[len] = b'-';
+        len += 1;
+    }
+    while d > 0 {
+        d -= 1;
+        out[len] = digits[d];
+        len += 1;
+    }
+    len
 }
 
 /// Resource ceilings the engine imposes on a child at spawn time. seccomp caps

@@ -166,6 +166,15 @@ const MAX_INFLIGHT_DECODES: usize = 8;
 /// *any* message type would grow it without bound. See [`Gate`].
 const MAX_QUEUED_PER_SOURCE: usize = 64;
 
+/// Global ceiling on live renderer processes. The per-tab fetch/decode caps
+/// bound what *one* renderer consumes, but nothing bounds how many renderers
+/// exist — a hostile page spamming `window.open` (or a buggy embedder) would
+/// otherwise spawn them until the host runs out of PIDs or memory. Opening past
+/// this fails the `OpenTab` (a bounded refusal) instead of spawning. Chromium
+/// has the same ceiling (its process limit); the number here is arbitrary but
+/// finite, which is the point.
+const MAX_RENDERERS: usize = 128;
+
 /// A tiny counting semaphore with a terminal `close`, giving each message
 /// source (a renderer, or the net component) its own bounded slice of the
 /// shared inbox. A source's reader thread must `acquire` a permit before
@@ -528,6 +537,16 @@ impl EngineLoop {
             });
             return;
         };
+
+        // Global process cap: refuse rather than spawn an unbounded number of
+        // renderers. Checked here, before any process is created.
+        if self.tabs.len() >= MAX_RENDERERS {
+            self.emit(EngineEvent::OpenTabFailed {
+                url: url.to_string(),
+                reason: format!("renderer limit reached ({MAX_RENDERERS} live)"),
+            });
+            return;
+        }
 
         let tab_id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
