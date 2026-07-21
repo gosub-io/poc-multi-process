@@ -1,11 +1,11 @@
-//! Windows spawn backend: `CreateProcessW` with an extended startup info.
+//! Windows spawn backend: `CreateProcessAsUserW` with an extended startup info.
 //!
 //! Replaces `std::process::Command` so the spawn call is ours, which is the
-//! precondition for every parent-side access control Windows has. Today it
-//! uses that ownership for one thing — an explicit inherited-handle list — and
-//! is structured so a restricted token (`CreateProcessAsUserW`) and an
-//! AppContainer (`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`) slot into the
-//! same call.
+//! precondition for every parent-side access control Windows has. Today it uses
+//! that ownership for two things: an explicit inherited-handle list, and a
+//! restricted primary token. An AppContainer
+//! (`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`) would slot into the same
+//! call when it lands.
 //!
 //! ## The handle list
 //!
@@ -25,14 +25,11 @@ use std::ffi::c_void;
 use std::io;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-use windows_sys::Win32::Security::{
-    DuplicateTokenEx, SecurityImpersonation, TokenImpersonation, TOKEN_ALL_ACCESS,
-};
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList,
-    InitializeProcThreadAttributeList, ResumeThread, SetThreadToken, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTUPINFOEXW,
+    InitializeProcThreadAttributeList, UpdateProcThreadAttribute, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTUPINFOEXW,
 };
 
 /// A spawned child process. Owns the process handle and closes it on drop.
@@ -111,46 +108,6 @@ fn quote(arg: &str) -> String {
     out.extend(std::iter::repeat_n('\\', backslashes));
     out.push('"');
     out
-}
-
-/// Impersonate `initial` on the suspended child's first thread, then resume it.
-///
-/// `SetThreadToken` needs an *impersonation* token specifically, so the
-/// primary token is duplicated into one first. Windows consults the
-/// impersonation token for access checks while it is set, which is what lets a
-/// child created under a heavily restricted primary token still load its DLLs
-/// and initialize its runtime.
-fn impersonate_and_resume(thread: HANDLE, initial: HANDLE) -> io::Result<()> {
-    let mut imp: HANDLE = std::ptr::null_mut();
-    // SAFETY: `initial` is a valid primary token; out-param receives the copy.
-    let duped = unsafe {
-        DuplicateTokenEx(
-            initial,
-            TOKEN_ALL_ACCESS,
-            std::ptr::null(),
-            SecurityImpersonation,
-            TokenImpersonation,
-            &mut imp,
-        )
-    };
-    if duped == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // SAFETY: a valid suspended thread handle and a valid impersonation token.
-    let set = unsafe { SetThreadToken(&thread, imp) };
-    let err = io::Error::last_os_error();
-    // SAFETY: duplicated above; the thread holds its own reference now.
-    unsafe { CloseHandle(imp) };
-    if set == 0 {
-        return Err(err);
-    }
-
-    // SAFETY: valid suspended thread; -1 signals failure.
-    if unsafe { ResumeThread(thread) } == u32::MAX {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// A NUL-terminated UTF-16 buffer, as every `*W` API wants.
@@ -235,75 +192,46 @@ pub fn spawn(
     // SAFETY: zeroed out-param, filled by CreateProcessW on success.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-    // Three spawn shapes, strongest first, each falling back to the next. A
-    // host or policy that refuses token creation should get a less confined
-    // child rather than no browser — the same call made for low integrity and
-    // win32k lockdown.
+    // Two spawn shapes, strongest first, falling back rather than failing: a
+    // host that refuses token creation should get a less confined child, not no
+    // browser — the same call made for low integrity and win32k lockdown.
     //
-    // 1. **Two-phase.** Create suspended under the lockdown token, impersonate
-    //    the permissive initial token on the child's first thread so startup
-    //    can complete, then resume. The child drops the impersonation itself
-    //    once warm (`sandbox::lower_token`, called from its lockdown).
-    // 2. **Single restricted token.** No impersonation, so the token has to be
-    //    weak enough to start a process unaided.
-    // 3. **Inherited token.** The child's own mitigation policies and low
+    // 1. **Restricted token** — privileges stripped, groups deny-only.
+    // 2. **Inherited token** — the child's own mitigation policies and low
     //    integrity still apply.
-    let pair = crate::sandbox::token_pair();
-    let single = if pair.is_none() { crate::sandbox::restricted_token() } else { None };
-    // Name the shape. Without this the three paths are indistinguishable from
-    // outside the process, which is how a fallback went unnoticed once already.
-    eprintln!(
-        "[spawn] token: {}",
-        match (&pair, &single) {
-            (Some(_), _) => "two-phase (lockdown + initial)",
-            (None, Some(_)) => "single restricted",
-            (None, None) => "inherited",
-        }
-    );
-
-    let flags = if pair.is_some() {
-        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED
-    } else {
-        EXTENDED_STARTUPINFO_PRESENT
-    };
+    //
+    // There is deliberately no third, stronger shape. A token with restricting
+    // SIDs would confine file access further, but such a child dies in the
+    // loader before `main` — image loading is checked against the primary token
+    // and nothing on disk grants it access. That needs the executable ACLed for
+    // the RESTRICTED SID at install time; see `sandbox::restricted_token`. It
+    // was tried, measured, and removed rather than left as dead scaffolding.
+    let token = crate::sandbox::restricted_token();
 
     // SAFETY: `exe_w` and `line_w` are NUL-terminated and live across the call;
     // `bInheritHandles = TRUE` is required for the handle list to apply.
     let ok = unsafe {
-        match (&pair, single) {
-            (Some(p), _) => CreateProcessAsUserW(
-                p.lockdown,
-                exe_w.as_mut_ptr(),
-                line_w.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1, // inherit handles — scoped by the list above
-                flags,
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::addr_of!(si).cast(),
-                &mut pi,
-            ),
-            (None, Some(t)) => CreateProcessAsUserW(
+        match token {
+            Some(t) => CreateProcessAsUserW(
                 t,
                 exe_w.as_mut_ptr(),
                 line_w.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
-                1,
-                flags,
+                1, // inherit handles — scoped by the list above
+                EXTENDED_STARTUPINFO_PRESENT,
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::addr_of!(si).cast(),
                 &mut pi,
             ),
-            (None, None) => CreateProcessW(
+            None => CreateProcessW(
                 exe_w.as_mut_ptr(),
                 line_w.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
                 1,
-                flags,
+                EXTENDED_STARTUPINFO_PRESENT,
                 std::ptr::null(),
                 std::ptr::null(),
                 std::ptr::addr_of!(si).cast(),
@@ -316,50 +244,14 @@ pub fn spawn(
     // SAFETY: initialized above and no longer needed either way.
     unsafe { DeleteProcThreadAttributeList(attr_list) };
 
-    if ok == 0 {
-        if let Some(p) = &pair {
-            // SAFETY: built by `token_pair`, never handed to a process.
-            unsafe {
-                CloseHandle(p.lockdown);
-                CloseHandle(p.initial);
-            }
-        }
-        if let Some(t) = single {
-            // SAFETY: built by `restricted_token`, never handed to a process.
-            unsafe { CloseHandle(t) };
-        }
-        return Err(err);
-    }
-    if let Some(t) = single {
-        // SAFETY: the process holds its own reference now.
+    if let Some(t) = token {
+        // SAFETY: built by `restricted_token`; the process (on success) holds
+        // its own reference now, and on failure we simply free ours.
         unsafe { CloseHandle(t) };
     }
 
-    // Phase one of the two-phase drop: hand the suspended child a permissive
-    // impersonation token so it can finish starting, then let it run. It drops
-    // the impersonation itself once warm.
-    if let Some(p) = &pair {
-        let started = impersonate_and_resume(pi.hThread, p.initial);
-        // SAFETY: both were built by `token_pair`; the process holds its own
-        // reference to the lockdown token and the impersonation has been
-        // applied (or has failed) by now.
-        unsafe {
-            CloseHandle(p.initial);
-            CloseHandle(p.lockdown);
-        }
-        if let Err(e) = started {
-            // The child exists but is suspended under a token it cannot start
-            // under. Leaving it would hang the engine waiting for a component
-            // that never speaks, so kill it and report — the one case here
-            // that is not recoverable by falling back.
-            // SAFETY: valid handles from CreateProcess.
-            unsafe {
-                windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-            }
-            return Err(e);
-        }
+    if ok == 0 {
+        return Err(err);
     }
 
     // The child holds its own copies now; drop ours so a dead child is seen as

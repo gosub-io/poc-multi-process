@@ -414,39 +414,37 @@ mod mitigation_enforcement {
     /// The token handed to a child must carry fewer privileges than the one
     /// the engine runs with. Privileges are the ambient ACL-override rights; a
     /// renderer needs none of them.
+    ///
+    /// This builds a restricted token *in the probe process*. It confirms the
+    /// token can be built, but not that a spawned child actually received one —
+    /// see `spawned_children_get_a_restricted_token` for that.
     #[test]
     fn child_token_drops_privileges() {
         check("restricted-token");
     }
-}
 
-/// The two-phase token drop must actually have happened.
-///
-/// Every other signal is satisfied by the fallback paths: `lower_token` runs
-/// on all three, and `RevertToSelf` succeeds trivially with no impersonation to
-/// drop, so the lockdown banner looks identical whether the child got the
-/// lockdown token or the engine quietly spawned it with a weaker one. The
-/// restricting-SID count is the only thing that differs, and only the child can
-/// read it.
-///
-/// A zero here is not a crash — it means Windows children are running less
-/// confined than intended, silently. That is precisely the failure this suite
-/// exists to make loud.
-#[cfg(all(feature = "multi-process", target_os = "windows"))]
-#[test]
-fn windows_children_get_the_lockdown_token() {
-    let out = run(&[]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("restricting-sids="),
-        "no child reported its token state:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("restricting-sids=0"),
-        "a child was spawned WITHOUT the lockdown token — the two-phase drop \
-         fell back silently, so Windows renderers are less confined than \
-         intended:\n{stderr}"
-    );
+    /// A *spawned* child must run under the restricted token, not fall back to
+    /// the inherited one.
+    ///
+    /// This is separate from the probe above because the failure it guards
+    /// against is exactly a successful-looking fallback: `restricted_token`
+    /// warns and returns `None` on error, the spawner uses the inherited token,
+    /// and rendering proceeds — so every other test passes while the child runs
+    /// unrestricted. The warning is the only signal, so its *absence* is the
+    /// assertion.
+    ///
+    /// It caught a real bug: an unaligned SID buffer made `CreateRestrictedToken`
+    /// fault intermittently, which is why "green once, red twice" plagued this
+    /// backend before the alignment fix.
+    #[test]
+    fn spawned_children_get_a_restricted_token() {
+        let out = super::run(&[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("using inherited token"),
+            "a child fell back to the inherited token — restricted_token() failed:\n{stderr}"
+        );
+    }
 }
 
 /// Guards the enforcement suite against silently shrinking.

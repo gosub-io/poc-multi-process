@@ -79,13 +79,16 @@
 //!   original contract untouched.
 //! * Parent-side but *post*-spawn — a job object, which can be attached to a
 //!   process that already exists. This is the one new hook.
-//! * Parent-side and *pre*-create — a restricted token and an AppContainer,
-//!   which must be supplied to `CreateProcess` itself. [`crate::spawn`] now
-//!   owns that call, so they have somewhere to go; neither is implemented yet.
-//!   Both will also want Chromium's two-phase drop, because a fully restricted
-//!   process often cannot complete its own startup: create it with the
-//!   restricted primary token plus a more permissive impersonation token, then
-//!   drop the latter once the runtime is warm.
+//! * Parent-side and *pre*-create — supplied to `CreateProcess` itself, which
+//!   [`crate::spawn`] now owns. A **restricted token** (privileges stripped,
+//!   groups deny-only) is applied this way. Its stronger *restricting-SID*
+//!   form, and an AppContainer, are not: the first cannot start a process
+//!   unless the executable is ACLed for the `RESTRICTED` SID (verified by
+//!   experiment, not assumed — see `windows.rs`), and both are larger pieces
+//!   of work. Notably, Chromium's two-phase drop does **not** rescue the
+//!   restricting-SID token here: image loading is checked against the primary
+//!   token throughout, which thread impersonation does not cover, so the child
+//!   dies in the loader regardless.
 
 // --- platform seam: the only place a sandbox `target_os` cfg lives ---
 #[cfg(target_os = "linux")]
@@ -175,15 +178,8 @@ pub fn confine_spawned_child(child: &crate::spawn::Child) -> std::io::Result<()>
     }
 }
 
-/// Build the lockdown/initial token pair for a two-phase drop, or `None` if
-/// the host refuses. Windows only. See the backend for why two are needed.
-#[cfg(all(feature = "multi-process", target_os = "windows"))]
-pub fn token_pair() -> Option<windows::TokenPair> {
-    imp::token_pair()
-}
-
-/// Build a single restricted token — the fallback when a pair cannot be made.
-/// Windows only.
+/// Build a restricted primary token for a Windows child, or `None` if the host
+/// refuses (the spawner then falls back to the inherited token). Windows only.
 #[cfg(all(feature = "multi-process", target_os = "windows"))]
 pub fn restricted_token() -> Option<::windows_sys::Win32::Foundation::HANDLE> {
     imp::restricted_token()
