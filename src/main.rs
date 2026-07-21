@@ -27,14 +27,17 @@
 #[cfg(feature = "multi-process")]
 mod channel;
 mod decoder;
+mod device_service;
 mod engine;
 mod events;
+mod font;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 mod fork_server;
 mod ip_utils;
 mod ipc;
 mod net_daemon;
 mod renderer;
+mod storage;
 // Unconditional: the per-OS confinement machinery inside is feature-gated, but
 // `deny_debugger_attach` applies to the single-process build too — that build
 // still holds the cookie jar in its address space. The platform backend
@@ -89,6 +92,16 @@ fn main() {
         // is the fork+exec fallback used elsewhere.
         #[cfg(feature = "multi-process")]
         Some("decoder") => decoder::run(&args[2]),
+        // Engine-spawned services — filesystem or device capable, so they live
+        // outside the zygote with their own filters (see each module).
+        #[cfg(feature = "multi-process")]
+        Some("storage") => storage::run(&args[2]),
+        #[cfg(feature = "multi-process")]
+        Some("font") => font::run(&args[2]),
+        #[cfg(feature = "multi-process")]
+        Some("audio") => device_service::run("audio", &args[2]),
+        #[cfg(feature = "multi-process")]
+        Some("gpu") => device_service::run("gpu", &args[2]),
         #[cfg(all(feature = "multi-process", target_os = "linux"))]
         Some("fork-server") => fork_server::run(&args[2]),
         // Internal sandbox self-test, spawned only by the integration suite.

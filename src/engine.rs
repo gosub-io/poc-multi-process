@@ -27,8 +27,9 @@
 
 use crate::events::{EngineCommand, EngineEvent, TabCommand, TabId, Tile, TilePixels, ZoneId};
 use crate::ipc::{
-    self, DecodeOutcome, Endpoint, EndpointTx, FetchOutcome, FromDecoder, FromRenderer, NetRequest,
-    NetResponse, ToDecoder, ToRenderer,
+    self, DecodeOutcome, Endpoint, EndpointTx, FetchOutcome, FontRequest, FontResponse, FromDecoder,
+    FromRenderer, NetRequest, NetResponse, ServiceControl, StorageRequest, StorageResponse,
+    ToDecoder, ToRenderer,
 };
 use crate::{net_daemon, renderer};
 use std::collections::HashMap;
@@ -132,6 +133,10 @@ enum LoopMsg {
     /// answering — so a decoder crash reaches the loop as a `Failed`, never as
     /// a lost message.
     DecodeReply { request_id: u64, outcome: DecodeOutcome },
+    /// The storage service answered a `Get`/`Set`.
+    StorageReply { request_id: u64, value: Option<Vec<u8>> },
+    /// The font service answered a metrics request.
+    FontReply { request_id: u64, metrics: Option<crate::ipc::FontMetrics> },
 }
 
 /// A running child component, however it is hosted.
@@ -245,6 +250,10 @@ enum Role<'a> {
     Renderer(&'a str),
     /// A throwaway image decoder — spawned per decode, decodes one image, dies.
     Decoder,
+    /// A long-lived, engine-spawned service that needs a privilege the zygote
+    /// gave up (filesystem or device). The token is both the argv role name and
+    /// the serve-loop selector; the child self-confines with the right filter.
+    Service(&'static str),
 }
 
 /// A cookie in the engine's jar. `http_only` cookies are attached to network
@@ -276,8 +285,29 @@ struct EngineLoop {
     pending_fetches: HashMap<u64, TabId>,
     /// In-flight decodes: request id -> the tab awaiting the decoded image.
     pending_decodes: HashMap<u64, TabId>,
+    /// The filesystem-capable services: long-lived, engine-spawned, brokered
+    /// like the net component. Keyed request/response, so many tabs multiplex
+    /// over one link.
+    storage: ServiceLink,
+    storage_gate: Arc<Gate>,
+    pending_storage: HashMap<u64, TabId>,
+    font: ServiceLink,
+    font_gate: Arc<Gate>,
+    pending_font: HashMap<u64, TabId>,
+    /// The device-backed stubs: spawned and confined, never messaged, ended at
+    /// shutdown. Kept only so their links can be dropped and their processes
+    /// reaped.
+    devices: Vec<ServiceLink>,
     next_tab_id: u64,
     next_request_id: u64,
+}
+
+/// A long-lived engine-spawned service: the write half plus the handle to reap
+/// it. (Its read half lives in a reader thread, and its inbox gate — for the
+/// brokered ones — is created next to it.)
+struct ServiceLink {
+    tx: EndpointTx,
+    handle: ChildHandle,
 }
 
 impl EngineLoop {
@@ -292,34 +322,96 @@ impl EngineLoop {
         {
             let inbox = inbox.clone();
             let net_gate = Arc::clone(&net_gate);
-            std::thread::spawn(move || loop {
-                match net_rx.recv::<NetResponse>() {
-                    Ok(resp) => {
-                        // A streaming response's ring fd follows on the same
-                        // socket; this thread is its only reader, so take the
-                        // fd here and route both together.
-                        #[cfg(all(feature = "multi-process", target_os = "linux"))]
-                        if matches!(resp.outcome, FetchOutcome::OkStreaming { .. }) {
-                            let Ok(fd) = net_rx.recv_fd() else { break };
-                            if !net_gate.acquire() {
-                                break;
-                            }
-                            if inbox.send(LoopMsg::NetStream { resp, fd }).is_err() {
-                                break;
-                            }
-                            continue;
-                        }
+            std::thread::spawn(move || {
+                while let Ok(resp) = net_rx.recv::<NetResponse>() {
+                    // A streaming response's ring fd follows on the same
+                    // socket; this thread is its only reader, so take the
+                    // fd here and route both together.
+                    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                    if matches!(resp.outcome, FetchOutcome::OkStreaming { .. }) {
+                        let Ok(fd) = net_rx.recv_fd() else { break };
                         if !net_gate.acquire() {
                             break;
                         }
-                        if inbox.send(LoopMsg::NetReply(resp)).is_err() {
+                        if inbox.send(LoopMsg::NetStream { resp, fd }).is_err() {
                             break;
                         }
+                        continue;
                     }
-                    Err(_) => break,
+                    if !net_gate.acquire() {
+                        break;
+                    }
+                    if inbox.send(LoopMsg::NetReply(resp)).is_err() {
+                        break;
+                    }
                 }
             });
         }
+
+        // Prepare the on-disk state the filesystem services expect *before*
+        // spawning them: the engine is unconfined and can create directories,
+        // while the services' filters have `openat` but not `mkdirat`.
+        crate::storage::ensure_dir();
+        crate::font::ensure_font_file();
+
+        // The storage service: reader thread forwards `StorageResponse`s into
+        // the inbox, gated like the net component.
+        let (storage_handle, ep) = spawner.spawn(Role::Service("storage"));
+        let (storage_tx, mut storage_rx) = ep.split();
+        let storage_gate = Gate::new(MAX_QUEUED_PER_SOURCE);
+        {
+            let inbox = inbox.clone();
+            let gate = Arc::clone(&storage_gate);
+            std::thread::spawn(move || {
+                while let Ok(resp) = storage_rx.recv::<StorageResponse>() {
+                    if !gate.acquire() {
+                        break;
+                    }
+                    let msg = LoopMsg::StorageReply {
+                        request_id: resp.request_id,
+                        value: resp.value,
+                    };
+                    if inbox.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // The font service: same shape, forwarding `FontResponse`s.
+        let (font_handle, ep) = spawner.spawn(Role::Service("font"));
+        let (font_tx, mut font_rx) = ep.split();
+        let font_gate = Gate::new(MAX_QUEUED_PER_SOURCE);
+        {
+            let inbox = inbox.clone();
+            let gate = Arc::clone(&font_gate);
+            std::thread::spawn(move || {
+                while let Ok(resp) = font_rx.recv::<FontResponse>() {
+                    if !gate.acquire() {
+                        break;
+                    }
+                    let msg = LoopMsg::FontReply {
+                        request_id: resp.request_id,
+                        metrics: resp.metrics,
+                    };
+                    if inbox.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // The device stubs: spawned and confined, then left idle. No reader
+        // thread — they are never messaged; the engine only holds their links
+        // so it can end them cleanly at shutdown.
+        let devices = ["audio", "gpu"]
+            .into_iter()
+            .map(|name| {
+                let (handle, ep) = spawner.spawn(Role::Service(name));
+                let (tx, _rx) = ep.split();
+                ServiceLink { tx, handle }
+            })
+            .collect();
 
         EngineLoop {
             spawner,
@@ -332,6 +424,13 @@ impl EngineLoop {
             cookies: HashMap::new(),
             pending_fetches: HashMap::new(),
             pending_decodes: HashMap::new(),
+            storage: ServiceLink { tx: storage_tx, handle: storage_handle },
+            storage_gate,
+            pending_storage: HashMap::new(),
+            font: ServiceLink { tx: font_tx, handle: font_handle },
+            font_gate,
+            pending_font: HashMap::new(),
+            devices,
             next_tab_id: 0,
             next_request_id: 0,
         }
@@ -392,6 +491,8 @@ impl EngineLoop {
                         join(tab.handle);
                         self.pending_fetches.retain(|_, t| *t != tab_id);
                         self.pending_decodes.retain(|_, t| *t != tab_id);
+                        self.pending_storage.retain(|_, t| *t != tab_id);
+                        self.pending_font.retain(|_, t| *t != tab_id);
                         self.emit(EngineEvent::TabCrashed { tab_id });
                     }
                 }
@@ -406,6 +507,14 @@ impl EngineLoop {
                 }
                 LoopMsg::DecodeReply { request_id, outcome } => {
                     self.decode_reply(request_id, outcome);
+                }
+                LoopMsg::StorageReply { request_id, value } => {
+                    self.storage_reply(request_id, value);
+                    self.storage_gate.release();
+                }
+                LoopMsg::FontReply { request_id, metrics } => {
+                    self.font_reply(request_id, metrics);
+                    self.font_gate.release();
                 }
             }
         }
@@ -440,8 +549,10 @@ impl EngineLoop {
             let inbox = self.inbox.clone();
             let gate = Arc::clone(&gate);
             std::thread::spawn(move || {
-                loop {
-                    match rx.recv::<FromRenderer>() {
+                // Loop ends when `recv` errors (renderer gone) or a shm tile
+                // fails validation; either way we fall through to `TabGone`.
+                while let Ok(msg) = rx.recv::<FromRenderer>() {
+                    match msg {
                         // A shared-memory tile: the fd follows the message on
                         // the same socket, so this thread — the socket's only
                         // reader — receives and validates it here. The message
@@ -450,7 +561,7 @@ impl EngineLoop {
                         // tile that fails validation is a protocol violation:
                         // drop the link and report the tab gone.
                         #[cfg(all(feature = "multi-process", target_os = "linux"))]
-                        Ok(FromRenderer::TileShm { width, height }) => {
+                        FromRenderer::TileShm { width, height } => {
                             let mapped = rx
                                 .recv_fd()
                                 .and_then(|fd| crate::shm::map_sealed_tile(fd, width, height));
@@ -471,7 +582,7 @@ impl EngineLoop {
                                 }
                             }
                         }
-                        Ok(msg) => {
+                        msg => {
                             if !gate.acquire() {
                                 return;
                             }
@@ -479,7 +590,6 @@ impl EngineLoop {
                                 return;
                             }
                         }
-                        Err(_) => break,
                     }
                 }
                 let _ = inbox.send(LoopMsg::TabGone { tab_id });
@@ -528,6 +638,8 @@ impl EngineLoop {
                 join(tab.handle);
                 self.pending_fetches.retain(|_, t| *t != tab_id);
                 self.pending_decodes.retain(|_, t| *t != tab_id);
+                self.pending_storage.retain(|_, t| *t != tab_id);
+                self.pending_font.retain(|_, t| *t != tab_id);
                 self.emit(EngineEvent::TabClosed { tab_id });
             }
         }
@@ -609,10 +721,58 @@ impl EngineLoop {
             FromRenderer::NeedDecode { image } => {
                 self.broker_decode(tab_id, image);
             }
+            FromRenderer::NeedStorage { op } => {
+                // Identity stamped from engine bookkeeping, never the message —
+                // the same rule as fetches. The storage service partitions by
+                // this pair, so a renderer cannot reach another origin's data.
+                let request_id = self.next_request_id;
+                self.next_request_id += 1;
+                self.pending_storage.insert(request_id, tab_id);
+                let req = StorageRequest::Op {
+                    request_id,
+                    zone: tab.zone.0,
+                    origin: tab.origin.clone(),
+                    op,
+                };
+                if self.storage.tx.send(&req).is_err() {
+                    self.pending_storage.remove(&request_id);
+                    let _ = tab.tx.send(&ToRenderer::StorageResult(None));
+                }
+            }
+            FromRenderer::NeedFont { family } => {
+                let request_id = self.next_request_id;
+                self.next_request_id += 1;
+                self.pending_font.insert(request_id, tab_id);
+                let req = FontRequest::Metrics { request_id, family };
+                if self.font.tx.send(&req).is_err() {
+                    self.pending_font.remove(&request_id);
+                    let _ = tab.tx.send(&ToRenderer::FontResult(None));
+                }
+            }
             // Consumed (fd received, validated, mapped) by the reader thread;
             // never reaches the loop as a FromTab message.
             #[cfg(all(feature = "multi-process", target_os = "linux"))]
             FromRenderer::TileShm { .. } => {}
+        }
+    }
+
+    /// Relay a storage service reply to the tab that requested it.
+    fn storage_reply(&mut self, request_id: u64, value: Option<Vec<u8>>) {
+        let Some(tab_id) = self.pending_storage.remove(&request_id) else {
+            return;
+        };
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            let _ = tab.tx.send(&ToRenderer::StorageResult(value));
+        }
+    }
+
+    /// Relay a font service reply to the tab that requested it.
+    fn font_reply(&mut self, request_id: u64, metrics: Option<crate::ipc::FontMetrics>) {
+        let Some(tab_id) = self.pending_font.remove(&request_id) else {
+            return;
+        };
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            let _ = tab.tx.send(&ToRenderer::FontResult(metrics));
         }
     }
 
@@ -742,6 +902,21 @@ impl EngineLoop {
         self.net_gate.close();
         let _ = self.net_tx.send(&NetRequest::Shutdown);
         join(std::mem::replace(&mut self.net_handle, ChildHandle::Thread(dummy_thread())));
+
+        // End the services. Each gets its shutdown message, then its handle is
+        // reaped; the device stubs only need their links dropped (they exit on
+        // EOF), but a Shutdown makes the intent explicit.
+        self.storage_gate.close();
+        let _ = self.storage.tx.send(&StorageRequest::Shutdown);
+        join(std::mem::replace(&mut self.storage.handle, ChildHandle::Thread(dummy_thread())));
+        self.font_gate.close();
+        let _ = self.font.tx.send(&FontRequest::Shutdown);
+        join(std::mem::replace(&mut self.font.handle, ChildHandle::Thread(dummy_thread())));
+        for mut dev in self.devices.drain(..) {
+            let _ = dev.tx.send(&ServiceControl::Shutdown);
+            join(dev.handle);
+        }
+
         self.spawner.shutdown_forkserver();
         self.emit(EngineEvent::EngineShutdown);
     }
@@ -751,6 +926,17 @@ impl EngineLoop {
 /// struct without wrapping the field in an `Option`.
 fn dummy_thread() -> std::thread::JoinHandle<()> {
     std::thread::spawn(|| {})
+}
+
+/// Single-process dispatch: run a service's serve loop as a thread, selected by
+/// the same token that names its role in multi-process mode.
+fn service_serve(name: &str, ep: Endpoint) {
+    match name {
+        "storage" => crate::storage::serve(ep),
+        "font" => crate::font::serve(ep),
+        "audio" | "gpu" => crate::device_service::serve(ep),
+        other => panic!("unknown service {other}"),
+    }
 }
 
 fn join(handle: ChildHandle) {
@@ -921,6 +1107,7 @@ impl Spawner {
                     Role::Decoder => {
                         std::thread::spawn(move || crate::decoder::serve_one(theirs))
                     }
+                    Role::Service(name) => std::thread::spawn(move || service_serve(name, theirs)),
                 };
                 (ChildHandle::Thread(handle), mine)
             }
@@ -939,6 +1126,18 @@ impl Spawner {
                     let ep = Endpoint::from_channel(parent_end).expect("wrap parent end");
                     (ChildHandle::Process(child), ep)
                 }
+                // Services need a privilege the zygote gave up, so they cannot
+                // be fork-served — they are spawned fork+exec straight from the
+                // engine (like the net component) and self-confine with their
+                // own filter. None needs the network, so each gets an empty
+                // netns.
+                Role::Service(name) => {
+                    let (parent_end, child_end) =
+                        crate::channel::Channel::pair().expect("channel pair");
+                    let child = spawn_inherited(exe, &[name], child_end, true);
+                    let ep = Endpoint::from_channel(parent_end).expect("wrap parent end");
+                    (ChildHandle::Process(child), ep)
+                }
                 // Both renderers and decoders are fork-served: the engine
                 // creates the socketpair, keeps one end, and hands the other to
                 // the fork server via SCM_RIGHTS — so the child talks straight
@@ -949,7 +1148,7 @@ impl Spawner {
                     let req = match role {
                         Role::Renderer(origin) => ipc::ForkRequest::Renderer { origin: origin.to_string() },
                         Role::Decoder => ipc::ForkRequest::Decoder,
-                        Role::Net => unreachable!(),
+                        Role::Net | Role::Service(_) => unreachable!(),
                     };
                     let (parent_end, child_end) =
                         std::os::unix::net::UnixStream::pair().expect("socketpair");
@@ -975,12 +1174,13 @@ impl Spawner {
                     Role::Net => vec!["net-daemon"],
                     Role::Renderer(origin) => vec!["renderer", origin],
                     Role::Decoder => vec!["decoder"],
+                    Role::Service(name) => vec![name],
                 };
                 let (parent_end, child_end) =
                     crate::channel::Channel::pair().expect("channel pair");
                 // No-op off Linux (no namespaces), but kept truthful per role:
-                // a decoder needs no network any more than a renderer does.
-                let isolate_network = matches!(role, Role::Renderer(_) | Role::Decoder);
+                // only the net component needs the network.
+                let isolate_network = !matches!(role, Role::Net);
                 let child = spawn_inherited(exe, &role_args, child_end, isolate_network);
                 let ep = Endpoint::from_channel(parent_end).expect("wrap parent end");
                 (ChildHandle::Process(child), ep)

@@ -58,11 +58,8 @@ pub fn run(control_fd: &str) {
     // one fork; failing later looks like every tab crashing on open.
     crate::sandbox::verify_fork_server_filter();
 
-    loop {
-        let req: ForkRequest = match ipc::recv_msg(&mut control) {
-            Ok(req) => req,
-            Err(_) => break, // engine went away
-        };
+    // Loop ends when `recv_msg` errors (engine went away) or on `Shutdown`.
+    while let Ok(req) = ipc::recv_msg::<ForkRequest>(&mut control) {
         match req {
             ForkRequest::Shutdown => break,
             ForkRequest::Renderer { origin } => {

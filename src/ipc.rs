@@ -66,6 +66,21 @@ pub enum FromRenderer {
     /// process (see `decoder`). The bytes are the encoded image; the reply is a
     /// [`ToRenderer::DecodeResult`].
     NeedDecode { image: Vec<u8> },
+    /// Persist or read a value in this origin's storage partition (the
+    /// `localStorage`/`IndexedDB` stand-in). Renderers hold no filesystem
+    /// access; the engine brokers to the storage service, which is keyed by the
+    /// tab's `(zone, origin)` — never a claim in this message.
+    NeedStorage { op: StorageOp },
+    /// Ask the font service for a font's metrics. Renderers cannot open files;
+    /// the font service can, and returns only the derived data.
+    NeedFont { family: String },
+}
+
+/// A storage operation a renderer requests through the broker.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum StorageOp {
+    Get { key: String },
+    Set { key: String, value: Vec<u8> },
 }
 
 /// Engine -> renderer.
@@ -77,6 +92,12 @@ pub enum ToRenderer {
     /// reason the (ephemeral) decoder refused or died. A decoder crash is
     /// reported as a failure here, never as a failure of the renderer.
     DecodeResult(DecodeOutcome),
+    /// The outcome of a [`FromRenderer::NeedStorage`]. `Get` yields the value or
+    /// `None` if unset; `Set` yields `None`.
+    StorageResult(Option<Vec<u8>>),
+    /// The outcome of a [`FromRenderer::NeedFont`]: the font's metrics, or
+    /// `None` if the service could not read it.
+    FontResult(Option<FontMetrics>),
     /// A fetch whose body streams through a shared-memory ring (Linux): the
     /// ring fd follows immediately via `SCM_RIGHTS`. `body_len` is a *claim*
     /// the renderer bounds before allocating; the ring fd itself is validated
@@ -137,6 +158,55 @@ pub enum ToDecoder {
 pub enum FromDecoder {
     Decoded { width: u32, height: u32, pixels: Vec<u8> },
     Failed { reason: String },
+}
+
+/// Engine -> storage service. `request_id` multiplexes many tabs over one link,
+/// like [`NetRequest`]; the `(zone, origin)` is stamped by the engine and
+/// selects the partition, so a renderer cannot read another origin's storage.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum StorageRequest {
+    Op { request_id: u64, zone: u64, origin: String, op: StorageOp },
+    Shutdown,
+}
+
+/// Storage service -> engine.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct StorageResponse {
+    pub request_id: u64,
+    /// `Get`: the value or `None`; `Set`: always `None`.
+    pub value: Option<Vec<u8>>,
+}
+
+/// Font metrics — the small derived data a renderer needs, without ever seeing
+/// the font file itself (which only the font service may open).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FontMetrics {
+    pub family: String,
+    /// Number of glyphs — stands in for the parsed contents of the font file.
+    pub glyphs: u32,
+    /// Size in bytes of the file the service read.
+    pub file_len: u64,
+}
+
+/// Engine -> font service.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum FontRequest {
+    Metrics { request_id: u64, family: String },
+    Shutdown,
+}
+
+/// Engine -> a stub device service (audio, GPU). They do no work; this exists
+/// only so the engine can end them cleanly at shutdown.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ServiceControl {
+    Shutdown,
+}
+
+/// Font service -> engine.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct FontResponse {
+    pub request_id: u64,
+    pub metrics: Option<FontMetrics>,
 }
 
 /// The decode outcome as it reaches the renderer — the decoder's own result,

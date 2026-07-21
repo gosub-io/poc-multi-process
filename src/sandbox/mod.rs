@@ -155,6 +155,26 @@ pub fn lock_down_net() {
     imp::lock_down_net();
 }
 
+/// What extra capability an engine-spawned service needs beyond the content
+/// baseline. Unlike a renderer or the decoder, these roles need a privilege the
+/// zygote gave up (filesystem or device access), which is why each is spawned
+/// from the engine with its own filter rather than forked from the fork server.
+#[derive(Clone, Copy)]
+pub struct ServiceCaps {
+    /// Needs to open files (font, storage). Adds `openat` on Linux.
+    pub filesystem: bool,
+    /// Needs a device node + `ioctl` (audio, GPU). Adds `openat` + `ioctl`.
+    pub device: bool,
+}
+
+/// Confine an engine-spawned service to the content baseline plus exactly the
+/// capability `caps` selects. `name` is the label in its lockdown banner.
+/// Fail-closed like the other lockdowns.
+#[cfg(feature = "multi-process")]
+pub fn lock_down_service(name: &str, caps: ServiceCaps) {
+    imp::lock_down_service(name, caps.filesystem, caps.device);
+}
+
 /// Apply parent-side confinement to a child that has just been spawned.
 ///
 /// **The sixth operation**, and the first that is not self-applied: the parent

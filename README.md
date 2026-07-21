@@ -108,11 +108,27 @@ maps each reply back to the tab that asked).
 ```
 engine event loop (broker — owns cookie jar & policy)
 ├── net component            Phase 1: sole owner of network capability
+├── storage service          filesystem: per-(zone,origin) key/value store
+├── font service             filesystem: opens font files, returns metrics
+├── audio service            device stub: confined with an ioctl filter
+├── gpu service              device stub: confined with an ioctl filter
 └── fork server (Linux)      minimal, single-threaded, secret-free
     ├── renderer (zone, A)   Phase 2: per-(zone,origin), unprivileged
     ├── renderer (zone, B)   Phase 2: per-(zone,origin), unprivileged
     └── decoder              ephemeral: forked per image, decodes one, exits
 ```
+
+Two families of child, split by one rule: **the zygote can only parent a
+process strictly less privileged than itself.** Its filter, empty netns and
+non-dumpable flag are inherited and only narrow, so anything needing a
+capability the zygote gave up cannot be its child.
+
+- *Under the fork server* (content processes, less privileged): renderers, and
+  the ephemeral decoder. They fork cheaply from the warm zygote.
+- *Off the engine* (services, each needing a capability renderers lack): the
+  net component (network), storage and font (`openat`), audio and gpu (device
+  `ioctl`). Each is spawned fork+exec with its own filter — a *superset* of the
+  content baseline — and, except the net component, an empty netns.
 
 - **Image decoding runs in a throwaway process.** Decoding is the most
   dangerous input a browser handles (libwebp CVE-2023-4863 was a zero-click RCE
@@ -125,6 +141,21 @@ engine event loop (broker — owns cookie jar & policy)
   a decoder can never see a second origin's image — a single long-lived decoder
   would reintroduce the cross-origin channel the per-`(zone,origin)` split
   closes. The per-image fork is what the warm fork server makes cheap.
+
+- **Filesystem-capable services are separate processes with a wider filter.**
+  Renderers deny `openat` outright — the property that caps their filesystem
+  without Landlock — which is only sustainable while nothing renders real text
+  or persists data. So storage (the `localStorage`/`IndexedDB` stand-in) and
+  the font service run outside the zygote with a `baseline + openat` filter.
+  Storage is keyed by the `(zone, origin)` the *engine* stamps, never a claim
+  in the message, so a renderer cannot read another origin's data; and the
+  renderer's key is hashed into the filename rather than spliced into a path,
+  since `openat`'s path argument is one seccomp cannot restrict (Landlock is
+  the syscall-level answer, still the next step). **Audio and GPU are honest
+  stubs**: real processes with the correct device filter (`baseline + openat +
+  ioctl`) and empty netns, but no real work — a PoC has no hardware to drive,
+  and `ioctl` is a large surface seccomp constrains poorly, so the isolation
+  they show is the process boundary, not a tight filter.
 
 - Renderers hold no secrets: cookies and network access live in the engine
   and net component. A renderer can only send IPC messages, and every message
@@ -394,6 +425,9 @@ covers the bounding mechanism itself deterministically.
 | `src/ip_utils.rs` | SSRF policy: URL host extraction, IP-literal parsing (incl. `inet_aton` encodings), blocked-range classification |
 | `src/renderer.rs` | Per-`(zone,origin)` renderer: `serve` loop, placeholder render pipeline |
 | `src/decoder.rs` | Ephemeral image decoder: bounds-checked `GIMG` parser, decodes one image and exits |
+| `src/storage.rs` | Storage service: per-`(zone,origin)` key/value store, keys hashed into filenames |
+| `src/font.rs` | Font service: opens a font file, returns only metrics |
+| `src/device_service.rs` | Audio + GPU stubs: confined with a device filter, no real work |
 | `src/fork_server.rs` | Fork server (Linux): `fork()`s renderers without exec |
 | `src/shm.rs` | Shared-memory tiles (Linux): sealed-`memfd` producer + validating consumer |
 | `src/ring.rs` | Shared-memory ring (Linux): streams large fetch bodies, futex wakeups, hostile-cursor validation |

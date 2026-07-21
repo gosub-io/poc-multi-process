@@ -93,6 +93,12 @@ pub const PROBES: &[&str] = &[
     "forkserver-no-exec",
     #[cfg(target_os = "linux")]
     "forkserver-no-socket",
+    #[cfg(target_os = "linux")]
+    "service-fs-openat",
+    #[cfg(target_os = "linux")]
+    "service-fs-no-socket",
+    #[cfg(target_os = "linux")]
+    "service-device-ioctl",
     #[cfg(target_os = "macos")]
     "seatbelt-file",
     #[cfg(target_os = "macos")]
@@ -830,6 +836,52 @@ fn run_platform_probe(probe: &str) {
     // Fork-server probes: this role's filter is not the renderer's, and it is
     // inherited by every renderer forked under it — so it gets its own
     // lockdown here rather than falling through to `lock_down_renderer`.
+    // Service-filter probes: each confines itself with a service filter, then
+    // tests one syscall. They run before the renderer lockdown below because
+    // they need a *different* filter (a superset of the baseline).
+    if let Some(op) = probe.strip_prefix("service-") {
+        use crate::sandbox::ServiceCaps;
+        match op {
+            // The filesystem filter must permit `openat` — the whole reason a
+            // storage/font service is a separate process. Allowed = the syscall
+            // returns (fd or errno) rather than a fatal SIGSYS; clean exit.
+            "fs-openat" => {
+                crate::sandbox::lock_down_service("probe", ServiceCaps { filesystem: true, device: false });
+                // SAFETY: a NUL-terminated path and standard open flags.
+                let fd = unsafe { libc::openat(libc::AT_FDCWD, c"/dev/null".as_ptr(), libc::O_RDONLY) };
+                if fd >= 0 {
+                    unsafe { libc::close(fd) };
+                }
+                std::process::exit(0);
+            }
+            // ...but it is a *superset of the baseline*, not a blank cheque:
+            // network is still denied. Reached (clean exit) only if the filter
+            // wrongly allowed `socket`; otherwise SIGSYS.
+            "fs-no-socket" => {
+                crate::sandbox::lock_down_service("probe", ServiceCaps { filesystem: true, device: false });
+                // SAFETY: obtaining a socket; expected to be fatal.
+                let _ = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+                std::process::exit(0);
+            }
+            // The device filter must permit `ioctl` (how a real audio/GPU
+            // service drives its device). An unsupported request returns ENOTTY
+            // rather than being killed; clean exit = the syscall was allowed.
+            "device-ioctl" => {
+                crate::sandbox::lock_down_service("probe", ServiceCaps { filesystem: false, device: true });
+                let mut winsz: libc::winsize = unsafe { std::mem::zeroed() };
+                // SAFETY: TIOCGWINSZ with a valid out-struct; fd 2 may not be a
+                // tty, in which case it errors — which is fine, we only need the
+                // syscall to be permitted rather than killed.
+                let _ = unsafe { libc::ioctl(2, libc::TIOCGWINSZ, &mut winsz) };
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("unknown service probe: {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     if let Some(op) = probe.strip_prefix("forkserver-") {
         crate::sandbox::lock_down_fork_server();
         match op {

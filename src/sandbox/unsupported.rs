@@ -25,6 +25,13 @@ pub fn lock_down_renderer() {
 #[cfg(feature = "multi-process")]
 pub fn lock_down_net() {}
 
+/// No confinement here either; the service runs unconfined like everything else
+/// on this platform.
+#[cfg(feature = "multi-process")]
+pub fn lock_down_service(name: &str, _filesystem: bool, _device: bool) {
+    eprintln!("[{name}] no sandbox on this platform — running unconfined");
+}
+
 /// rlimits are POSIX, but this fallback keeps the whole backend as no-ops so a
 /// port is an all-or-nothing, clearly-visible piece of work rather than a
 /// partial illusion of confinement.

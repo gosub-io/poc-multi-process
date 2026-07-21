@@ -82,6 +82,21 @@ fn images_decode_in_an_isolated_process() {
     assert!(!stderr.contains("MISMATCH"), "decoded pixels corrupted in transit:\n{stderr}");
 }
 
+/// Storage and font are filesystem-capable services renderers can't be: the
+/// renderer round-trips a value through storage and reads font metrics, both
+/// brokered to services that hold `openat` where the renderer denies it. Seeing
+/// these proves the services come up under their (wider) filter and actually
+/// touch the filesystem.
+#[test]
+fn filesystem_services_serve_renderers() {
+    let out = run(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {:?}\nstderr: {stderr}", out.status);
+    assert!(stderr.contains("storage round-trip (ok)"), "storage did not round-trip:\n{stderr}");
+    assert!(stderr.contains("font 'sans' metrics"), "font service gave no metrics:\n{stderr}");
+    assert!(!stderr.contains("MISMATCH"), "storage value corrupted:\n{stderr}");
+}
+
 /// The fault-isolation guarantee: a malformed image is rejected by the decoder,
 /// the engine relays the failure, and *nothing else is disturbed* — the tab
 /// still renders its frame and the engine still shuts down cleanly. A hostile
@@ -515,6 +530,9 @@ mod probe_inventory {
         "forkserver-canary-gap",
         "forkserver-no-exec",
         "forkserver-no-socket",
+        "service-fs-openat",
+        "service-fs-no-socket",
+        "service-device-ioctl",
     ];
 
     /// The Seatbelt profile's enforcement. `PT_DENY_ATTACH` and the rlimits
@@ -660,6 +678,31 @@ mod sandbox_enforcement {
     fn fork_server_cannot_open_a_socket() {
         let st = probe("forkserver-no-socket");
         assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (no network), got {st:?}");
+    }
+
+    /// A filesystem service's filter is the baseline *plus* `openat` — the one
+    /// capability a font/storage service exists to have and a renderer denies.
+    #[test]
+    fn filesystem_service_may_open_files() {
+        let st = probe("service-fs-openat");
+        assert!(st.success(), "the fs filter should permit openat, got {st:?}");
+    }
+
+    /// ...but only that. The wider filter is still a superset of the baseline,
+    /// so network is denied exactly as for a renderer — a storage service
+    /// cannot phone home.
+    #[test]
+    fn filesystem_service_still_has_no_network() {
+        let st = probe("service-fs-no-socket");
+        assert_eq!(st.signal(), Some(SIGSYS), "fs service should have no socket, got {st:?}");
+    }
+
+    /// A device service's filter permits `ioctl` — how a real audio/GPU service
+    /// drives its device. (The stubs do no real work, but the filter is real.)
+    #[test]
+    fn device_service_may_ioctl() {
+        let st = probe("service-device-ioctl");
+        assert!(st.success(), "the device filter should permit ioctl, got {st:?}");
     }
 
     #[test]

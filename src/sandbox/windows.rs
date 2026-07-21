@@ -206,6 +206,20 @@ pub fn lock_down_renderer() {
 /// net component *more* than a renderer (it keeps the network); here neither
 /// role is network-confined in the first place, so there is nothing to
 /// differentiate. That is a gap, not a design choice — see the module docs.
+/// Cap an engine-spawned service.
+///
+/// The `filesystem`/`device` caps are ignored here: the Windows mitigation
+/// policies remove code execution and process creation but do not gate file or
+/// device access (that would need the restricted-token/AppContainer half the
+/// module docs describe as unbuilt). So every service gets the same policy set
+/// as a renderer, and the per-service distinction the Linux backend draws does
+/// not exist on Windows yet.
+#[cfg(feature = "multi-process")]
+pub fn lock_down_service(name: &str, _filesystem: bool, _device: bool) {
+    deny_debugger_attach();
+    lock_down(name);
+}
+
 #[cfg(feature = "multi-process")]
 pub fn lock_down_net() {
     deny_debugger_attach();

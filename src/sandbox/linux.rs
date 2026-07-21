@@ -343,6 +343,47 @@ pub fn lock_down_net() {
     enforce("net", install(allowed));
 }
 
+/// The one syscall a filesystem-capable service needs beyond the baseline:
+/// `openat`. Renderers deny it outright (their filesystem is capped without
+/// Landlock); a font or storage service is *defined* by needing it, which is
+/// exactly why it is a separate process rather than something a renderer does.
+///
+/// Note what seccomp cannot do here: `openat` takes a *path* pointer, which the
+/// filter cannot dereference, so this permits opening *any* file, not a
+/// specific directory. Scoping to a directory is done at the application level
+/// (the service only ever forms paths under its own dir); the real syscall-level
+/// answer is Landlock, flagged as the next step in the module docs.
+#[cfg(feature = "multi-process")]
+const FS_EXTRA: &[libc::c_long] = &[libc::SYS_openat];
+
+/// What a *device*-backed service (audio, GPU) needs: open a device node and
+/// talk to it via `ioctl`. `ioctl` is a large, driver-defined surface that
+/// seccomp constrains poorly (its request codes and pointer arguments are
+/// opaque to the filter), which is precisely why these processes are isolated —
+/// the confinement they get is the process boundary and everything *else* in
+/// the baseline, not a tight filter on the device path itself.
+#[cfg(feature = "multi-process")]
+const DEVICE_EXTRA: &[libc::c_long] = &[libc::SYS_openat, libc::SYS_ioctl];
+
+/// Cap an engine-spawned service — a role that needs a privilege renderers do
+/// not, so it lives outside the zygote and carries its own, wider filter. The
+/// caps select the superset: `filesystem` adds `openat`, `device` adds
+/// `openat` + `ioctl`. Everything else is the same default-deny baseline, so a
+/// storage service still cannot open a socket and an audio service still cannot
+/// spawn a program.
+#[cfg(feature = "multi-process")]
+pub fn lock_down_service(name: &str, filesystem: bool, device: bool) {
+    deny_debugger_attach();
+    let mut allowed = BASELINE.to_vec();
+    if filesystem {
+        allowed.extend_from_slice(FS_EXTRA);
+    }
+    if device {
+        allowed.extend_from_slice(DEVICE_EXTRA);
+    }
+    enforce(name, install(allowed));
+}
+
 #[cfg(feature = "multi-process")]
 fn enforce(role: &str, result: Result<(), Box<dyn std::error::Error>>) {
     match result {

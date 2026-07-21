@@ -16,12 +16,6 @@ impl Child {
     pub fn wait(&mut self) -> io::Result<()> {
         self.0.wait().map(|_| ())
     }
-
-    /// The underlying `std::process::Child`, for the parent-side confinement
-    /// hook (a no-op on Unix, but the seam is shared).
-    pub fn as_std(&self) -> &std::process::Child {
-        &self.0
-    }
 }
 
 /// Spawn `exe` with `args`, handing `child_end` over as an inherited channel.

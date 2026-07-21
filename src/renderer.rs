@@ -66,11 +66,8 @@ pub fn run(origin: &str, link: &str) {
 
 /// The component loop — identical in both modes.
 pub fn serve(mut ep: Endpoint, origin: &str) {
-    loop {
-        let cmd: ToRenderer = match ep.recv() {
-            Ok(cmd) => cmd,
-            Err(_) => break, // engine went away
-        };
+    // Loop ends when `recv` errors (engine went away) or on `Shutdown`.
+    while let Ok(cmd) = ep.recv::<ToRenderer>() {
         match cmd {
             ToRenderer::RenderPage { url } => {
                 if render_page(&mut ep, origin, &url).is_err() {
@@ -129,6 +126,12 @@ fn render_page(ep: &mut Endpoint, origin: &str, url: &str) -> io::Result<()> {
     // the round trip is self-checking.
     decode_image(ep)?;
 
+    // The page uses storage and a web font. Renderers have no filesystem, so
+    // both are brokered to services that do — storage keyed by this renderer's
+    // (zone, origin), the font returning only metrics, never the file.
+    use_storage(ep)?;
+    use_font(ep)?;
+
     // A real renderer parses, styles, lays out and rasterizes here; the PoC
     // ships a placeholder tile of the size the issue budgets per frame.
     send_tile(ep)
@@ -163,6 +166,42 @@ fn decode_image(ep: &mut Endpoint) -> io::Result<()> {
         ToRenderer::DecodeResult(crate::ipc::DecodeOutcome::Failed { reason }) => {
             eprintln!("[renderer] image decode failed: {reason}");
         }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Round-trip a value through the storage service: set it, read it back, and
+/// confirm the bytes match — the acceptance check for the storage channel, and
+/// a demonstration that a renderer with no filesystem still persists per-origin
+/// data through the broker.
+fn use_storage(ep: &mut Endpoint) -> io::Result<()> {
+    use crate::ipc::StorageOp;
+    let value = b"remembered".to_vec();
+    ep.send(&FromRenderer::NeedStorage { op: StorageOp::Set { key: "greeting".into(), value: value.clone() } })?;
+    let _ = ep.recv::<ToRenderer>()?; // Set result (always None)
+
+    ep.send(&FromRenderer::NeedStorage { op: StorageOp::Get { key: "greeting".into() } })?;
+    match ep.recv::<ToRenderer>()? {
+        ToRenderer::StorageResult(got) => {
+            let ok = got.as_deref() == Some(value.as_slice());
+            eprintln!("[renderer] storage round-trip ({})", if ok { "ok" } else { "MISMATCH" });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Ask the font service for a font's metrics — a renderer cannot open the font
+/// file itself, so this shows the derived data coming back from a service that
+/// can, without the file ever entering the renderer.
+fn use_font(ep: &mut Endpoint) -> io::Result<()> {
+    ep.send(&FromRenderer::NeedFont { family: "sans".into() })?;
+    match ep.recv::<ToRenderer>()? {
+        ToRenderer::FontResult(Some(m)) => {
+            eprintln!("[renderer] font '{}' metrics: {} glyphs, {} bytes read", m.family, m.glyphs, m.file_len);
+        }
+        ToRenderer::FontResult(None) => eprintln!("[renderer] font unavailable"),
         _ => {}
     }
     Ok(())

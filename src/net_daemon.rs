@@ -51,11 +51,8 @@ impl Resolver for SyntheticResolver {
 }
 
 pub fn serve(mut ep: Endpoint) {
-    loop {
-        let req: NetRequest = match ep.recv() {
-            Ok(req) => req,
-            Err(_) => break, // engine went away
-        };
+    // Loop ends when `recv` errors (engine went away) or on `Shutdown`.
+    while let Ok(req) = ep.recv::<NetRequest>() {
         match req {
             NetRequest::Shutdown => break,
             NetRequest::Fetch { request_id, for_zone, for_origin, url, cookies } => {

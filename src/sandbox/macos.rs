@@ -96,6 +96,27 @@ pub fn lock_down_net() {
     enforce("net", NET_PROFILE);
 }
 
+/// Cap an engine-spawned service. Seatbelt gates *operations* rather than
+/// syscalls, so the Linux `filesystem`/`device` distinction maps onto profile
+/// clauses: a filesystem service is granted `file-read*`/`file-write*`, a
+/// device service additionally `iokit-open` (the closest analogue to `ioctl`
+/// on a device node). Everything else stays `(deny default)`.
+#[cfg(feature = "multi-process")]
+pub fn lock_down_service(name: &str, filesystem: bool, device: bool) {
+    deny_debugger_attach();
+    let mut profile = String::from("(version 1)\n(deny default)\n");
+    profile.push_str("(allow signal (target self))\n");
+    profile.push_str("(allow process-info* (target self))\n");
+    if filesystem || device {
+        profile.push_str("(allow file-read* file-write*)\n");
+    }
+    if device {
+        profile.push_str("(allow iokit-open)\n");
+    }
+    profile.push('\0');
+    enforce(name, &profile);
+}
+
 /// Apply an SBPL profile to this process, or die trying. Fail-closed, matching
 /// the seccomp precedent: a component meant to be confined must never run as if
 /// it were not.
