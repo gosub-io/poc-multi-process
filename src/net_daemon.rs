@@ -5,6 +5,13 @@
 //! production build would enforce that with seccomp/landlock). In
 //! single-process mode the very same `serve` loop runs as a thread: the
 //! policy checks still apply, but there is no hard boundary behind them.
+//!
+//! Fetching follows redirects, and the SSRF classifier runs on **every hop**,
+//! not just the entry URL — an open redirect to an internal address is the
+//! classic way past an entry-only check. Each hop is re-resolved and re-pinned
+//! through the [`Resolver`] seam, the chain is bounded, and a redirect that
+//! crosses an origin drops the request's cookies rather than leaking them
+//! onward. See [`handle_fetch`].
 
 use crate::ip_utils::{resolve_and_pin, Resolver};
 use crate::ipc::{Endpoint, FetchOutcome, NetRequest, NetResponse};
@@ -77,7 +84,7 @@ pub fn serve(mut ep: Endpoint) {
                 // route it back to the tab that asked, even with many
                 // fetches in flight.
                 let requester = format!("zone-{for_zone}/{for_origin}");
-                let outcome = handle_fetch(&requester, &url, &cookies);
+                let outcome = handle_fetch(&requester, &url, &cookies, &SyntheticResolver);
                 let resp = NetResponse { request_id, outcome };
                 if ep.send(&resp).is_err() {
                     break;
@@ -152,42 +159,287 @@ fn stream_blob(ep: &mut Endpoint, request_id: u64, body_len: u64) -> std::io::Re
     Ok(())
 }
 
-/// `requester` is the `zone-N/origin` identity as recorded by the engine; a
-/// real implementation uses it for per-partition network policy. `cookies` are
-/// that partition's cookies (including HttpOnly) the engine wants attached to
-/// this request — the net component is the only process outside the engine
-/// that sees their values.
-fn handle_fetch(_requester: &str, url: &str, cookies: &[(String, String)]) -> FetchOutcome {
-    // Policy and destination in one step: what comes back is the address a
-    // real component would connect to, not a verdict it would then re-resolve.
-    let _pinned = match resolve_and_pin(url, &SyntheticResolver) {
-        Ok(pinned) => pinned,
-        Err(reason) => return FetchOutcome::Denied { reason },
-    };
-    // A large body on a transport without fd passing (single-process mode,
-    // or the bench's forced-socket comparison) is copied in-band — if it
-    // fits. The 16 MiB frame cap is DoS protection and stays authoritative:
-    // beyond it the honest answer is a refusal, not a raised limit.
-    if let Some(body_len) = blob_len(url) {
-        const MAX_INLINE_BLOB: u64 = 12 * 1024 * 1024; // frame cap minus headroom
-        if body_len > MAX_INLINE_BLOB {
-            return FetchOutcome::Denied {
-                reason: "body too large for in-band transport (needs the shm ring)".into(),
-            };
-        }
-        let mut body = vec![0u8; body_len as usize];
-        for (i, b) in body.iter_mut().enumerate() {
-            *b = body_pattern(i);
-        }
-        return FetchOutcome::Ok { status: 200, body };
+/// Redirect chain bound. Large enough for real navigation, small enough that a
+/// redirect *loop* terminates as a refusal rather than spinning forever. Every
+/// mainstream browser caps this around 20; 10 is plenty for the PoC.
+const MAX_REDIRECTS: u32 = 10;
+
+/// What the (synthetic) origin server returns for one request: a body, or a
+/// redirect the client must follow. Real HTTP lives here in a production
+/// component; the PoC models just enough to exercise the redirect-following
+/// policy — which is the security-relevant part.
+enum ServerReply {
+    Body { status: u16, body: Vec<u8> },
+    Redirect { location: String },
+}
+
+/// The (synthetic) origin server. Recognised paths:
+/// - `/redirect-loop…` redirects to itself (exercises the hop cap).
+/// - `/relative-redirect` returns `Location: /landing` (root-relative, same origin).
+/// - `/redirect/<rest>` returns `Location: <rest>` when `<rest>` carries a
+///   scheme, else `http://<rest>/` — a targeted, usually cross-origin redirect,
+///   the open-redirect an SSRF abuses.
+/// - anything else is a 200 body naming how many cookies were attached.
+fn synthetic_server(url: &str, cookies: &[(String, String)]) -> ServerReply {
+    let path = path_of(url);
+    if path.starts_with("/redirect-loop") {
+        return ServerReply::Redirect { location: url.to_string() };
     }
-    // A real implementation would set `Cookie: name=value; ...` on the
-    // outbound request from `cookies` and perform the HTTP fetch here; the PoC
+    if path.starts_with("/relative-redirect") {
+        return ServerReply::Redirect { location: "/landing".into() };
+    }
+    if let Some(rest) = path.strip_prefix("/redirect/") {
+        let location =
+            if rest.contains("://") { rest.to_string() } else { format!("http://{rest}/") };
+        return ServerReply::Redirect { location };
+    }
+    // A real implementation would set `Cookie: name=value; ...` on the outbound
+    // request from `cookies` and perform the HTTP fetch here; the PoC
     // synthesizes the response so it runs offline and deterministically.
-    let body = format!(
-        "<html><!-- 200 OK for {url}; {} cookie(s) attached --></html>",
-        cookies.len()
-    )
-    .into_bytes();
-    FetchOutcome::Ok { status: 200, body }
+    let body =
+        format!("<html><!-- 200 OK for {url}; {} cookie(s) attached --></html>", cookies.len())
+            .into_bytes();
+    ServerReply::Body { status: 200, body }
+}
+
+/// The path (with any query/fragment) of a URL, or `/` if it has none.
+fn path_of(url: &str) -> &str {
+    match url.split_once("://") {
+        Some((_, rest)) => match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => "/",
+        },
+        None => "/",
+    }
+}
+
+/// `scheme://authority` of a URL, for resolving root-relative redirects and
+/// comparing origins. Deliberately coarse (keeps userinfo/port verbatim): a
+/// mismatch only makes a cookie decision err on the *drop* side.
+fn origin_prefix(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    (!authority.is_empty()).then(|| format!("{scheme}://{authority}"))
+}
+
+/// Whether two URLs share a `scheme://authority`. Used to decide if cookies may
+/// follow a redirect.
+fn same_authority(a: &str, b: &str) -> bool {
+    match (origin_prefix(a), origin_prefix(b)) {
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(&y),
+        _ => false,
+    }
+}
+
+/// Resolve a `Location` against the URL it was returned from: an absolute URL
+/// (has a scheme) is used as-is; a root-relative path is joined onto the current
+/// origin. Anything else (a bare relative path) is not modeled → `None`.
+fn resolve_redirect_target(current: &str, location: &str) -> Option<String> {
+    if location.contains("://") {
+        Some(location.to_string())
+    } else if let Some(path) = location.strip_prefix('/') {
+        Some(format!("{}/{}", origin_prefix(current)?, path))
+    } else {
+        None
+    }
+}
+
+/// Perform a fetch, following the server's redirects.
+///
+/// `requester` is the `zone-N/origin` identity the engine recorded; a real
+/// component uses it for per-partition network policy. `cookies` are that
+/// partition's cookies (including HttpOnly) the engine wants attached — the net
+/// component is the only process outside the engine that sees their values.
+///
+/// The security-critical property is that [`resolve_and_pin`] runs on **every**
+/// hop, the entry URL and each `Location` alike. An entry-only check is a
+/// classic SSRF hole: the entry is public, the server 302s to
+/// `http://169.254.169.254/`, and a naive client follows it. Here each hop is
+/// re-resolved and re-pinned, so a redirect into blocked space is refused even
+/// when the entry was allowed, and the chain is bounded by [`MAX_REDIRECTS`] so
+/// a loop terminates.
+///
+/// Cookies do not cross an origin boundary. The engine handed us *this* origin's
+/// cookies, so a redirect to a different origin drops them rather than leaking
+/// them onward — a redirect-following fetcher that kept them would send one
+/// origin's session token to another host. A real component would instead ask
+/// the engine for the new origin's cookies; dropping is the safe subset.
+fn handle_fetch(
+    _requester: &str,
+    start_url: &str,
+    cookies: &[(String, String)],
+    resolver: &impl Resolver,
+) -> FetchOutcome {
+    let mut url = start_url.to_string();
+    let mut carry_cookies = true;
+    let mut hops = 0u32;
+
+    loop {
+        // Policy + destination for THIS hop — re-resolved and re-pinned every
+        // iteration. `_pinned.addr` is the address a real component would
+        // connect to (connecting to the *name* would re-resolve and undo it).
+        if let Err(reason) = resolve_and_pin(&url, resolver) {
+            return FetchOutcome::Denied { reason };
+        }
+
+        // A large body is terminal and copied in-band here (the streaming path
+        // in `serve` handles it when fd-passing is available). The 16 MiB frame
+        // cap stays authoritative: beyond it the honest answer is a refusal.
+        if let Some(body_len) = blob_len(&url) {
+            const MAX_INLINE_BLOB: u64 = 12 * 1024 * 1024; // frame cap minus headroom
+            if body_len > MAX_INLINE_BLOB {
+                return FetchOutcome::Denied {
+                    reason: "body too large for in-band transport (needs the shm ring)".into(),
+                };
+            }
+            let mut body = vec![0u8; body_len as usize];
+            for (i, b) in body.iter_mut().enumerate() {
+                *b = body_pattern(i);
+            }
+            return FetchOutcome::Ok { status: 200, body };
+        }
+
+        let effective: &[(String, String)] = if carry_cookies { cookies } else { &[] };
+        match synthetic_server(&url, effective) {
+            ServerReply::Body { status, body } => return FetchOutcome::Ok { status, body },
+            ServerReply::Redirect { location } => {
+                hops += 1;
+                if hops > MAX_REDIRECTS {
+                    return FetchOutcome::Denied {
+                        reason: format!("too many redirects (> {MAX_REDIRECTS})"),
+                    };
+                }
+                let Some(next) = resolve_redirect_target(&url, &location) else {
+                    return FetchOutcome::Denied {
+                        reason: format!("unfollowable redirect Location: {location}"),
+                    };
+                };
+                // Once a hop leaves the original origin, this origin's cookies
+                // stop travelling — and do not come back on a redirect home.
+                if carry_cookies && !same_authority(&url, &next) {
+                    carry_cookies = false;
+                }
+                url = next;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ip_utils::Resolver;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// A resolver where one name points into private space and everything else
+    /// is public — so a hop to `internal.example` proves the per-hop check
+    /// re-*resolves* (not merely re-classifies an IP literal).
+    struct RedirectResolver;
+    impl Resolver for RedirectResolver {
+        fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            Ok(match host.to_ascii_lowercase().as_str() {
+                "internal.example" => vec![ip("10.0.0.5")],
+                _ => vec![ip("93.184.216.34")],
+            })
+        }
+    }
+
+    fn body_text(o: &FetchOutcome) -> String {
+        match o {
+            FetchOutcome::Ok { body, .. } => String::from_utf8_lossy(body).into_owned(),
+            other => panic!("expected an Ok body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follows_a_redirect_to_a_public_body() {
+        let out =
+            handle_fetch("r", "https://example.com/redirect/example.com", &[], &RedirectResolver);
+        assert!(matches!(out, FetchOutcome::Ok { status: 200, .. }));
+    }
+
+    /// The property #4 exists for: entry public, `Location` link-local (cloud
+    /// metadata). An entry-only check would have followed it.
+    #[test]
+    fn a_redirect_to_an_internal_literal_is_refused_at_the_hop() {
+        let out = handle_fetch(
+            "r",
+            "https://example.com/redirect/169.254.169.254",
+            &[],
+            &RedirectResolver,
+        );
+        match out {
+            FetchOutcome::Denied { reason } => {
+                assert!(reason.contains("169.254"), "reason should name the address: {reason}");
+                assert!(reason.contains("SSRF"), "reason should cite the policy: {reason}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    /// Proves the hop is re-*resolved*: the `Location` is a bare name only the
+    /// resolver knows maps to 10.0.0.5.
+    #[test]
+    fn a_redirect_to_a_name_resolving_internal_is_refused() {
+        let out = handle_fetch(
+            "r",
+            "https://example.com/redirect/internal.example",
+            &[],
+            &RedirectResolver,
+        );
+        match out {
+            FetchOutcome::Denied { reason } => {
+                assert!(reason.contains("10.0.0.5"), "reason should name the address: {reason}")
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_redirect_loop_terminates_as_too_many_redirects() {
+        let out = handle_fetch("r", "https://example.com/redirect-loop", &[], &RedirectResolver);
+        match out {
+            FetchOutcome::Denied { reason } => {
+                assert!(reason.contains("too many redirects"), "{reason}")
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_internal_entry_url_is_still_refused() {
+        let out = handle_fetch("r", "http://127.0.0.1/", &[], &RedirectResolver);
+        assert!(matches!(out, FetchOutcome::Denied { .. }));
+    }
+
+    /// A redirect that changes origin must not carry this origin's cookies; a
+    /// same-origin (root-relative) redirect keeps them.
+    #[test]
+    fn cookies_do_not_cross_an_origin_boundary_on_redirect() {
+        let cookies = vec![("sid".to_string(), "secret".to_string())];
+
+        let out = handle_fetch(
+            "r",
+            "https://example.com/redirect/other.example",
+            &cookies,
+            &RedirectResolver,
+        );
+        assert!(
+            body_text(&out).contains("0 cookie"),
+            "cookies must not follow a cross-origin redirect: {}",
+            body_text(&out)
+        );
+
+        let out =
+            handle_fetch("r", "https://example.com/relative-redirect", &cookies, &RedirectResolver);
+        assert!(
+            body_text(&out).contains("1 cookie"),
+            "a same-origin redirect keeps cookies: {}",
+            body_text(&out)
+        );
+    }
 }

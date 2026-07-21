@@ -205,8 +205,15 @@ capability the zygote gave up cannot be its child.
   Subnet-directed broadcast (`x.y.z.255`) is knowingly not classified — it
   depends on the local netmask, and refusing every `.255` would break
   legitimate public hosts.
-  It can't resolve *hostnames* offline; a real one resolves DNS, re-checks the
-  resolved IPs, and pins that IP for the connection to defeat DNS rebinding.
+  Hostnames resolve through a pluggable resolver seam (the PoC's is synthetic
+  and offline; a deployment selects `SystemResolver`): every resolved IP is
+  classified and the survivor is *pinned* as the address to connect to, so there
+  is no second lookup left to poison (DNS rebinding). **Redirects are followed
+  with the same classification re-run on every hop** — an open redirect to
+  `169.254.169.254` is refused even when the entry URL was public, and the chain
+  is bounded so a redirect loop terminates as a refusal. A redirect that leaves
+  the original origin drops the request's cookies rather than leaking one
+  origin's session token to another host.
 - Renderers are **sandboxed at the OS level** (Linux): after connecting their
   IPC link, they install a default-deny seccomp-BPF **allowlist** permitting
   only a curated baseline (I/O on existing fds, memory, futex, signals, time).
@@ -411,7 +418,9 @@ a real security boundary with a process behind them.
 
 - **Unit tests** (in `src/`) cover the pure policy/logic deterministically: the
   SSRF classifier (internal ranges, alternate IP encodings, IPv6,
-  userinfo/trailing-dot bypasses), the cookie broker (`(zone, origin)`
+  userinfo/trailing-dot bypasses), redirect following (per-hop SSRF re-check,
+  the hop-count bound, and cookies not crossing an origin), the cookie broker
+  (`(zone, origin)`
   partitioning + HttpOnly hiding), IPC frame round-trip and oversized-length
   rejection, the per-source backpressure `Gate`, the storage quota admission
   (per-value cap, overwrite-as-delta, saturating arithmetic), and origin
@@ -517,9 +526,10 @@ simplified is the surrounding browser. What each entry below still needs:
   handles one request at a time (the engine doesn't block on it, but a real
   daemon would fetch concurrently — with the ring transport that matters
   more, since one slow-draining body stream now occupies the component until
-  it completes or hits the 5 s stall timeout). The SSRF filter classifies IP literals but
-  can't resolve hostnames offline — production resolves DNS, re-checks the
-  result, and pins the IP against rebinding.
+  it completes or hits the 5 s stall timeout). The SSRF filter resolves through
+  a resolver seam and pins the result (the PoC's resolver is synthetic; a
+  deployment selects `SystemResolver`), and redirects are followed with the
+  classifier re-run on every hop — but real DNS and real HTTP are still stubbed.
 - **Event loop & writes**: std threads + mpsc instead of tokio; the real
   engine's worker loops are `select!`-based async tasks. The loop's replies to
   components are *blocking* socket writes, so a renderer that floods requests
