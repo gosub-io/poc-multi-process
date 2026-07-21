@@ -23,9 +23,17 @@ jobs:
   # Two of those were found by running this suite under a libc other than the
   # developer's, and would not have been found any other way. That is what this
   # job is for.
+  #
+  # The aarch64 rows extend it from libc to *architecture*: the seccomp target
+  # arch, the raw syscall numbers, the SIGSYS reporter's `si_syscall` offset in
+  # `siginfo_t`, and the fork path (aarch64 has no `SYS_fork` at all, so glibc
+  # and musl both reach `clone`/`clone3`) are all arch-specific and only ever
+  # *run* — as opposed to type-checked by `cross-compile` — here. The arm64
+  # rows need an arm64 runner, which GitHub provides free for public repos
+  # (`ubuntu-24.04-arm`); on a private repo they require the paid arm runners.
   linux-libc-matrix:
     name: linux (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs-on || 'ubuntu-latest' }}
     # A cap, not a budget: these finish in well under a minute. The default is
     # 360, and the first run of this workflow spent hours on a wedged musl job
     # before it was cancelled by hand. A hang should cost minutes and report.
@@ -43,13 +51,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: glibc 2.36 (debian bookworm)
+          # x86_64: three libcs (default runner).
+          - name: glibc 2.36 x86_64 (debian bookworm)
             image: rust:1-bookworm
-          - name: glibc 2.39 (debian trixie)
+          - name: glibc 2.39 x86_64 (debian trixie)
             image: rust:1-trixie
-          - name: musl (alpine)
+          - name: musl x86_64 (alpine)
             image: rust:1-alpine
             setup: apk add --no-cache musl-dev
+          # aarch64: same two libcs on a native arm64 runner, so the
+          # arch-specific sandbox paths are enforced by a real kernel (qemu-user
+          # would not faithfully apply guest seccomp). The multi-arch `rust:1-*`
+          # images resolve to their arm64 variants automatically here.
+          - name: glibc 2.39 aarch64 (debian trixie)
+            image: rust:1-trixie
+            runs-on: ubuntu-24.04-arm
+          - name: musl aarch64 (alpine)
+            image: rust:1-alpine
+            setup: apk add --no-cache musl-dev
+            runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -114,6 +134,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --all-targets
+
+  # Build and briefly run each fuzz target. The point is to keep the harness (and
+  # the untrusted-input parsers it covers — the image decoder, the broker's IPC
+  # deserialization, the SSRF URL parser) from bit-rotting, and to surface a new
+  # *shallow* crash as a red build. This is a smoke test, not a campaign: a few
+  # seconds per target finds a broken build or an immediate panic, not a deep
+  # bug. A real campaign belongs in a scheduled job with a persisted corpus.
+  fuzz-smoke:
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-fuzz targets are `#![no_main]` libFuzzer binaries and need nightly.
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run each target briefly
+        run: |
+          for target in decode_image ipc_frame ssrf_url; do
+            echo "=== $target ==="
+            cargo fuzz run "$target" -- -max_total_time=30 -print_final_stats=1
+          done
 
   # Advisory, deliberately: the tree is not currently clean under either tool.
   # There is no rustfmt.toml and the code is written wider than default rustfmt
