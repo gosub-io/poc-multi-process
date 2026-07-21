@@ -142,20 +142,24 @@ capability the zygote gave up cannot be its child.
   would reintroduce the cross-origin channel the per-`(zone,origin)` split
   closes. The per-image fork is what the warm fork server makes cheap.
 
-- **Filesystem-capable services are separate processes with a wider filter.**
-  Renderers deny `openat` outright — the property that caps their filesystem
-  without Landlock — which is only sustainable while nothing renders real text
-  or persists data. So storage (the `localStorage`/`IndexedDB` stand-in) and
-  the font service run outside the zygote with a `baseline + openat` filter.
-  Storage is keyed by the `(zone, origin)` the *engine* stamps, never a claim
-  in the message, so a renderer cannot read another origin's data; and the
-  renderer's key is hashed into the filename rather than spliced into a path,
-  since `openat`'s path argument is one seccomp cannot restrict (Landlock is
-  the syscall-level answer, still the next step). **Audio and GPU are honest
-  stubs**: real processes with the correct device filter (`baseline + openat +
-  ioctl`) and empty netns, but no real work — a PoC has no hardware to drive,
-  and `ioctl` is a large surface seccomp constrains poorly, so the isolation
-  they show is the process boundary, not a tight filter.
+- **Filesystem-capable services are separate processes with a wider filter,
+  path-confined by Landlock.** Renderers deny `openat` outright — the property
+  that caps their filesystem — which is only sustainable while nothing renders
+  real text or persists data. So storage (the `localStorage`/`IndexedDB`
+  stand-in) and the font service run outside the zygote with a `baseline +
+  openat` filter. That grants `openat` on *any* path, because seccomp sees only
+  the syscall number, never the path pointer — so **Landlock** confines *which*
+  paths: each service declares a ruleset of `(directory, rights)` and the kernel
+  enforces it, scoping storage to its own dir and the font service to its one
+  read-only file. Storage is additionally keyed by the `(zone, origin)` the
+  *engine* stamps (never a message claim), and the renderer's key is hashed into
+  the filename rather than spliced into a path — so path traversal is guarded at
+  the application level *and* by the kernel. Landlock is best-effort: a kernel
+  without it degrades to seccomp + the hashing, rather than refusing to start.
+  **Audio and GPU are honest stubs**: real processes with the correct device
+  filter (`baseline + openat + ioctl`) and empty netns, but no real work — a PoC
+  has no hardware to drive, and `ioctl` is a large surface seccomp constrains
+  poorly, so the isolation they show is the process boundary, not a tight filter.
 
 - Renderers hold no secrets: cookies and network access live in the engine
   and net component. A renderer can only send IPC messages, and every message
@@ -454,12 +458,12 @@ simplified is the surrounding browser. What each entry below still needs:
   `/proc/<pid>/mem` — the engine's cookie jar is the obvious target, and this is
   the inbound direction that seccomp has no say over. It is set after `execve`,
   which resets the flag; it survives `fork`, so renderers inherit it from the
-  fork server. Still missing for a real
-  deployment: a per-arch baseline tested across libc/kernel versions,
-  filesystem restriction (Landlock), and the remaining namespaces
-  (mount/PID/IPC) plus `pivot_root`. A real JS JIT needs executable memory, so
-  it would carve out a dedicated JIT exception rather than deny `PROT_EXEC`
-  outright.
+  fork server. Filesystem restriction with **Landlock** is now used by the
+  filesystem services (storage, font) to path-confine their `openat`; still
+  missing for a real deployment: a per-arch baseline tested across libc/kernel
+  versions, and the remaining namespaces (mount/PID/IPC) plus `pivot_root`. A
+  real JS JIT needs executable memory, so it would carve out a dedicated JIT
+  exception rather than deny `PROT_EXEC` outright.
 
   **Platform status.** Linux is the reference implementation: seccomp, an empty
   netns, rlimits, non-dumpable processes, 12 probes. macOS runs a Seatbelt

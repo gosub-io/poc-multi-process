@@ -88,9 +88,14 @@ pub fn run(link: &str) {
     // SAFETY: the engine passed us sole ownership of this inherited channel.
     let ch = unsafe { crate::channel::Channel::from_argv(link) }.expect("storage: bad link arg");
     let ep = Endpoint::from_channel(ch).expect("storage: wrap link");
+    // Landlock scopes the service's filesystem to exactly its storage dir — so
+    // even a bug that formed a path outside it (the key-hashing is the other
+    // guard) cannot open one.
+    let dir = storage_dir();
     crate::sandbox::lock_down_service(
         "storage",
         crate::sandbox::ServiceCaps { filesystem: true, device: false },
+        &[(dir.as_path(), true)],
     );
     serve(ep);
 }

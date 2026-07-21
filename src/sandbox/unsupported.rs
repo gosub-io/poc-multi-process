@@ -28,7 +28,7 @@ pub fn lock_down_net() {}
 /// No confinement here either; the service runs unconfined like everything else
 /// on this platform.
 #[cfg(feature = "multi-process")]
-pub fn lock_down_service(name: &str, _filesystem: bool, _device: bool) {
+pub fn lock_down_service(name: &str, _filesystem: bool, _device: bool, _fs_allow: &[(&std::path::Path, bool)]) {
     eprintln!("[{name}] no sandbox on this platform — running unconfined");
 }
 

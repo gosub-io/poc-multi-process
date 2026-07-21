@@ -215,7 +215,7 @@ pub fn lock_down_renderer() {
 /// as a renderer, and the per-service distinction the Linux backend draws does
 /// not exist on Windows yet.
 #[cfg(feature = "multi-process")]
-pub fn lock_down_service(name: &str, _filesystem: bool, _device: bool) {
+pub fn lock_down_service(name: &str, _filesystem: bool, _device: bool, _fs_allow: &[(&std::path::Path, bool)]) {
     deny_debugger_attach();
     lock_down(name);
 }

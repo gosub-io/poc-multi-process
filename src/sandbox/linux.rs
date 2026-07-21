@@ -348,13 +348,213 @@ pub fn lock_down_net() {
 /// Landlock); a font or storage service is *defined* by needing it, which is
 /// exactly why it is a separate process rather than something a renderer does.
 ///
-/// Note what seccomp cannot do here: `openat` takes a *path* pointer, which the
-/// filter cannot dereference, so this permits opening *any* file, not a
-/// specific directory. Scoping to a directory is done at the application level
-/// (the service only ever forms paths under its own dir); the real syscall-level
-/// answer is Landlock, flagged as the next step in the module docs.
+/// Seccomp permits `openat` on *any* path — the argument is a pointer the
+/// filter cannot dereference — so *which* files a service may touch is confined
+/// by Landlock instead ([`landlock`]), not by this list.
 #[cfg(feature = "multi-process")]
 const FS_EXTRA: &[libc::c_long] = &[libc::SYS_openat];
+
+/// Landlock: filesystem access control by *path*, the thing seccomp cannot do.
+///
+/// A filesystem service gets `openat` in its seccomp filter — but seccomp sees
+/// only the syscall number and registers, never the path string a pointer
+/// points at, so it cannot say "under `/tmp/gosub-storage` but not
+/// `/etc/shadow`". Landlock can: you declare a ruleset of `(directory, rights)`
+/// and the kernel enforces it on every path resolution. Here it turns the
+/// storage service's key-hashing from the *only* guard against path traversal
+/// into defense in depth behind a kernel boundary.
+///
+/// It is applied *before* seccomp: its own syscalls and the `open(O_PATH)` used
+/// to anchor a rule then run unfiltered, and once installed only path access is
+/// restricted, not the syscall set. It is **best-effort** — Landlock needs a
+/// kernel built with it and listed in `lsm=`, which not every host has — so an
+/// absence degrades to seccomp + application-level scoping rather than refusing
+/// to start. `libc` exposes the three syscall numbers but not the ABI structs
+/// or rights bits, so those are declared here; the ABI version is queried and
+/// rights beyond it are masked off (a newer right on an older kernel makes
+/// `create_ruleset` reject the whole thing).
+#[cfg(feature = "multi-process")]
+mod landlock {
+    use std::os::fd::RawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    // Access-right bits (ABI v1 unless noted). From the Landlock uapi.
+    const EXECUTE: u64 = 1 << 0;
+    const WRITE_FILE: u64 = 1 << 1;
+    const READ_FILE: u64 = 1 << 2;
+    const READ_DIR: u64 = 1 << 3;
+    const REMOVE_DIR: u64 = 1 << 4;
+    const REMOVE_FILE: u64 = 1 << 5;
+    const MAKE_CHAR: u64 = 1 << 6;
+    const MAKE_DIR: u64 = 1 << 7;
+    const MAKE_REG: u64 = 1 << 8;
+    const MAKE_SOCK: u64 = 1 << 9;
+    const MAKE_FIFO: u64 = 1 << 10;
+    const MAKE_BLOCK: u64 = 1 << 11;
+    const MAKE_SYM: u64 = 1 << 12;
+    const REFER: u64 = 1 << 13; // ABI v2
+    const TRUNCATE: u64 = 1 << 14; // ABI v3
+
+    const CREATE_RULESET_VERSION: u32 = 1 << 0;
+    const RULE_PATH_BENEATH: libc::c_int = 1;
+
+    #[repr(C)]
+    struct RulesetAttr {
+        handled_access_fs: u64,
+    }
+
+    #[repr(C)]
+    struct PathBeneathAttr {
+        allowed_access: u64,
+        parent_fd: RawFd,
+    }
+
+    /// The supported ABI version, or `-1`/`0` when Landlock is unavailable.
+    fn abi() -> i32 {
+        // SAFETY: create_ruleset(NULL, 0, VERSION) is the documented probe; it
+        // returns the ABI version and creates nothing.
+        unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<RulesetAttr>(),
+                0usize,
+                CREATE_RULESET_VERSION,
+            ) as i32
+        }
+    }
+
+    /// Whether Landlock is usable on this kernel.
+    pub fn available() -> bool {
+        abi() >= 1
+    }
+
+    /// Every fs right this ABI knows — the set the ruleset *handles* (anything
+    /// handled but not granted by a rule is denied). Masked to the ABI so an
+    /// unsupported bit does not make `create_ruleset` fail.
+    fn handled(abi: i32) -> u64 {
+        let mut h = EXECUTE
+            | WRITE_FILE
+            | READ_FILE
+            | READ_DIR
+            | REMOVE_DIR
+            | REMOVE_FILE
+            | MAKE_CHAR
+            | MAKE_DIR
+            | MAKE_REG
+            | MAKE_SOCK
+            | MAKE_FIFO
+            | MAKE_BLOCK
+            | MAKE_SYM;
+        if abi >= 2 {
+            h |= REFER;
+        }
+        if abi >= 3 {
+            h |= TRUNCATE;
+        }
+        h
+    }
+
+    /// Rights to grant one path. Directory-only rights (`READ_DIR`, `MAKE_REG`,
+    /// `REMOVE_FILE`) must not be set on a *file* path or `add_rule` rejects the
+    /// whole ruleset with `EINVAL` — so the grant depends on `is_dir`.
+    fn grant(is_dir: bool, writable: bool, abi: i32) -> u64 {
+        let mut a = READ_FILE;
+        if is_dir {
+            a |= READ_DIR;
+        }
+        if writable {
+            a |= WRITE_FILE;
+            if abi >= 3 {
+                a |= TRUNCATE;
+            }
+            if is_dir {
+                // Create and remove entries under the directory.
+                a |= MAKE_REG | REMOVE_FILE;
+            }
+        }
+        a
+    }
+
+    /// Restrict this thread's filesystem access to exactly `rules`
+    /// `(path, writable)`. `Ok(true)` = applied, `Ok(false)` = Landlock
+    /// unavailable (caller degrades to seccomp), `Err` = a real failure.
+    pub fn restrict(rules: &[(&Path, bool)]) -> std::io::Result<bool> {
+        let abi = abi();
+        if abi < 1 {
+            return Ok(false);
+        }
+        let attr = RulesetAttr { handled_access_fs: handled(abi) };
+        // SAFETY: valid attr pointer with its size; flags 0.
+        let rs = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                &attr as *const RulesetAttr,
+                std::mem::size_of::<RulesetAttr>(),
+                0u32,
+            )
+        };
+        if rs < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let rs = rs as RawFd;
+
+        for (path, writable) in rules {
+            let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+            // SAFETY: NUL-terminated path; O_PATH just anchors the rule.
+            let pfd = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+            if pfd < 0 {
+                let e = std::io::Error::last_os_error();
+                unsafe { libc::close(rs) };
+                return Err(e);
+            }
+            let rule = PathBeneathAttr {
+                allowed_access: grant(path.is_dir(), *writable, abi) & handled(abi),
+                parent_fd: pfd,
+            };
+            // SAFETY: valid ruleset fd, rule pointer, and rule type.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_landlock_add_rule,
+                    rs,
+                    RULE_PATH_BENEATH,
+                    &rule as *const PathBeneathAttr,
+                    0u32,
+                )
+            };
+            unsafe { libc::close(pfd) };
+            if rc < 0 {
+                let e = std::io::Error::last_os_error();
+                unsafe { libc::close(rs) };
+                return Err(e);
+            }
+        }
+
+        // restrict_self requires NO_NEW_PRIVS (the seccomp install would set it
+        // too, but that runs later).
+        // SAFETY: a one-way prctl switch.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(rs) };
+            return Err(e);
+        }
+        // SAFETY: valid ruleset fd; flags 0.
+        let rc = unsafe { libc::syscall(libc::SYS_landlock_restrict_self, rs, 0u32) };
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(rs) };
+        if rc < 0 {
+            return Err(e);
+        }
+        Ok(true)
+    }
+}
+
+/// Whether Landlock is usable on this host (for probes and diagnostics).
+#[cfg(feature = "multi-process")]
+pub fn landlock_available() -> bool {
+    landlock::available()
+}
 
 /// What a *device*-backed service (audio, GPU) needs: open a device node and
 /// talk to it via `ioctl`. `ioctl` is a large, driver-defined surface that
@@ -372,8 +572,24 @@ const DEVICE_EXTRA: &[libc::c_long] = &[libc::SYS_openat, libc::SYS_ioctl];
 /// storage service still cannot open a socket and an audio service still cannot
 /// spawn a program.
 #[cfg(feature = "multi-process")]
-pub fn lock_down_service(name: &str, filesystem: bool, device: bool) {
+pub fn lock_down_service(name: &str, filesystem: bool, device: bool, fs_allow: &[(&std::path::Path, bool)]) {
     deny_debugger_attach();
+
+    // Landlock first (see the module doc): it runs before the seccomp filter so
+    // its own syscalls and the O_PATH opens are unfiltered, and it confines
+    // *which* paths the coming `openat` may reach. Best-effort — a kernel
+    // without Landlock leaves seccomp + application-level path scoping as the
+    // guard rather than refusing to start.
+    if !fs_allow.is_empty() {
+        match landlock::restrict(fs_allow) {
+            Ok(true) => eprintln!("[{name}] landlock active (filesystem scoped to its own paths)"),
+            Ok(false) => {
+                eprintln!("[{name}] landlock unavailable on this kernel; seccomp + path scoping only")
+            }
+            Err(e) => eprintln!("[{name}] landlock could not be applied ({e}); seccomp + path scoping only"),
+        }
+    }
+
     let mut allowed = BASELINE.to_vec();
     if filesystem {
         allowed.extend_from_slice(FS_EXTRA);

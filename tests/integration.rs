@@ -533,6 +533,7 @@ mod probe_inventory {
         "service-fs-openat",
         "service-fs-no-socket",
         "service-device-ioctl",
+        "service-landlock",
     ];
 
     /// The Seatbelt profile's enforcement. `PT_DENY_ATTACH` and the rlimits
@@ -703,6 +704,17 @@ mod sandbox_enforcement {
     fn device_service_may_ioctl() {
         let st = probe("service-device-ioctl");
         assert!(st.success(), "the device filter should permit ioctl, got {st:?}");
+    }
+
+    /// Landlock does what seccomp cannot: confine `openat` to specific paths. A
+    /// service scoped to a directory may open files inside it but is denied
+    /// (EACCES) outside — even though seccomp still permits the `openat` syscall.
+    /// Skips cleanly where the kernel lacks Landlock, so it never fails an
+    /// untestable host (the probe exits 0 in that case).
+    #[test]
+    fn landlock_scopes_a_service_to_its_directory() {
+        let st = probe("service-landlock");
+        assert!(st.success(), "landlock should confine openat to the ruleset, got {st:?}");
     }
 
     #[test]

@@ -62,9 +62,12 @@ pub fn run(link: &str) {
     // SAFETY: the engine passed us sole ownership of this inherited channel.
     let ch = unsafe { crate::channel::Channel::from_argv(link) }.expect("font: bad link arg");
     let ep = Endpoint::from_channel(ch).expect("font: wrap link");
+    // Landlock scopes the service to just its one (read-only) font file.
+    let file = font_file();
     crate::sandbox::lock_down_service(
         "font",
         crate::sandbox::ServiceCaps { filesystem: true, device: false },
+        &[(file.as_path(), false)],
     );
     serve(ep);
 }

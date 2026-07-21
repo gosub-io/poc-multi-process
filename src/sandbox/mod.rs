@@ -169,10 +169,19 @@ pub struct ServiceCaps {
 
 /// Confine an engine-spawned service to the content baseline plus exactly the
 /// capability `caps` selects. `name` is the label in its lockdown banner.
-/// Fail-closed like the other lockdowns.
+///
+/// `fs_allow` names the directories/files a filesystem service may touch, each
+/// with a `writable` flag. On Linux these become a Landlock ruleset that
+/// confines the service's `openat` to exactly those paths — the path-level
+/// guard seccomp cannot provide. Ignored on platforms whose confinement gates
+/// files another way (macOS) or not at all (Windows). Empty for device
+/// services and where no path scoping applies.
+///
+/// Fail-closed on the seccomp/profile install like the other lockdowns; the
+/// Landlock portion is best-effort (see the Linux backend).
 #[cfg(feature = "multi-process")]
-pub fn lock_down_service(name: &str, caps: ServiceCaps) {
-    imp::lock_down_service(name, caps.filesystem, caps.device);
+pub fn lock_down_service(name: &str, caps: ServiceCaps, fs_allow: &[(&std::path::Path, bool)]) {
+    imp::lock_down_service(name, caps.filesystem, caps.device, fs_allow);
 }
 
 /// Apply parent-side confinement to a child that has just been spawned.
@@ -222,6 +231,13 @@ pub fn get_mitigation_policy(
     policy: ::windows_sys::Win32::System::Threading::PROCESS_MITIGATION_POLICY,
 ) -> std::io::Result<u32> {
     imp::get_policy(policy)
+}
+
+/// Whether Landlock (path-level filesystem confinement) is usable on this
+/// kernel. Linux only; used by the probe to skip cleanly where it is absent.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn landlock_available() -> bool {
+    imp::landlock_available()
 }
 
 /// Cap the fork server (Linux only — it is the one platform with a zygote).

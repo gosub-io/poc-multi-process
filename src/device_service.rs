@@ -38,6 +38,7 @@ pub fn run(name: &'static str, link: &str) {
     crate::sandbox::lock_down_service(
         name,
         crate::sandbox::ServiceCaps { filesystem: false, device: true },
+        &[],
     );
     serve(ep);
 }

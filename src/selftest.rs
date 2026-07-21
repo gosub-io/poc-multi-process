@@ -99,6 +99,8 @@ pub const PROBES: &[&str] = &[
     "service-fs-no-socket",
     #[cfg(target_os = "linux")]
     "service-device-ioctl",
+    #[cfg(target_os = "linux")]
+    "service-landlock",
     #[cfg(target_os = "macos")]
     "seatbelt-file",
     #[cfg(target_os = "macos")]
@@ -846,7 +848,7 @@ fn run_platform_probe(probe: &str) {
             // storage/font service is a separate process. Allowed = the syscall
             // returns (fd or errno) rather than a fatal SIGSYS; clean exit.
             "fs-openat" => {
-                crate::sandbox::lock_down_service("probe", ServiceCaps { filesystem: true, device: false });
+                crate::sandbox::lock_down_service("probe", ServiceCaps { filesystem: true, device: false }, &[]);
                 // SAFETY: a NUL-terminated path and standard open flags.
                 let fd = unsafe { libc::openat(libc::AT_FDCWD, c"/dev/null".as_ptr(), libc::O_RDONLY) };
                 if fd >= 0 {
@@ -858,7 +860,7 @@ fn run_platform_probe(probe: &str) {
             // network is still denied. Reached (clean exit) only if the filter
             // wrongly allowed `socket`; otherwise SIGSYS.
             "fs-no-socket" => {
-                crate::sandbox::lock_down_service("probe", ServiceCaps { filesystem: true, device: false });
+                crate::sandbox::lock_down_service("probe", ServiceCaps { filesystem: true, device: false }, &[]);
                 // SAFETY: obtaining a socket; expected to be fatal.
                 let _ = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
                 std::process::exit(0);
@@ -867,13 +869,47 @@ fn run_platform_probe(probe: &str) {
             // service drives its device). An unsupported request returns ENOTTY
             // rather than being killed; clean exit = the syscall was allowed.
             "device-ioctl" => {
-                crate::sandbox::lock_down_service("probe", ServiceCaps { filesystem: false, device: true });
+                crate::sandbox::lock_down_service("probe", ServiceCaps { filesystem: false, device: true }, &[]);
                 let mut winsz: libc::winsize = unsafe { std::mem::zeroed() };
                 // SAFETY: TIOCGWINSZ with a valid out-struct; fd 2 may not be a
                 // tty, in which case it errors — which is fine, we only need the
                 // syscall to be permitted rather than killed.
                 let _ = unsafe { libc::ioctl(2, libc::TIOCGWINSZ, &mut winsz) };
                 std::process::exit(0);
+            }
+            // Landlock: the path-level confinement seccomp cannot do. Scoped to
+            // a temp dir, the service may open files *inside* it but is denied
+            // (EACCES) *outside* — even though seccomp still permits `openat`.
+            // Skips cleanly where Landlock is unavailable (kernel/config), like
+            // the macOS ptrace probe, so it never fails for an untestable host.
+            "landlock" => {
+                if !crate::sandbox::landlock_available() {
+                    eprintln!("[selftest] landlock unavailable on this kernel — skipping");
+                    std::process::exit(0);
+                }
+                let dir = std::env::temp_dir().join("gosub-ll-probe");
+                let _ = std::fs::create_dir_all(&dir);
+                let inside = dir.join("inside.tmp");
+                // A file *outside* the ruleset, created before lockdown so it
+                // certainly exists (an EACCES below is Landlock, not ENOENT).
+                let outside = std::env::temp_dir().join("gosub-ll-outside.tmp");
+                let _ = std::fs::write(&outside, b"pre");
+
+                crate::sandbox::lock_down_service(
+                    "probe",
+                    ServiceCaps { filesystem: true, device: false },
+                    &[(dir.as_path(), true)],
+                );
+
+                // Inside the scope: creating/writing must work.
+                let ok_inside = std::fs::write(&inside, b"x").is_ok();
+                // Outside the scope: reading must be refused with EACCES.
+                let denied_outside = matches!(
+                    std::fs::read(&outside),
+                    Err(e) if e.raw_os_error() == Some(libc::EACCES)
+                );
+                eprintln!("[selftest] landlock: inside_ok={ok_inside} outside_denied={denied_outside}");
+                std::process::exit(if ok_inside && denied_outside { 0 } else { 1 });
             }
             other => {
                 eprintln!("unknown service probe: {other}");

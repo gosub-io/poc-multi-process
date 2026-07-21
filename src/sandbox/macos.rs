@@ -102,7 +102,7 @@ pub fn lock_down_net() {
 /// device service additionally `iokit-open` (the closest analogue to `ioctl`
 /// on a device node). Everything else stays `(deny default)`.
 #[cfg(feature = "multi-process")]
-pub fn lock_down_service(name: &str, filesystem: bool, device: bool) {
+pub fn lock_down_service(name: &str, filesystem: bool, device: bool, _fs_allow: &[(&std::path::Path, bool)]) {
     deny_debugger_attach();
     let mut profile = String::from("(version 1)\n(deny default)\n");
     profile.push_str("(allow signal (target self))\n");
