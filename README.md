@@ -193,6 +193,22 @@ capability the zygote gave up cannot be its child.
   renderer asking for `document.cookie` gets only the non-HttpOnly ones. So an
   exploited `example.com` renderer never sees `example.com`'s session token —
   it travels engine → net and skips the renderer's address space entirely.
+- **Cross-origin subresources go through Opaque Response Blocking (ORB).** A
+  renderer's *document* fetch (`NeedFetch`) is same-origin only, but real pages
+  load cross-origin subresources (images, scripts, styles, fonts), so a
+  `NeedSubresource` request *may* be cross-origin. That is safe only because the
+  trusted side decides what bytes the renderer may *read*: site isolation keeps
+  each origin in its own process so a Spectre gadget reads only its own address
+  space, and ORB is what keeps cross-origin secrets from getting into that space
+  to begin with. The engine resolves the destination origin and attaches *its*
+  cookies (never the renderer's), then the net component classifies the response
+  and applies ORB (`src/orb.rs`): a same-origin or CORS-approved response is
+  readable; a cross-origin no-cors *embeddable* type (image/script/CSS/font) is
+  delivered **opaque** (usable, not readable as data); a cross-origin *data* type
+  (HTML/JSON/XML) or anything not clearly embeddable is **blocked** — its bytes
+  never enter the renderer. Cross-origin navigation is still refused outright (a
+  real engine swaps renderers); only subresources cross the boundary, and only
+  under ORB.
 - SSRF policy is centralized in the net component (the one place allowed to
   open sockets), so no renderer bug can bypass it. It classifies the *numeric*
   address (loopback, private incl. `172.16/12`, link-local/cloud-metadata,
@@ -419,8 +435,10 @@ a real security boundary with a process behind them.
 - **Unit tests** (in `src/`) cover the pure policy/logic deterministically: the
   SSRF classifier (internal ranges, alternate IP encodings, IPv6,
   userinfo/trailing-dot bypasses), redirect following (per-hop SSRF re-check,
-  the hop-count bound, and cookies not crossing an origin), the cookie broker
-  (`(zone, origin)`
+  the hop-count bound, and cookies not crossing an origin), Opaque Response
+  Blocking (same-origin/CORS readable, cross-origin embeddable opaque,
+  cross-origin data blocked, and a cross-origin redirect forcing ORB), the
+  cookie broker (`(zone, origin)`
   partitioning + HttpOnly hiding), IPC frame round-trip and oversized-length
   rejection, the per-source backpressure `Gate`, the storage quota admission
   (per-value cap, overwrite-as-delta, saturating arithmetic), and origin
@@ -483,7 +501,8 @@ explore far more.
 | `src/engine.rs` | `start(mode)`, `EngineHandle`, the event loop (broker + policy), `Spawner` |
 | `src/ipc.rs` | `Endpoint` tx/rx halves (channel/local transports), wire messages, bincode framing, `SCM_RIGHTS` fd-passing (Linux) |
 | `src/channel/` | Transport seam: the duplex byte channel a link runs over — `unix.rs` (socketpair), `windows.rs` (anonymous pipe pair) |
-| `src/net_daemon.rs` | Net component: `serve` loop, (synthesized) fetching |
+| `src/net_daemon.rs` | Net component: `serve` loop, (synthesized) fetching, redirect following, ORB enforcement |
+| `src/orb.rs` | Opaque Response Blocking: the pure decision for what cross-origin response bytes may reach a renderer |
 | `src/ip_utils.rs` | SSRF policy: URL host extraction, IP-literal parsing (incl. `inet_aton` encodings), blocked-range classification |
 | `src/renderer.rs` | Per-`(zone,origin)` renderer: `serve` loop, placeholder render pipeline |
 | `src/decoder.rs` | Ephemeral image decoder: bounds-checked `GIMG` parser, decodes one image and exits |

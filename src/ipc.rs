@@ -74,6 +74,16 @@ pub enum FromRenderer {
     /// Ask the font service for a font's metrics. Renderers cannot open files;
     /// the font service can, and returns only the derived data.
     NeedFont { family: String },
+    /// Load a *subresource* (image, script, style, JSON, …) which — unlike
+    /// [`NeedFetch`], restricted to the renderer's own origin — may be
+    /// cross-origin. The response is subject to Opaque Response Blocking in the
+    /// broker/net: a cross-origin *data* type (HTML/JSON/XML) is withheld
+    /// entirely, an embeddable type (image/script/CSS/font) is delivered but
+    /// marked opaque, and a same-origin or CORS-approved response is readable.
+    /// See [`ToRenderer::SubresourceResult`].
+    ///
+    /// [`NeedFetch`]: FromRenderer::NeedFetch
+    NeedSubresource { url: String, mode: FetchMode },
 }
 
 /// A storage operation a renderer requests through the broker.
@@ -81,6 +91,16 @@ pub enum FromRenderer {
 pub enum StorageOp {
     Get { key: String },
     Set { key: String, value: Vec<u8> },
+}
+
+/// How a subresource request treats the cross-origin boundary, mirroring the
+/// Fetch `mode`: `NoCors` (an `<img>`/`<script>`/`<link>` load — usable but not
+/// readable cross-origin) or `Cors` (an explicit `crossorigin`/`fetch()` that
+/// asks the server's permission to read the bytes).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchMode {
+    NoCors,
+    Cors,
 }
 
 /// Engine -> renderer.
@@ -98,6 +118,9 @@ pub enum ToRenderer {
     /// The outcome of a [`FromRenderer::NeedFont`]: the font's metrics, or
     /// `None` if the service could not read it.
     FontResult(Option<FontMetrics>),
+    /// The outcome of a [`FromRenderer::NeedSubresource`] after Opaque Response
+    /// Blocking.
+    SubresourceResult(SubresourceOutcome),
     /// A fetch whose body streams through a shared-memory ring (Linux): the
     /// ring fd follows immediately via `SCM_RIGHTS`. `body_len` is a *claim*
     /// the renderer bounds before allocating; the ring fd itself is validated
@@ -126,6 +149,20 @@ pub enum NetRequest {
         /// network process but never the renderer.
         cookies: Vec<(String, String)>,
     },
+    /// A subresource fetch that may be cross-origin. `same_origin` and the
+    /// destination-origin `cookies` are computed by the *engine* (which owns the
+    /// canonical origins and the jar); the net component applies SSRF +
+    /// redirects like a fetch, then Opaque Response Blocking on the response.
+    Subresource {
+        request_id: u64,
+        url: String,
+        mode: FetchMode,
+        /// Whether the requesting origin equals the destination origin, decided
+        /// by the engine. The net component additionally treats a redirect that
+        /// leaves the initial authority as cross-origin (fails safe).
+        same_origin: bool,
+        cookies: Vec<(String, String)>,
+    },
     Shutdown,
 }
 
@@ -144,6 +181,14 @@ pub enum FetchOutcome {
     /// requesting renderer without ever mapping the ring itself.
     #[cfg(all(feature = "multi-process", target_os = "linux"))]
     OkStreaming { status: u16, body_len: u64 },
+    /// A cross-origin no-cors *embeddable* resource (image/script/style/font):
+    /// the bytes are delivered but the renderer must treat them as opaque.
+    /// Produced only for subresource requests.
+    Opaque { status: u16, body: Vec<u8> },
+    /// Opaque Response Blocking withheld a cross-origin *data* response (the
+    /// bytes never leave the net component). Produced only for subresource
+    /// requests; distinct from `Denied`, which is an SSRF/policy refusal.
+    Blocked { reason: String },
     Denied { reason: String },
 }
 
@@ -217,6 +262,22 @@ pub struct FontResponse {
 pub enum DecodeOutcome {
     Ok { width: u32, height: u32, pixels: Vec<u8> },
     Failed { reason: String },
+}
+
+/// The result of a subresource load after Opaque Response Blocking (ORB).
+#[derive(Serialize, Deserialize, Debug)]
+pub enum SubresourceOutcome {
+    /// Bytes reached the renderer. `opaque` = usable but not readable as data (a
+    /// cross-origin no-cors embeddable resource); `!opaque` = same-origin or
+    /// CORS-approved, so the bytes are readable. A real engine gives an opaque
+    /// response no readback API; here the flag records the distinction the
+    /// renderer would enforce.
+    Delivered { status: u16, opaque: bool, body: Vec<u8> },
+    /// ORB withheld the response: a cross-origin data type the renderer may not
+    /// read. The bytes never entered its address space.
+    Blocked { reason: String },
+    /// Refused before ORB — SSRF policy, unparseable URL, etc.
+    Denied { reason: String },
 }
 
 /// Send half of an IPC link.

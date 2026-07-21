@@ -29,7 +29,7 @@ use crate::events::{EngineCommand, EngineEvent, TabCommand, TabId, Tile, TilePix
 use crate::ipc::{
     self, DecodeOutcome, Endpoint, EndpointTx, FetchOutcome, FontRequest, FontResponse, FromDecoder,
     FromRenderer, NetRequest, NetResponse, ServiceControl, StorageRequest, StorageResponse,
-    ToDecoder, ToRenderer,
+    SubresourceOutcome, ToDecoder, ToRenderer,
 };
 use crate::{net_daemon, renderer};
 use std::collections::HashMap;
@@ -292,6 +292,11 @@ struct EngineLoop {
     cookies: HashMap<(ZoneId, String), Vec<Cookie>>,
     /// In-flight fetches: request id -> the tab awaiting the reply.
     pending_fetches: HashMap<u64, TabId>,
+    /// In-flight subresource loads: request id -> the tab awaiting the reply.
+    /// Kept separate from `pending_fetches` so a net reply is routed back as the
+    /// right renderer message (a `FetchResult` vs a `SubresourceResult`); both
+    /// ride the one net link and share the per-tab in-flight bound.
+    pending_subresources: HashMap<u64, TabId>,
     /// In-flight decodes: request id -> the tab awaiting the decoded image.
     pending_decodes: HashMap<u64, TabId>,
     /// The filesystem-capable services: long-lived, engine-spawned, brokered
@@ -432,6 +437,7 @@ impl EngineLoop {
             tabs: HashMap::new(),
             cookies: HashMap::new(),
             pending_fetches: HashMap::new(),
+            pending_subresources: HashMap::new(),
             pending_decodes: HashMap::new(),
             storage: ServiceLink { tx: storage_tx, handle: storage_handle },
             storage_gate,
@@ -499,6 +505,7 @@ impl EngineLoop {
                         tab.gate.close();
                         join(tab.handle);
                         self.pending_fetches.retain(|_, t| *t != tab_id);
+                        self.pending_subresources.retain(|_, t| *t != tab_id);
                         self.pending_decodes.retain(|_, t| *t != tab_id);
                         self.pending_storage.retain(|_, t| *t != tab_id);
                         self.pending_font.retain(|_, t| *t != tab_id);
@@ -656,6 +663,7 @@ impl EngineLoop {
                 let _ = tab.tx.send(&ToRenderer::Shutdown);
                 join(tab.handle);
                 self.pending_fetches.retain(|_, t| *t != tab_id);
+                self.pending_subresources.retain(|_, t| *t != tab_id);
                 self.pending_decodes.retain(|_, t| *t != tab_id);
                 self.pending_storage.retain(|_, t| *t != tab_id);
                 self.pending_font.retain(|_, t| *t != tab_id);
@@ -768,6 +776,47 @@ impl EngineLoop {
                     let _ = tab.tx.send(&ToRenderer::FontResult(None));
                 }
             }
+            FromRenderer::NeedSubresource { url, mode } => {
+                // Unlike NeedFetch (own-origin only), a subresource may be
+                // cross-origin. The engine resolves the *destination* origin and
+                // attaches *its* cookies — never this renderer's — so an
+                // exploited renderer cannot redirect its own (HttpOnly) cookies
+                // to another host. What may then be *read back* is decided by
+                // Opaque Response Blocking in the net component; the renderer's
+                // claimed identity is never trusted.
+                let Some(dest_origin) = origin_of(&url) else {
+                    let _ = tab.tx.send(&ToRenderer::SubresourceResult(
+                        SubresourceOutcome::Denied {
+                            reason: format!("unparseable subresource URL: {url}"),
+                        },
+                    ));
+                    return;
+                };
+                // Shares the per-tab in-flight bound with fetches (one net link).
+                if tab.inflight_fetches >= MAX_INFLIGHT_FETCHES {
+                    let _ = tab.tx.send(&ToRenderer::SubresourceResult(
+                        SubresourceOutcome::Denied { reason: "too many in-flight requests".into() },
+                    ));
+                    return;
+                }
+                let same_origin = dest_origin == tab.origin;
+                // Destination-origin cookies in this tab's zone (HttpOnly
+                // included — they reach the net component, never the renderer;
+                // the response is ORB-filtered regardless).
+                let cookies = attachable_cookies(&self.cookies, tab.zone, &dest_origin);
+                let request_id = self.next_request_id;
+                self.next_request_id += 1;
+                self.pending_subresources.insert(request_id, tab_id);
+                tab.inflight_fetches += 1;
+                let req = NetRequest::Subresource { request_id, url, mode, same_origin, cookies };
+                if self.net_tx.send(&req).is_err() {
+                    self.pending_subresources.remove(&request_id);
+                    tab.inflight_fetches -= 1;
+                    let _ = tab.tx.send(&ToRenderer::SubresourceResult(
+                        SubresourceOutcome::Denied { reason: "net component unavailable".into() },
+                    ));
+                }
+            }
             // Consumed (fd received, validated, mapped) by the reader thread;
             // never reaches the loop as a FromTab message.
             #[cfg(all(feature = "multi-process", target_os = "linux"))]
@@ -868,21 +917,50 @@ impl EngineLoop {
     }
 
     fn net_reply(&mut self, resp: NetResponse) {
-        let Some(tab_id) = self.pending_fetches.remove(&resp.request_id) else {
-            return; // requester disappeared while the fetch was in flight
-        };
-        let Some(tab) = self.tabs.get_mut(&tab_id) else {
-            return;
-        };
-        tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1);
-        let reply = match resp.outcome {
-            FetchOutcome::Ok { status, body } => ToRenderer::FetchResult { status, body },
-            FetchOutcome::Denied { reason } => ToRenderer::FetchDenied { reason },
-            // Streamed outcomes arrive as LoopMsg::NetStream, never here.
-            #[cfg(all(feature = "multi-process", target_os = "linux"))]
-            FetchOutcome::OkStreaming { .. } => return,
-        };
-        let _ = tab.tx.send(&reply);
+        // A reply is for either a document fetch or a subresource load; its
+        // request id is in exactly one of the two pending maps, which is how the
+        // engine knows whether to answer with a `FetchResult` or a
+        // `SubresourceResult`.
+        if let Some(tab_id) = self.pending_fetches.remove(&resp.request_id) {
+            let Some(tab) = self.tabs.get_mut(&tab_id) else {
+                return;
+            };
+            tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1);
+            let reply = match resp.outcome {
+                FetchOutcome::Ok { status, body } => ToRenderer::FetchResult { status, body },
+                FetchOutcome::Denied { reason } => ToRenderer::FetchDenied { reason },
+                // ORB outcomes are only produced for subresource requests.
+                FetchOutcome::Opaque { .. } | FetchOutcome::Blocked { .. } => {
+                    ToRenderer::FetchDenied {
+                        reason: "unexpected subresource outcome for a fetch".into(),
+                    }
+                }
+                // Streamed outcomes arrive as LoopMsg::NetStream, never here.
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                FetchOutcome::OkStreaming { .. } => return,
+            };
+            let _ = tab.tx.send(&reply);
+        } else if let Some(tab_id) = self.pending_subresources.remove(&resp.request_id) {
+            let Some(tab) = self.tabs.get_mut(&tab_id) else {
+                return;
+            };
+            tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1);
+            let outcome = match resp.outcome {
+                FetchOutcome::Ok { status, body } => {
+                    SubresourceOutcome::Delivered { status, opaque: false, body }
+                }
+                FetchOutcome::Opaque { status, body } => {
+                    SubresourceOutcome::Delivered { status, opaque: true, body }
+                }
+                FetchOutcome::Blocked { reason } => SubresourceOutcome::Blocked { reason },
+                FetchOutcome::Denied { reason } => SubresourceOutcome::Denied { reason },
+                // Subresources never take the streaming path.
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                FetchOutcome::OkStreaming { .. } => return,
+            };
+            let _ = tab.tx.send(&ToRenderer::SubresourceResult(outcome));
+        }
+        // else: requester disappeared while the request was in flight.
     }
 
     /// Route a streamed fetch body: same bookkeeping as [`net_reply`], but

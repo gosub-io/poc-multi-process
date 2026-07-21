@@ -132,6 +132,10 @@ fn render_page(ep: &mut Endpoint, origin: &str, url: &str) -> io::Result<()> {
     use_storage(ep)?;
     use_font(ep)?;
 
+    // The page pulls in cross-origin subresources. What the renderer may see is
+    // decided by Opaque Response Blocking in the broker/net, not here.
+    load_subresources(ep)?;
+
     // A real renderer parses, styles, lays out and rasterizes here; the PoC
     // ships a placeholder tile of the size the issue budgets per frame.
     send_tile(ep)
@@ -203,6 +207,38 @@ fn use_font(ep: &mut Endpoint) -> io::Result<()> {
         }
         ToRenderer::FontResult(None) => eprintln!("[renderer] font unavailable"),
         _ => {}
+    }
+    Ok(())
+}
+
+/// Pull in cross-origin subresources and report what Opaque Response Blocking
+/// let through — the demonstration that a renderer can *request* cross-origin
+/// resources but only ever *reads* what the trusted broker permits. An
+/// embeddable image comes back opaque (usable, not readable), a cross-origin
+/// JSON data resource is withheld entirely, and a CORS-approved fetch is
+/// readable. The decision is the engine/net's; the renderer only observes it.
+fn load_subresources(ep: &mut Endpoint) -> io::Result<()> {
+    use crate::ipc::{FetchMode, SubresourceOutcome};
+    let requests = [
+        ("https://cdn.example.org/logo.png", FetchMode::NoCors, "cross-origin image (no-cors)"),
+        ("https://api.other.test/secret.json", FetchMode::NoCors, "cross-origin JSON (no-cors)"),
+        ("https://api.other.test/cors/data.json", FetchMode::Cors, "cross-origin JSON (cors)"),
+    ];
+    for (url, mode, label) in requests {
+        ep.send(&FromRenderer::NeedSubresource { url: url.to_string(), mode })?;
+        if let ToRenderer::SubresourceResult(outcome) = ep.recv::<ToRenderer>()? {
+            let desc = match outcome {
+                SubresourceOutcome::Delivered { opaque: true, body, .. } => {
+                    format!("delivered opaque ({} bytes, not readable as data)", body.len())
+                }
+                SubresourceOutcome::Delivered { opaque: false, body, .. } => {
+                    format!("delivered readable ({} bytes)", body.len())
+                }
+                SubresourceOutcome::Blocked { reason } => format!("BLOCKED by ORB — {reason}"),
+                SubresourceOutcome::Denied { reason } => format!("denied — {reason}"),
+            };
+            eprintln!("[renderer] subresource {label}: {desc}");
+        }
     }
     Ok(())
 }

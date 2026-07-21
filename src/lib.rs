@@ -41,6 +41,7 @@ pub mod fork_server;
 pub mod ip_utils;
 pub mod ipc;
 pub mod net_daemon;
+pub mod orb;
 pub mod renderer;
 pub mod storage;
 // Unconditional: the per-OS confinement machinery inside is feature-gated, but
