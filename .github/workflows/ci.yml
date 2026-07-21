@@ -24,13 +24,13 @@ jobs:
   # developer's, and would not have been found any other way. That is what this
   # job is for.
   #
-  # The aarch64 rows extend it from libc to *architecture*: the seccomp target
+  # The aarch64 row extends it from libc to *architecture*: the seccomp target
   # arch, the raw syscall numbers, the SIGSYS reporter's `si_syscall` offset in
   # `siginfo_t`, and the fork path (aarch64 has no `SYS_fork` at all, so glibc
   # and musl both reach `clone`/`clone3`) are all arch-specific and only ever
-  # *run* — as opposed to type-checked by `cross-compile` — here. The arm64
-  # rows need an arm64 runner, which GitHub provides free for public repos
-  # (`ubuntu-24.04-arm`); on a private repo they require the paid arm runners.
+  # *run* — as opposed to type-checked by `cross-compile` — here. It needs an
+  # arm64 runner, which GitHub provides free for public repos
+  # (`ubuntu-24.04-arm`); on a private repo it requires the paid arm runners.
   linux-libc-matrix:
     name: linux (${{ matrix.name }})
     runs-on: ${{ matrix.runs-on || 'ubuntu-latest' }}
@@ -59,16 +59,22 @@ jobs:
           - name: musl x86_64 (alpine)
             image: rust:1-alpine
             setup: apk add --no-cache musl-dev
-          # aarch64: same two libcs on a native arm64 runner, so the
-          # arch-specific sandbox paths are enforced by a real kernel (qemu-user
-          # would not faithfully apply guest seccomp). The multi-arch `rust:1-*`
-          # images resolve to their arm64 variants automatically here.
+          # aarch64: a native arm64 runner, so the arch-specific sandbox paths
+          # are enforced by a real kernel (qemu-user would not faithfully apply
+          # guest seccomp). The multi-arch `rust:1-trixie` image resolves to its
+          # arm64 variant automatically here.
+          #
+          # glibc only, deliberately: a musl/arm64 row is *not* worth it. First,
+          # it adds no unique coverage — aarch64 has no `SYS_fork` for any libc,
+          # so musl-on-arm reaches `clone`/`clone3` exactly as glibc-on-arm does,
+          # and the musl-specific quirks (`set_tid_address`, the `F_SETFD` after
+          # `F_DUPFD_CLOEXEC`) are already exercised by the musl-x86 row. Second,
+          # `actions/checkout` cannot even run in an Alpine/arm64 container:
+          # GitHub injects a glibc-linked Node.js that will not execute on musl,
+          # so the job dies at checkout before any test runs. Arch coverage comes
+          # from glibc-arm here; musl coverage from musl-x86 above.
           - name: glibc 2.39 aarch64 (debian trixie)
             image: rust:1-trixie
-            runs-on: ubuntu-24.04-arm
-          - name: musl aarch64 (alpine)
-            image: rust:1-alpine
-            setup: apk add --no-cache musl-dev
             runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4

@@ -349,16 +349,31 @@ pub fn lock_down_net() {
     enforce("net", install(allowed));
 }
 
-/// The one syscall a filesystem-capable service needs beyond the baseline:
-/// `openat`. Renderers deny it outright (their filesystem is capped without
-/// Landlock); a font or storage service is *defined* by needing it, which is
+/// The syscalls a filesystem-capable service needs beyond the baseline to open
+/// a file. Renderers deny these outright (their filesystem is capped without
+/// Landlock); a font or storage service is *defined* by needing them, which is
 /// exactly why it is a separate process rather than something a renderer does.
 ///
-/// Seccomp permits `openat` on *any* path — the argument is a pointer the
-/// filter cannot dereference — so *which* files a service may touch is confined
-/// by Landlock instead ([`landlock`]), not by this list.
+/// **`openat` is not enough on its own — which libc you run against decides the
+/// syscall.** Rust's `std::fs` open reaches the kernel as `openat` under glibc
+/// (which routes `open()` through `openat` internally) but as the legacy
+/// `SYS_open` under musl on x86. Granting only `openat` therefore kills every
+/// file open in a service under musl with `SIGSYS` on syscall #2, and the
+/// failure surfaces as an unrelated hang: the service dies, the renderer's
+/// storage/font request is never answered, and its tab never completes. Found
+/// by the musl CI row, invisible on a glibc dev box — the same class of bug as
+/// the fork server's `clone3`-vs-`clone`. `SYS_open` is x86-only: aarch64 has no
+/// such syscall (it only ever had `openat`), so naming it there does not compile.
+///
+/// Seccomp permits these on *any* path — the argument is a pointer the filter
+/// cannot dereference — so *which* files a service may touch is confined by
+/// Landlock instead ([`landlock`]), not by this list.
 #[cfg(feature = "multi-process")]
-const FS_EXTRA: &[libc::c_long] = &[libc::SYS_openat];
+const FS_EXTRA: &[libc::c_long] = &[
+    libc::SYS_openat,
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    libc::SYS_open,
+];
 
 /// Landlock: filesystem access control by *path*, the thing seccomp cannot do.
 ///
@@ -568,8 +583,16 @@ pub fn landlock_available() -> bool {
 /// opaque to the filter), which is precisely why these processes are isolated —
 /// the confinement they get is the process boundary and everything *else* in
 /// the baseline, not a tight filter on the device path itself.
+///
+/// `SYS_open` alongside `openat` for the same libc reason as [`FS_EXTRA`]: musl
+/// opens a device node via the legacy `open` on x86, glibc via `openat`.
 #[cfg(feature = "multi-process")]
-const DEVICE_EXTRA: &[libc::c_long] = &[libc::SYS_openat, libc::SYS_ioctl];
+const DEVICE_EXTRA: &[libc::c_long] = &[
+    libc::SYS_openat,
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    libc::SYS_open,
+    libc::SYS_ioctl,
+];
 
 /// Cap an engine-spawned service — a role that needs a privilege renderers do
 /// not, so it lives outside the zygote and carries its own, wider filter. The
@@ -683,24 +706,27 @@ fn install_with(
             SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, cmd as u64)?;
         fcntl_allowed.push(SeccompRule::new(vec![is_cmd])?);
     }
-    if allow_dup_fd {
-        // musl follows its `F_DUPFD_CLOEXEC` with an explicit
-        // `fcntl(F_SETFD, FD_CLOEXEC)`; glibc does not. Both conditions are
-        // required together (they AND), so this permits *setting* close-on-exec
-        // and nothing else: `F_SETFD` with any other flag word — crucially 0,
-        // which would CLEAR close-on-exec and leak the descriptor across an
-        // exec — still hits KillProcess. Setting the flag only ever narrows
-        // what a descriptor can do, so this grants no reach.
-        let is_setfd =
-            SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, libc::F_SETFD as u64)?;
-        let sets_cloexec = SeccompCondition::new(
-            2,
-            SeccompCmpArgLen::Qword,
-            SeccompCmpOp::Eq,
-            libc::FD_CLOEXEC as u64,
-        )?;
-        fcntl_allowed.push(SeccompRule::new(vec![is_setfd, sets_cloexec])?);
-    }
+    // `fcntl(F_SETFD, FD_CLOEXEC)` — permitted for *every* filter, not just the
+    // fork server. musl issues it after *any* file open (its `std::fs` opens
+    // with `O_CLOEXEC` and then redundantly re-sets `FD_CLOEXEC` via `fcntl`),
+    // as well as after `F_DUPFD_CLOEXEC`; glibc does neither. Gating it behind
+    // the fork server's `allow_dup_fd` therefore killed every file open in a
+    // filesystem/device service under musl with `SIGSYS` on syscall #72 — the
+    // failure surfacing as a service dying and the renderer's storage/font
+    // request never being answered. Found on the musl CI row, the same libc
+    // class of bug as `open`-vs-`openat` above.
+    //
+    // Both conditions AND together, so this permits *setting* close-on-exec and
+    // nothing else: `F_SETFD` with any other flag word — crucially 0, which
+    // would CLEAR close-on-exec and leak a descriptor across an exec — still
+    // hits the default action. Setting the flag only ever narrows a descriptor,
+    // so it grants no reach (and a confined child cannot `exec` anyway).
+    let is_setfd =
+        SeccompCondition::new(1, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, libc::F_SETFD as u64)?;
+    let sets_cloexec =
+        SeccompCondition::new(2, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, libc::FD_CLOEXEC as u64)?;
+    fcntl_allowed.push(SeccompRule::new(vec![is_setfd, sets_cloexec])?);
+
     rules.insert(libc::SYS_fcntl as i64, fcntl_allowed);
 
     // tgkill is permitted ONLY to deliver SIGSYS to a thread of this process —
