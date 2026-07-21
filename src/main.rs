@@ -26,6 +26,7 @@
 // are in-process channels.
 #[cfg(feature = "multi-process")]
 mod channel;
+mod decoder;
 mod engine;
 mod events;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
@@ -83,6 +84,11 @@ fn main() {
         Some("net-daemon") => net_daemon::run(&args[2]),
         #[cfg(feature = "multi-process")]
         Some("renderer") => renderer::run(&args[2], &args[3]),
+        // Ephemeral image decoder: decodes one image and exits (see decoder.rs).
+        // On Linux it is forked from the zygote and never takes this path; this
+        // is the fork+exec fallback used elsewhere.
+        #[cfg(feature = "multi-process")]
+        Some("decoder") => decoder::run(&args[2]),
         #[cfg(all(feature = "multi-process", target_os = "linux"))]
         Some("fork-server") => fork_server::run(&args[2]),
         // Internal sandbox self-test, spawned only by the integration suite.

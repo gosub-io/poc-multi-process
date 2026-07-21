@@ -110,8 +110,21 @@ engine event loop (broker — owns cookie jar & policy)
 ├── net component            Phase 1: sole owner of network capability
 └── fork server (Linux)      minimal, single-threaded, secret-free
     ├── renderer (zone, A)   Phase 2: per-(zone,origin), unprivileged
-    └── renderer (zone, B)   Phase 2: per-(zone,origin), unprivileged
+    ├── renderer (zone, B)   Phase 2: per-(zone,origin), unprivileged
+    └── decoder              ephemeral: forked per image, decodes one, exits
 ```
+
+- **Image decoding runs in a throwaway process.** Decoding is the most
+  dangerous input a browser handles (libwebp CVE-2023-4863 was a zero-click RCE
+  in every major browser), so renderers never parse image bytes themselves —
+  they broker a `NeedDecode` to a decoder forked from the zygote, which decodes
+  exactly one image and exits. It is a content process with the renderer's
+  confinement (no network, files, or exec), so a parser bug is contained; a
+  crash is relayed to the renderer as a decode *failure*, never a crash of
+  anything else. It is deliberately **ephemeral, not shared**: holding no state,
+  a decoder can never see a second origin's image — a single long-lived decoder
+  would reintroduce the cross-origin channel the per-`(zone,origin)` split
+  closes. The per-image fork is what the warm fork server makes cheap.
 
 - Renderers hold no secrets: cookies and network access live in the engine
   and net component. A renderer can only send IPC messages, and every message
@@ -380,6 +393,7 @@ covers the bounding mechanism itself deterministically.
 | `src/net_daemon.rs` | Net component: `serve` loop, (synthesized) fetching |
 | `src/ip_utils.rs` | SSRF policy: URL host extraction, IP-literal parsing (incl. `inet_aton` encodings), blocked-range classification |
 | `src/renderer.rs` | Per-`(zone,origin)` renderer: `serve` loop, placeholder render pipeline |
+| `src/decoder.rs` | Ephemeral image decoder: bounds-checked `GIMG` parser, decodes one image and exits |
 | `src/fork_server.rs` | Fork server (Linux): `fork()`s renderers without exec |
 | `src/shm.rs` | Shared-memory tiles (Linux): sealed-`memfd` producer + validating consumer |
 | `src/ring.rs` | Shared-memory ring (Linux): streams large fetch bodies, futex wakeups, hostile-cursor validation |

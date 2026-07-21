@@ -36,6 +36,10 @@ pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ForkRequest {
     Renderer { origin: String },
+    /// Fork a throwaway decoder. Its IPC fd follows via `SCM_RIGHTS`, exactly
+    /// like a renderer's; the difference is entirely in what the child does —
+    /// decode one image and exit.
+    Decoder,
     Shutdown,
 }
 
@@ -57,6 +61,11 @@ pub enum FromRenderer {
     /// validates the received fd's seals and real size against them.
     #[cfg(all(feature = "multi-process", target_os = "linux"))]
     TileShm { width: u32, height: u32 },
+    /// Renderers do not parse images themselves — that is the most dangerous
+    /// input a browser handles, so it is brokered to a throwaway decoder
+    /// process (see `decoder`). The bytes are the encoded image; the reply is a
+    /// [`ToRenderer::DecodeResult`].
+    NeedDecode { image: Vec<u8> },
 }
 
 /// Engine -> renderer.
@@ -64,6 +73,10 @@ pub enum FromRenderer {
 pub enum ToRenderer {
     RenderPage { url: String },
     FetchResult { status: u16, body: Vec<u8> },
+    /// The outcome of a [`FromRenderer::NeedDecode`]: the decoded pixels, or the
+    /// reason the (ephemeral) decoder refused or died. A decoder crash is
+    /// reported as a failure here, never as a failure of the renderer.
+    DecodeResult(DecodeOutcome),
     /// A fetch whose body streams through a shared-memory ring (Linux): the
     /// ring fd follows immediately via `SCM_RIGHTS`. `body_len` is a *claim*
     /// the renderer bounds before allocating; the ring fd itself is validated
@@ -111,6 +124,29 @@ pub enum FetchOutcome {
     #[cfg(all(feature = "multi-process", target_os = "linux"))]
     OkStreaming { status: u16, body_len: u64 },
     Denied { reason: String },
+}
+
+/// Engine -> decoder. A decoder handles exactly one of these and exits.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ToDecoder {
+    Decode { image: Vec<u8> },
+}
+
+/// Decoder -> engine: the result of decoding one image.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum FromDecoder {
+    Decoded { width: u32, height: u32, pixels: Vec<u8> },
+    Failed { reason: String },
+}
+
+/// The decode outcome as it reaches the renderer — the decoder's own result,
+/// plus a synthesized failure for the case where the decoder died before
+/// answering (which the engine turns into a `Failed`, so a decoder crash is
+/// indistinguishable from a rejection to the renderer).
+#[derive(Serialize, Deserialize, Debug)]
+pub enum DecodeOutcome {
+    Ok { width: u32, height: u32, pixels: Vec<u8> },
+    Failed { reason: String },
 }
 
 /// Send half of an IPC link.

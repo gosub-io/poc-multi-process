@@ -23,14 +23,18 @@ const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// for hours on a demo that had already lost both its renderers, reporting
 /// nothing. A hang must present as a fast, loud failure.
 fn run(args: &[&str]) -> Output {
+    run_env(args, &[])
+}
+
+fn run_env(args: &[&str], env: &[(&str, &str)]) -> Output {
     use std::process::Stdio;
 
-    let mut child = Command::new(bin())
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn poc binary");
+    let mut cmd = Command::new(bin());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn poc binary");
 
     let deadline = std::time::Instant::now() + RUN_TIMEOUT;
     loop {
@@ -64,6 +68,35 @@ fn default_run_renders_and_shuts_down() {
     assert!(stdout.contains("frame ready"), "no frame rendered:\n{stdout}");
     assert!(stdout.contains("engine shut down"), "no clean shutdown:\n{stdout}");
     assert!(!stdout.contains("crashed"), "unexpected crash:\n{stdout}");
+}
+
+/// Every rendered page decodes an image in a throwaway process; the renderer
+/// byte-compares the result and reports on stderr. Seeing this proves the whole
+/// broker → fork → decode → return path works across the process boundary.
+#[test]
+fn images_decode_in_an_isolated_process() {
+    let out = run(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {:?}\nstderr: {stderr}", out.status);
+    assert!(stderr.contains("image decoded 16x16 (pattern ok)"), "no verified decode:\n{stderr}");
+    assert!(!stderr.contains("MISMATCH"), "decoded pixels corrupted in transit:\n{stderr}");
+}
+
+/// The fault-isolation guarantee: a malformed image is rejected by the decoder,
+/// the engine relays the failure, and *nothing else is disturbed* — the tab
+/// still renders its frame and the engine still shuts down cleanly. A hostile
+/// image is exactly this shape with a parser bug behind it; isolating the
+/// parser is what turns "RCE in the browser" into "one decode failed".
+#[test]
+fn a_bad_image_fails_without_taking_anything_down() {
+    let out = run_env(&[], &[("GOSUB_DECODE_BADIMAGE", "1")]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "a bad image should not fail the run:\n{stdout}{stderr}");
+    assert!(stderr.contains("image decode failed"), "expected a reported decode failure:\n{stderr}");
+    assert!(stdout.contains("frame ready"), "the tab should still render:\n{stdout}");
+    assert!(stdout.contains("engine shut down"), "the engine should still shut down:\n{stdout}");
+    assert!(!stdout.contains("crashed"), "nothing should crash:\n{stdout}");
 }
 
 /// The same lifecycle must work with components as threads. No fd-passing on

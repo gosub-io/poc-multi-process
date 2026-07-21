@@ -72,7 +72,15 @@ pub fn run(control_fd: &str) {
                     Ok(fd) => fd,
                     Err(_) => break,
                 };
-                fork_renderer(control.as_raw_fd(), comp_fd, origin);
+                fork_child(control.as_raw_fd(), comp_fd, Child::Renderer(origin));
+            }
+            ForkRequest::Decoder => {
+                // SAFETY: the control stream is a valid open descriptor.
+                let comp_fd = match unsafe { ipc::recv_fd(control.as_raw_fd()) } {
+                    Ok(fd) => fd,
+                    Err(_) => break,
+                };
+                fork_child(control.as_raw_fd(), comp_fd, Child::Decoder);
             }
         }
     }
@@ -81,7 +89,15 @@ pub fn run(control_fd: &str) {
     while unsafe { libc::waitpid(-1, std::ptr::null_mut(), 0) } > 0 {}
 }
 
-fn fork_renderer(control_fd: RawFd, comp_fd: OwnedFd, origin: String) {
+/// What a forked child becomes. Both are content processes forked the same
+/// way and confined the same way; only the serve loop differs — a renderer is
+/// long-lived and per-origin, a decoder handles one image and exits.
+enum Child {
+    Renderer(String),
+    Decoder,
+}
+
+fn fork_child(control_fd: RawFd, comp_fd: OwnedFd, kind: Child) {
     // SAFETY: we are single-threaded, so the child may run normal code (the
     // async-signal-safe-only rule applies to *multithreaded* fork).
     match unsafe { libc::fork() } {
@@ -90,20 +106,25 @@ fn fork_renderer(control_fd: RawFd, comp_fd: OwnedFd, origin: String) {
             // comp_fd drops (closes) here.
         }
         0 => {
-            // Child — this IS the renderer now. It inherited the fork server's
-            // warm runtime via copy-on-write; no exec, no re-init.
+            // Child — this IS the content process now. It inherited the fork
+            // server's warm runtime via copy-on-write; no exec, no re-init.
             unsafe { libc::close(control_fd) }; // never touch the engine's control channel
             let ch = crate::channel::Channel::from_stream(UnixStream::from(comp_fd));
             let ep = Endpoint::from_channel(ch).expect("fork-server child: wrap fd");
-            // Drop privileges, then serve. rlimits were inherited from the
-            // fork server; seccomp is per-process, applied here.
+            // Drop privileges, then serve. rlimits were inherited from the fork
+            // server; seccomp is per-process, applied here. A decoder is a
+            // content process just like a renderer, so it shares the lockdown.
             crate::sandbox::lock_down_renderer();
-            crate::renderer::serve(ep, &origin);
+            match kind {
+                Child::Renderer(origin) => crate::renderer::serve(ep, &origin),
+                Child::Decoder => crate::decoder::serve_one(ep),
+            }
             std::process::exit(0); // must not fall back into the fork-server loop
         }
         _pid => {
-            // Parent (fork server): drop our copy of the renderer's end so the
-            // engine sees EOF (→ TabCrashed) when the renderer dies.
+            // Parent (fork server): drop our copy of the child's end so the
+            // engine sees EOF when the child dies (a decoder always exits after
+            // one image; a renderer only on crash).
             drop(comp_fd);
         }
     }

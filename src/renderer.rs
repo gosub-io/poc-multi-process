@@ -122,9 +122,50 @@ fn render_page(ep: &mut Endpoint, origin: &str, url: &str) -> io::Result<()> {
         _ => None,
     };
 
+    // The page has an image. A renderer never parses image bytes itself — that
+    // is the most dangerous input a browser handles — so it brokers the decode
+    // to a throwaway process (Phase: decoder isolation). In a real browser the
+    // bytes come from the network; here the renderer synthesizes a small one so
+    // the round trip is self-checking.
+    decode_image(ep)?;
+
     // A real renderer parses, styles, lays out and rasterizes here; the PoC
     // ships a placeholder tile of the size the issue budgets per frame.
     send_tile(ep)
+}
+
+/// Ask the broker to decode an image in an isolated, ephemeral process, then
+/// verify the pixels came back byte-for-byte — the round-trip acceptance check
+/// for the decoder channel, reported on stderr like the tile and blob checks.
+fn decode_image(ep: &mut Endpoint) -> io::Result<()> {
+    use crate::decoder;
+    const W: u32 = 16;
+    const H: u32 = 16;
+    let pixels: Vec<u8> = (0..(W * H * 4) as usize).map(decoder::sample_pixel).collect();
+
+    // `GOSUB_DECODE_BADIMAGE` sends a header that *lies* about its size — a
+    // 4096×4096 image carrying no pixels. It exercises the fault-isolation path
+    // end to end: the decoder must reject it, the engine relay a failure, and
+    // everything keep running. A real hostile image is this, with a parser bug
+    // behind it; here the parser has no bug, so rejection is the whole story.
+    let image = if std::env::var_os("GOSUB_DECODE_BADIMAGE").is_some() {
+        decoder::encode(decoder::MAX_DECODE_DIM, decoder::MAX_DECODE_DIM, &[])
+    } else {
+        decoder::encode(W, H, &pixels)
+    };
+
+    ep.send(&FromRenderer::NeedDecode { image })?;
+    match ep.recv::<ToRenderer>()? {
+        ToRenderer::DecodeResult(crate::ipc::DecodeOutcome::Ok { width, height, pixels: got }) => {
+            let ok = width == W && height == H && got == pixels;
+            eprintln!("[renderer] image decoded {width}x{height} (pattern {})", if ok { "ok" } else { "MISMATCH" });
+        }
+        ToRenderer::DecodeResult(crate::ipc::DecodeOutcome::Failed { reason }) => {
+            eprintln!("[renderer] image decode failed: {reason}");
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Deliver the rendered tile, preferring shared memory: rasterize into a

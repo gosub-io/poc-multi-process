@@ -27,7 +27,8 @@
 
 use crate::events::{EngineCommand, EngineEvent, TabCommand, TabId, Tile, TilePixels, ZoneId};
 use crate::ipc::{
-    self, Endpoint, EndpointTx, FetchOutcome, FromRenderer, NetRequest, NetResponse, ToRenderer,
+    self, DecodeOutcome, Endpoint, EndpointTx, FetchOutcome, FromDecoder, FromRenderer, NetRequest,
+    NetResponse, ToDecoder, ToRenderer,
 };
 use crate::{net_daemon, renderer};
 use std::collections::HashMap;
@@ -126,6 +127,11 @@ enum LoopMsg {
     /// to forward to the requesting renderer. The engine never maps the ring.
     #[cfg(all(feature = "multi-process", target_os = "linux"))]
     NetStream { resp: NetResponse, fd: std::os::fd::OwnedFd },
+    /// An ephemeral decoder answered (or died). Forwarded by its one-shot
+    /// reader thread, which synthesizes a failure if the decoder died before
+    /// answering — so a decoder crash reaches the loop as a `Failed`, never as
+    /// a lost message.
+    DecodeReply { request_id: u64, outcome: DecodeOutcome },
 }
 
 /// A running child component, however it is hosted.
@@ -144,6 +150,11 @@ enum ChildHandle {
 /// without waiting for replies. The 16 MiB frame cap only bounds one message;
 /// this bounds how many can be in flight at once.
 const MAX_INFLIGHT_FETCHES: usize = 32;
+
+/// Per-tab cap on outstanding decodes. Each decode forks a process, so without
+/// this a renderer spamming `NeedDecode` is a fork bomb against the host. The
+/// bound turns that into a flat refusal once the tab has too many in flight.
+const MAX_INFLIGHT_DECODES: usize = 8;
 
 /// Per-source cap on messages queued-but-unprocessed in the shared inbox. All
 /// sources funnel into one inbox, so without this a single renderer flooding
@@ -222,6 +233,9 @@ struct Tab {
     handle: ChildHandle,
     /// Number of this tab's fetches awaiting a reply from the net component.
     inflight_fetches: usize,
+    /// Number of this tab's decodes awaiting an ephemeral decoder. Bounds how
+    /// many decoder processes one renderer can have alive at once.
+    inflight_decodes: usize,
     /// Bounds this renderer's queued-but-unprocessed messages in the inbox.
     gate: Arc<Gate>,
 }
@@ -229,6 +243,8 @@ struct Tab {
 enum Role<'a> {
     Net,
     Renderer(&'a str),
+    /// A throwaway image decoder — spawned per decode, decodes one image, dies.
+    Decoder,
 }
 
 /// A cookie in the engine's jar. `http_only` cookies are attached to network
@@ -258,6 +274,8 @@ struct EngineLoop {
     cookies: HashMap<(ZoneId, String), Vec<Cookie>>,
     /// In-flight fetches: request id -> the tab awaiting the reply.
     pending_fetches: HashMap<u64, TabId>,
+    /// In-flight decodes: request id -> the tab awaiting the decoded image.
+    pending_decodes: HashMap<u64, TabId>,
     next_tab_id: u64,
     next_request_id: u64,
 }
@@ -313,6 +331,7 @@ impl EngineLoop {
             tabs: HashMap::new(),
             cookies: HashMap::new(),
             pending_fetches: HashMap::new(),
+            pending_decodes: HashMap::new(),
             next_tab_id: 0,
             next_request_id: 0,
         }
@@ -372,6 +391,7 @@ impl EngineLoop {
                         tab.gate.close();
                         join(tab.handle);
                         self.pending_fetches.retain(|_, t| *t != tab_id);
+                        self.pending_decodes.retain(|_, t| *t != tab_id);
                         self.emit(EngineEvent::TabCrashed { tab_id });
                     }
                 }
@@ -383,6 +403,9 @@ impl EngineLoop {
                 LoopMsg::NetStream { resp, fd } => {
                     self.net_stream(resp, fd);
                     self.net_gate.release();
+                }
+                LoopMsg::DecodeReply { request_id, outcome } => {
+                    self.decode_reply(request_id, outcome);
                 }
             }
         }
@@ -465,7 +488,15 @@ impl EngineLoop {
 
         self.tabs.insert(
             tab_id,
-            Tab { zone, origin: origin.clone(), tx, handle, inflight_fetches: 0, gate },
+            Tab {
+                zone,
+                origin: origin.clone(),
+                tx,
+                handle,
+                inflight_fetches: 0,
+                inflight_decodes: 0,
+                gate,
+            },
         );
         self.emit(EngineEvent::TabOpened { tab_id, zone, origin });
     }
@@ -496,6 +527,7 @@ impl EngineLoop {
                 let _ = tab.tx.send(&ToRenderer::Shutdown);
                 join(tab.handle);
                 self.pending_fetches.retain(|_, t| *t != tab_id);
+                self.pending_decodes.retain(|_, t| *t != tab_id);
                 self.emit(EngineEvent::TabClosed { tab_id });
             }
         }
@@ -574,11 +606,86 @@ impl EngineLoop {
                     tile: Tile { width, height, pixels: TilePixels::Inline(pixels) },
                 });
             }
+            FromRenderer::NeedDecode { image } => {
+                self.broker_decode(tab_id, image);
+            }
             // Consumed (fd received, validated, mapped) by the reader thread;
             // never reaches the loop as a FromTab message.
             #[cfg(all(feature = "multi-process", target_os = "linux"))]
             FromRenderer::TileShm { .. } => {}
         }
+    }
+
+    /// Fork a throwaway decoder for one image, hand it the bytes, and arrange
+    /// for its reply to come back tagged with the tab that asked.
+    ///
+    /// The decoder is spawned per request and never reused — that is the
+    /// ephemerality property, and it is why this bounds `inflight_decodes`: a
+    /// renderer that spammed `NeedDecode` would otherwise fork processes without
+    /// limit. The bytes come *from* the renderer, so no origin check is needed
+    /// (a renderer decoding its own image reveals nothing it did not already
+    /// have); the isolation is about containing the *parser*, not the data.
+    fn broker_decode(&mut self, tab_id: TabId, image: Vec<u8>) {
+        let Some(tab) = self.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        if tab.inflight_decodes >= MAX_INFLIGHT_DECODES {
+            let _ = tab.tx.send(&ToRenderer::DecodeResult(DecodeOutcome::Failed {
+                reason: "too many in-flight decodes".into(),
+            }));
+            return;
+        }
+
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+
+        // Spawn the decoder and hand it the image. If either step fails, the
+        // renderer gets a `Failed` rather than a silent hang.
+        let (handle, ep) = self.spawner.spawn(Role::Decoder);
+        let (mut dec_tx, dec_rx) = ep.split();
+        if dec_tx.send(&ToDecoder::Decode { image }).is_err() {
+            join(handle);
+            let _ = tab.tx.send(&ToRenderer::DecodeResult(DecodeOutcome::Failed {
+                reason: "decoder unavailable".into(),
+            }));
+            return;
+        }
+
+        tab.inflight_decodes += 1;
+        self.pending_decodes.insert(request_id, tab_id);
+
+        // One-shot reader thread: wait for the single reply, forward it, then
+        // reap the decoder. If the link closes *before* a reply, the decoder
+        // died mid-decode — synthesize a `Failed` so the renderer always hears
+        // an outcome. This is the fault-isolation guarantee: a decoder crash is
+        // a decode failure, never a lost request or a broken engine.
+        let inbox = self.inbox.clone();
+        std::thread::spawn(move || {
+            let mut dec_rx = dec_rx;
+            let outcome = match dec_rx.recv::<FromDecoder>() {
+                Ok(FromDecoder::Decoded { width, height, pixels }) => {
+                    DecodeOutcome::Ok { width, height, pixels }
+                }
+                Ok(FromDecoder::Failed { reason }) => DecodeOutcome::Failed { reason },
+                Err(_) => DecodeOutcome::Failed { reason: "decoder died before answering".into() },
+            };
+            let _ = inbox.send(LoopMsg::DecodeReply { request_id, outcome });
+            // The decoder has answered and is exiting; reap it (a no-op for a
+            // fork-served child, which the fork server reaps).
+            join(handle);
+        });
+    }
+
+    /// Relay an ephemeral decoder's result back to the tab that requested it.
+    fn decode_reply(&mut self, request_id: u64, outcome: DecodeOutcome) {
+        let Some(tab_id) = self.pending_decodes.remove(&request_id) else {
+            return; // requester gone while the decode was in flight
+        };
+        let Some(tab) = self.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        tab.inflight_decodes = tab.inflight_decodes.saturating_sub(1);
+        let _ = tab.tx.send(&ToRenderer::DecodeResult(outcome));
     }
 
     fn net_reply(&mut self, resp: NetResponse) {
@@ -811,6 +918,9 @@ impl Spawner {
                         let origin = origin.to_string();
                         std::thread::spawn(move || renderer::serve(theirs, &origin))
                     }
+                    Role::Decoder => {
+                        std::thread::spawn(move || crate::decoder::serve_one(theirs))
+                    }
                 };
                 (ChildHandle::Thread(handle), mine)
             }
@@ -829,19 +939,25 @@ impl Spawner {
                     let ep = Endpoint::from_channel(parent_end).expect("wrap parent end");
                     (ChildHandle::Process(child), ep)
                 }
-                Role::Renderer(origin) => {
+                // Both renderers and decoders are fork-served: the engine
+                // creates the socketpair, keeps one end, and hands the other to
+                // the fork server via SCM_RIGHTS — so the child talks straight
+                // to the engine even though the fork server is its OS parent.
+                // Only the ForkRequest differs.
+                Role::Renderer(_) | Role::Decoder => {
                     use std::os::fd::AsRawFd;
-                    // The engine creates the renderer's socketpair, keeps one
-                    // end, and hands the other to the fork server via
-                    // SCM_RIGHTS — so the renderer talks straight to the engine
-                    // even though the fork server is its OS parent.
+                    let req = match role {
+                        Role::Renderer(origin) => ipc::ForkRequest::Renderer { origin: origin.to_string() },
+                        Role::Decoder => ipc::ForkRequest::Decoder,
+                        Role::Net => unreachable!(),
+                    };
                     let (parent_end, child_end) =
                         std::os::unix::net::UnixStream::pair().expect("socketpair");
-                    ipc::send_msg(fork_control, &ipc::ForkRequest::Renderer { origin: origin.to_string() })
-                        .expect("fork request");
+                    ipc::send_msg(fork_control, &req).expect("fork request");
                     // SCM_RIGHTS duplicates the fd into the fork server; the
                     // engine then drops its copy of the child's end so it sees
-                    // EOF (→ TabCrashed) when the renderer dies.
+                    // EOF when the child dies (a decoder always, a renderer on
+                    // crash).
                     unsafe { ipc::send_fd(fork_control.as_raw_fd(), child_end.as_raw_fd()) }
                         .expect("send fd");
                     drop(child_end);
@@ -858,11 +974,13 @@ impl Spawner {
                 let role_args: Vec<&str> = match role {
                     Role::Net => vec!["net-daemon"],
                     Role::Renderer(origin) => vec!["renderer", origin],
+                    Role::Decoder => vec!["decoder"],
                 };
                 let (parent_end, child_end) =
                     crate::channel::Channel::pair().expect("channel pair");
-                // No-op off Linux (no namespaces), but kept truthful per role.
-                let isolate_network = matches!(role, Role::Renderer(_));
+                // No-op off Linux (no namespaces), but kept truthful per role:
+                // a decoder needs no network any more than a renderer does.
+                let isolate_network = matches!(role, Role::Renderer(_) | Role::Decoder);
                 let child = spawn_inherited(exe, &role_args, child_end, isolate_network);
                 let ep = Endpoint::from_channel(parent_end).expect("wrap parent end");
                 (ChildHandle::Process(child), ep)
