@@ -10,8 +10,48 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_gosub-proc-iso-poc")
 }
 
+/// How long the binary may run before the harness gives up on it. Everything
+/// here finishes in seconds; this is a backstop, not a budget.
+const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run the binary to completion, killing it if it exceeds [`RUN_TIMEOUT`].
+///
+/// The timeout is the point. `Command::output()` waits forever, so anything
+/// that wedges the engine — a renderer dying on a syscall the sandbox forgot,
+/// on a libc nobody tested — stops being a test failure and becomes a hung
+/// job. That is exactly what happened on the first CI run: the musl leg sat
+/// for hours on a demo that had already lost both its renderers, reporting
+/// nothing. A hang must present as a fast, loud failure.
 fn run(args: &[&str]) -> Output {
-    Command::new(bin()).args(args).output().expect("spawn poc binary")
+    use std::process::Stdio;
+
+    let mut child = Command::new(bin())
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn poc binary");
+
+    let deadline = std::time::Instant::now() + RUN_TIMEOUT;
+    loop {
+        match child.try_wait().expect("poll child") {
+            Some(_) => break,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let out = child.wait_with_output().expect("reap timed-out child");
+                panic!(
+                    "`{}` did not finish within {RUN_TIMEOUT:?} — killed.\n\
+                     A hang here usually means a renderer died and the engine is \
+                     still waiting on it.\nstdout:\n{}\nstderr:\n{}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr),
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    child.wait_with_output().expect("collect child output")
 }
 
 /// The default run (multi-process where the feature is on) must open two tabs,
@@ -118,13 +158,384 @@ fn unknown_argument_is_rejected() {
     assert!(!out.status.success(), "unknown arg should be an error");
 }
 
-/// In multi-process mode on Linux the children announce their seccomp sandbox.
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+/// What each platform's lockdown prints when a *child process* starts up.
+/// Only a real child emits this — in single-process mode the components are
+/// threads and no lockdown runs at all — which is what makes it a usable
+/// signal that multi-process mode really spawned processes.
+#[cfg(target_os = "linux")]
+const LOCKDOWN_BANNER: &str = "seccomp allowlist active";
+#[cfg(target_os = "macos")]
+const LOCKDOWN_BANNER: &str = "seatbelt profile active";
+#[cfg(target_os = "windows")]
+const LOCKDOWN_BANNER: &str = "mitigation policies active";
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+const LOCKDOWN_BANNER: &str = "no sandbox on this platform";
+
+/// Multi-process mode must actually spawn *processes* — and this is the only
+/// test that checks it.
+///
+/// It used to be Linux-only, asserting the seccomp banner. That left a hole
+/// everywhere else: on a platform with no shared memory, multi-process and
+/// single-process runs produce byte-identical output ("via message copy"), so
+/// a silent degradation to threads would pass every other test in this file.
+/// Windows exposed that — all four of its tests passed without anything
+/// confirming a child had been spawned.
+///
+/// The negative half matters as much as the positive one: asserting the banner
+/// is *absent* from a single-process run is what proves the banner distinguishes
+/// the two modes, rather than being something the engine prints regardless.
+#[cfg(feature = "multi-process")]
 #[test]
-fn multi_process_children_are_sandboxed() {
+fn multi_process_spawns_real_children() {
     let out = run(&[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("seccomp allowlist active"), "children not sandboxed:\n{stderr}");
+    assert!(
+        stderr.contains(LOCKDOWN_BANNER),
+        "no child announced its lockdown ({LOCKDOWN_BANNER:?}) — did multi-process \
+         mode silently run its components as threads?\n{stderr}"
+    );
+
+    let out = run(&["--single-process"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains(LOCKDOWN_BANNER),
+        "single-process mode announced a lockdown ({LOCKDOWN_BANNER:?}), so this \
+         banner does not distinguish the two modes and the check above proves \
+         nothing:\n{stderr}"
+    );
+}
+
+/// Seatbelt must *enforce*, not just install.
+///
+/// Unlike seccomp, a Seatbelt denial is not fatal — the call returns `EPERM`
+/// and the process continues — so these probes cannot be judged from a signal.
+/// Each performs its operation before and after `sandbox_init` and reports the
+/// transition through an exit code; the codes below are what those mean.
+#[cfg(all(feature = "multi-process", target_os = "macos"))]
+mod seatbelt_enforcement {
+    use super::bin;
+    use std::process::Command;
+
+    /// Mirrors `selftest::code`.
+    const CONTROL_FAILED: i32 = 90;
+    const NOT_DENIED: i32 = 91;
+    const WRONG_ERROR: i32 = 92;
+    const WRONG_VALUE: i32 = 93;
+
+    fn probe(name: &str) -> i32 {
+        let st = Command::new(bin()).args(["selftest", name]).status().expect("spawn selftest");
+        st.code().unwrap_or_else(|| panic!("{name}: killed by a signal, expected an exit code"))
+    }
+
+    /// Turn a probe's exit code into a message that says which half failed —
+    /// "the sandbox let it through" and "it never worked anyway" are very
+    /// different bugs and a bare assertion cannot tell them apart.
+    fn check(name: &str) {
+        match probe(name) {
+            0 => {}
+            CONTROL_FAILED => panic!(
+                "{name}: the operation already failed BEFORE lockdown, so this proves \
+                 nothing about the profile — the control is broken, not the sandbox"
+            ),
+            NOT_DENIED => panic!("{name}: the operation SUCCEEDED under the profile — not enforcing"),
+            WRONG_ERROR => panic!("{name}: denied, but not with EPERM — something else refused it"),
+            WRONG_VALUE => panic!("{name}: the cap was applied but did not take the expected value"),
+            other => panic!("{name}: unexpected exit {other}"),
+        }
+    }
+
+    /// A renderer has no filesystem — `(deny default)` withholding `file-read*`
+    /// is the SBPL counterpart of `openat` being off the seccomp list.
+    #[test]
+    fn renderer_cannot_open_files() {
+        check("seatbelt-file");
+    }
+
+    /// A renderer has no network. On Linux that is an empty netns plus missing
+    /// socket syscalls; here it is the profile omitting `network-outbound`, so
+    /// it needs its own test rather than inheriting the Linux one's assurance.
+    #[test]
+    fn renderer_cannot_reach_the_network() {
+        check("seatbelt-network");
+    }
+
+    /// No new programs, the analogue of `execve`/`clone` being off the list.
+    #[test]
+    fn renderer_cannot_spawn_programs() {
+        check("seatbelt-exec");
+    }
+
+    /// The control for the test above it: the net component's profile *does*
+    /// grant outbound access. Without this, "the renderer cannot reach the
+    /// network" would be equally satisfied by a machine with no network.
+    #[test]
+    fn net_component_keeps_its_network() {
+        check("seatbelt-net-role-keeps-network");
+    }
+
+    /// The control for every denial in this module: ordinary work must still
+    /// run under the profile. A profile so tight the renderer cannot function
+    /// would satisfy every negative test above and ship a broken component.
+    #[test]
+    fn ordinary_work_survives_the_profile() {
+        check("seatbelt-baseline");
+    }
+
+    /// `file-read*` and `file-write*` are separate SBPL operations — denying
+    /// reads does not imply denying writes.
+    #[test]
+    fn renderer_cannot_write_files() {
+        check("seatbelt-file-write");
+    }
+
+    /// `process-fork` is distinct from `process-exec`: forking without exec is
+    /// still process creation.
+    #[test]
+    fn renderer_cannot_fork() {
+        check("seatbelt-fork");
+    }
+
+    /// Tests the profile's *precision*, not merely that one exists. The grant
+    /// is `(allow signal (target self))`; if that scope were widened or lost,
+    /// every other test here would still pass and only this one would notice.
+    #[test]
+    fn renderer_cannot_signal_other_processes() {
+        check("seatbelt-signal-other");
+    }
+
+    /// The backend docs claim the profile grants no `sysctl-read`. Nothing
+    /// checked that until now; sysctls leak host details useful for
+    /// fingerprinting and exploit tuning.
+    #[test]
+    fn renderer_cannot_read_sysctls() {
+        check("seatbelt-sysctl");
+    }
+
+    /// The rlimits are a mechanism wholly separate from Seatbelt, and were
+    /// entirely unverified on macOS.
+    #[test]
+    fn child_rlimits_are_applied() {
+        check("rlimits");
+    }
+
+    /// Verifies the kernel *accepts* `PT_DENY_ATTACH` — deliberately weaker
+    /// than the Linux `children_refuse_debugger_attach`, which proves an attach
+    /// is actually refused.
+    ///
+    /// That stronger test is unavailable here: an unprivileged macOS process
+    /// cannot `PT_ATTACH` even to its own child without SIP disabled or
+    /// task-port entitlements, so the control fails and the probe proves
+    /// nothing. The first version did exactly that and CI reported
+    /// CONTROL_FAILED — the right answer, but not a usable test. What remains
+    /// still catches the call being rejected outright, which matters because
+    /// `deny_debugger_attach` only warns on failure.
+    #[test]
+    fn ptrace_deny_attach_is_accepted() {
+        check("ptrace-deny-accepted");
+    }
+}
+
+/// Windows process mitigation policies must *enforce*, not merely install.
+///
+/// Same shape as the macOS module: a denied operation returns an error rather
+/// than killing the process, so each probe runs its operation before and after
+/// the lockdown and reports the transition through an exit code.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+mod mitigation_enforcement {
+    use super::bin;
+    use std::process::Command;
+
+    /// Mirrors `selftest::wcode`.
+    const CONTROL_FAILED: i32 = 90;
+    const NOT_DENIED: i32 = 91;
+    const WRONG_VALUE: i32 = 93;
+
+    fn check(name: &str) {
+        let st = Command::new(bin()).args(["selftest", name]).status().expect("spawn selftest");
+        match st.code().unwrap_or_else(|| panic!("{name}: no exit code")) {
+            0 => {}
+            CONTROL_FAILED => panic!(
+                "{name}: the operation already failed BEFORE lockdown, so this proves \
+                 nothing about the policy — the control is broken, not the sandbox"
+            ),
+            NOT_DENIED => panic!("{name}: the operation SUCCEEDED under the policy — not enforcing"),
+            WRONG_VALUE => panic!("{name}: the kernel did not record the policy we set"),
+            other => panic!("{name}: unexpected exit {other}"),
+        }
+    }
+
+    /// The control for the denials below: ordinary work must still run. A
+    /// policy set that broke the component would satisfy every negative test
+    /// while shipping a renderer that cannot render.
+    #[test]
+    fn ordinary_work_survives_the_policies() {
+        check("mitigation-baseline");
+    }
+
+    /// W^X: the counterpart of the seccomp `PROT_EXEC` argument filter, and the
+    /// step most memory-corruption chains need to execute injected code.
+    #[test]
+    fn renderer_cannot_allocate_executable_memory() {
+        check("mitigation-dynamic-code");
+    }
+
+    /// The analogue of `execve`/`clone` being absent from the allowlist.
+    #[test]
+    fn renderer_cannot_spawn_child_processes() {
+        check("mitigation-child-process");
+    }
+
+    /// Behaviour is the real test, but the kernel's own readback catches a
+    /// policy word assembled wrongly — including extension-point disabling,
+    /// which has no convenient behavioural probe (it would need a third party
+    /// to attempt an injection).
+    #[test]
+    fn kernel_recorded_the_policies() {
+        check("mitigation-policies-readback");
+    }
+
+    /// Integrity is mandatory access control: a low-integrity process cannot
+    /// write to objects labelled medium or above, which is most of the user's
+    /// profile. This is the largest single reduction in blast radius available
+    /// on Windows without a bespoke spawn path.
+    #[test]
+    fn renderer_cannot_write_to_medium_integrity_objects() {
+        check("low-integrity");
+    }
+
+    /// The job object's memory ceiling — the `RLIMIT_AS` analogue Windows
+    /// otherwise lacks, and the one parent-side control that can be attached
+    /// to a process that already exists.
+    #[test]
+    fn job_object_caps_memory() {
+        check("job-memory-limit");
+    }
+
+    /// The token handed to a child must carry fewer privileges than the one
+    /// the engine runs with. Privileges are the ambient ACL-override rights; a
+    /// renderer needs none of them.
+    ///
+    /// This builds a restricted token *in the probe process*. It confirms the
+    /// token can be built, but not that a spawned child actually received one —
+    /// see `spawned_children_get_a_restricted_token` for that.
+    #[test]
+    fn child_token_drops_privileges() {
+        check("restricted-token");
+    }
+
+    /// A *spawned* child must run under the restricted token, not fall back to
+    /// the inherited one.
+    ///
+    /// This is separate from the probe above because the failure it guards
+    /// against is exactly a successful-looking fallback: `restricted_token`
+    /// warns and returns `None` on error, the spawner uses the inherited token,
+    /// and rendering proceeds — so every other test passes while the child runs
+    /// unrestricted. The warning is the only signal, so its *absence* is the
+    /// assertion.
+    ///
+    /// It caught a real bug: an unaligned SID buffer made `CreateRestrictedToken`
+    /// fault intermittently, which is why "green once, red twice" plagued this
+    /// backend before the alignment fix.
+    #[test]
+    fn spawned_children_get_a_restricted_token() {
+        let out = super::run(&[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("using inherited token"),
+            "a child fell back to the inherited token — restricted_token() failed:\n{stderr}"
+        );
+    }
+}
+
+/// Guards the enforcement suite against silently shrinking.
+///
+/// Every test below this point is `cfg`'d to Linux, so on another platform
+/// they do not fail — they cease to exist, and the run still reports success.
+/// That is not a hypothetical: the Windows port compiled out 13 of these 16
+/// tests and `cargo test` was green. A green suite that tests nothing is worse
+/// than a red one.
+///
+/// So the binary reports which probes it actually has, and this asserts that
+/// inventory against a per-platform expectation. Adding a probe fails here
+/// until the list is updated (which is the prompt to also add a test for it);
+/// losing one to a `cfg` fails here too. A platform whose expected set is
+/// empty is making an explicit, reviewable claim: *nothing about this
+/// platform's sandbox is verified.*
+#[cfg(feature = "multi-process")]
+mod probe_inventory {
+    use super::bin;
+    use std::process::Command;
+
+    /// What this platform is expected to verify. Keep in sync with
+    /// `selftest::PROBES` — that is the point of the test.
+    #[cfg(target_os = "linux")]
+    const EXPECTED: &[&str] = &[
+        "baseline",
+        "mprotect-exec",
+        "socket",
+        "memfd-seal",
+        "fcntl-dupfd",
+        "ring",
+        "netns",
+        "no-ptrace",
+        "forkserver-can-fork",
+        "forkserver-canary-gap",
+        "forkserver-no-exec",
+        "forkserver-no-socket",
+    ];
+
+    /// The Seatbelt profile's enforcement. `PT_DENY_ATTACH` and the rlimits
+    /// are still unprobed — the list says so rather than implying coverage.
+    #[cfg(target_os = "macos")]
+    const EXPECTED: &[&str] = &[
+        "seatbelt-file",
+        "seatbelt-network",
+        "seatbelt-exec",
+        "seatbelt-net-role-keeps-network",
+        "seatbelt-baseline",
+        "seatbelt-file-write",
+        "seatbelt-fork",
+        "seatbelt-signal-other",
+        "seatbelt-sysctl",
+        "rlimits",
+        "ptrace-deny-accepted",
+    ];
+
+    /// Windows: the process mitigation policies. The access-confining half
+    /// (restricted token, AppContainer, job object) is parent-side and not
+    /// implemented, so there is nothing yet to probe for file or network
+    /// confinement — see `sandbox/windows.rs`.
+    #[cfg(target_os = "windows")]
+    const EXPECTED: &[&str] = &[
+        "mitigation-baseline",
+        "mitigation-dynamic-code",
+        "mitigation-child-process",
+        "mitigation-policies-readback",
+        "low-integrity",
+        "job-memory-limit",
+        "restricted-token",
+    ];
+
+    /// Everything else has no sandbox backend: components run unconfined under
+    /// `sandbox::unsupported`. Nothing to probe until a measure lands — and
+    /// when one does, this list is what forces a probe to land with it.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    const EXPECTED: &[&str] = &[];
+
+    #[test]
+    fn compiled_probes_match_this_platform() {
+        let out = Command::new(bin()).args(["selftest", "list"]).output().expect("spawn selftest");
+        assert!(out.status.success(), "selftest list failed: {out:?}");
+        let got: Vec<String> =
+            String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().to_string()).collect();
+        assert_eq!(
+            got,
+            EXPECTED,
+            "sandbox probe inventory changed.\n\
+             If you added a measure, add a probe AND a test for it, then update EXPECTED.\n\
+             If a probe vanished, a `cfg` is hiding it — that is the bug this test exists to catch."
+        );
+    }
 }
 
 /// The sandbox must *enforce*, not just announce. These run the `selftest`
@@ -161,6 +572,60 @@ mod sandbox_enforcement {
     #[test]
     fn opening_a_socket_is_killed() {
         let st = probe("socket");
+        assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (no network), got {st:?}");
+    }
+
+    /// The inbound direction: other software running as the same user must not
+    /// be able to `ptrace`-attach or read `/proc/<pid>/mem`. Guards the
+    /// placement as much as the call — the dumpable flag does not survive
+    /// `execve`, so setting it pre-exec would leave this silently at 1.
+    #[test]
+    fn children_refuse_debugger_attach() {
+        let st = probe("no-ptrace");
+        assert!(st.success(), "expected a non-dumpable process, got {st:?}");
+    }
+
+    /// Defense in depth beneath the allowlist: even if `socket()` were somehow
+    /// reachable, the renderer's network namespace has nothing in it. This
+    /// probe unshares and then enumerates interfaces, so it fails loudly if the
+    /// namespace was never actually created.
+    #[test]
+    fn renderer_network_namespace_is_empty() {
+        let st = probe("netns");
+        assert!(st.success(), "expected an empty netns, got {st:?}");
+    }
+
+    /// The fork server's filter is inherited by every renderer it forks, so a
+    /// gap in it kills *renderers*, not the fork server — and surfaces as
+    /// `TabCrashed`, looking nothing like a sandbox problem. This is the
+    /// positive case guarding that: forking, reaping, and the
+    /// `fcntl(F_DUPFD_CLOEXEC)` a forked child needs to split its endpoint
+    /// before its own lockdown must all survive.
+    #[test]
+    fn fork_server_can_still_fork_and_reap() {
+        let st = probe("forkserver-can-fork");
+        assert!(st.success(), "the zygote cannot do its job under its filter: {st:?}");
+    }
+
+    /// The canary has to *detect*, not just pass. This runs it against a filter
+    /// missing `set_robust_list` — one of the three syscalls that really were
+    /// absent when this filter was written — and requires it to abort. A canary
+    /// that only ever succeeds is indistinguishable from no canary.
+    #[test]
+    fn startup_canary_detects_a_missing_syscall() {
+        let st = probe("forkserver-canary-gap");
+        assert_eq!(st.code(), Some(1), "canary should abort with exit 1, got {st:?}");
+    }
+
+    #[test]
+    fn fork_server_cannot_exec() {
+        let st = probe("forkserver-no-exec");
+        assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (no exec), got {st:?}");
+    }
+
+    #[test]
+    fn fork_server_cannot_open_a_socket() {
+        let st = probe("forkserver-no-socket");
         assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (no network), got {st:?}");
     }
 

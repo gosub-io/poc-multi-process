@@ -21,6 +21,11 @@
 //! - run time: when the feature is compiled in, `--single-process` still
 //!   selects the thread-based setup (like Chromium's `--single-process`).
 
+// The transport seam, mirroring `sandbox`: the only place a `target_os` cfg
+// for the IPC byte channel lives. Multi-process only — single-process links
+// are in-process channels.
+#[cfg(feature = "multi-process")]
+mod channel;
 mod engine;
 mod events;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
@@ -29,12 +34,23 @@ mod ip_utils;
 mod ipc;
 mod net_daemon;
 mod renderer;
-#[cfg(feature = "multi-process")]
+// Unconditional: the per-OS confinement machinery inside is feature-gated, but
+// `deny_debugger_attach` applies to the single-process build too — that build
+// still holds the cookie jar in its address space. The platform backend
+// (seccomp / Seatbelt / none) is selected inside the module.
 mod sandbox;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 mod ring;
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
+// Compiled on every platform (not just Linux) so the integration suite can
+// query the probe inventory anywhere — a platform with no probes must fail
+// loudly rather than silently skip its enforcement tests.
+#[cfg(feature = "multi-process")]
 mod selftest;
+// The spawn seam: how a child process is created. Owned rather than delegated
+// to std::process::Command because Windows access controls must be supplied at
+// CreateProcess time.
+#[cfg(feature = "multi-process")]
+mod spawn;
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 mod shm;
 
@@ -70,7 +86,7 @@ fn main() {
         #[cfg(all(feature = "multi-process", target_os = "linux"))]
         Some("fork-server") => fork_server::run(&args[2]),
         // Internal sandbox self-test, spawned only by the integration suite.
-        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        #[cfg(feature = "multi-process")]
         Some("selftest") => selftest::run(&args[2]),
         // Tile-transport measurement: render N frames over one tab and report
         // time + engine memory, via shared memory or the socket-copy path.
@@ -111,7 +127,10 @@ fn run(mode: Mode) {
     engine.open_tab(work, "https://example.com").unwrap();
     engine.open_tab(personal, "https://example.com").unwrap();
 
-    let mut tabs_closed = 0;
+    // Counts tabs that have *finished*, however they finished. A crash is an
+    // outcome, not a reason to wait forever — see `TabCrashed` below.
+    let mut tabs_finished = 0;
+    let mut crashed = 0;
     for event in events {
         match event {
             EngineEvent::TabOpened { tab_id, zone, origin } => {
@@ -138,8 +157,8 @@ fn run(mode: Mode) {
             }
             EngineEvent::TabClosed { tab_id } => {
                 println!("{tab_id}: closed");
-                tabs_closed += 1;
-                if tabs_closed == 2 {
+                tabs_finished += 1;
+                if tabs_finished == 2 {
                     engine.shutdown().unwrap();
                 }
             }
@@ -150,13 +169,36 @@ fn run(mode: Mode) {
                 println!("{tab_id}: navigation failed: {reason}");
             }
             EngineEvent::TabCrashed { tab_id } => {
+                // A crashed tab is finished too. Counting it is what keeps a
+                // dead renderer from hanging the whole run: previously this
+                // arm only printed, so `tabs_finished` never reached its
+                // target, shutdown was never sent, and the loop blocked
+                // forever. That turned any renderer failure — a sandbox gap on
+                // an untested libc, say — into a silent hang instead of a
+                // fast, loud failure. CI sat for hours on one.
+                //
+                // The exit code below still reports it, so this terminates
+                // *and* fails rather than pretending all is well.
                 println!("{tab_id}: renderer crashed (other tabs unaffected)");
+                crashed += 1;
+                tabs_finished += 1;
+                if tabs_finished == 2 {
+                    engine.shutdown().unwrap();
+                }
             }
             EngineEvent::EngineShutdown => {
                 println!("engine shut down");
                 break;
             }
         }
+    }
+
+    // Exit non-zero if any renderer died. Without this the demo would report
+    // success on a run where nothing rendered, which is exactly the false
+    // green the integration tests would then have to catch on their own.
+    if crashed > 0 {
+        eprintln!("{crashed} renderer(s) crashed — see the sandbox notes in src/sandbox/");
+        std::process::exit(1);
     }
 }
 

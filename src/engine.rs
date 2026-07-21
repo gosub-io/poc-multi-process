@@ -95,6 +95,10 @@ impl EngineHandle {
 /// event stream; the event loop runs on its own thread until
 /// [`EngineCommand::Shutdown`].
 pub fn start(mode: Mode) -> (EngineHandle, Receiver<EngineEvent>) {
+    // The engine is the highest-value target on the machine: it is the only
+    // process holding the cookie jar. Do this before the loop starts, and so
+    // before any jar is loaded, so the secrets are never in a readable process.
+    crate::sandbox::deny_debugger_attach();
     let (inbox_tx, inbox_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     let handle = EngineHandle { inbox: inbox_tx.clone() };
@@ -128,7 +132,7 @@ enum LoopMsg {
 enum ChildHandle {
     Thread(std::thread::JoinHandle<()>),
     #[cfg(feature = "multi-process")]
-    Process(std::process::Child),
+    Process(crate::spawn::Child),
     /// A renderer `fork()`ed by the fork server, which owns and reaps it. The
     /// engine has no `Child` for it; it detects death via IPC-socket EOF.
     #[cfg(all(feature = "multi-process", target_os = "linux"))]
@@ -761,7 +765,7 @@ enum Spawner {
         #[cfg(target_os = "linux")]
         fork_control: std::os::unix::net::UnixStream,
         #[cfg(target_os = "linux")]
-        fork_child: std::process::Child,
+        fork_child: crate::spawn::Child,
     },
 }
 
@@ -778,7 +782,16 @@ impl Spawner {
                 // without exec.
                 let (fork_control, fs_end) =
                     std::os::unix::net::UnixStream::pair().expect("socketpair");
-                let fork_child = spawn_inherited(&exe, &["fork-server"], fs_end);
+                // The fork server needs no network of its own, and every
+                // renderer it forks inherits the empty netns — which is how
+                // renderers get network isolation without ever passing through
+                // `spawn_inherited` themselves.
+                let fork_child = spawn_inherited(
+                    &exe,
+                    &["fork-server"],
+                    crate::channel::Channel::from_stream(fs_end),
+                    true,
+                );
                 Spawner::Multi { exe, fork_control, fork_child }
             }
             #[cfg(all(feature = "multi-process", not(target_os = "linux")))]
@@ -809,9 +822,11 @@ impl Spawner {
             Spawner::Multi { exe, fork_control, .. } => match role {
                 Role::Net => {
                     let (parent_end, child_end) =
-                        std::os::unix::net::UnixStream::pair().expect("socketpair");
-                    let child = spawn_inherited(exe, &["net-daemon"], child_end);
-                    let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
+                        crate::channel::Channel::pair().expect("channel pair");
+                    // The one role that keeps its network namespace: it is the
+                    // component whose entire job is outbound fetching.
+                    let child = spawn_inherited(exe, &["net-daemon"], child_end, false);
+                    let ep = Endpoint::from_channel(parent_end).expect("wrap parent end");
                     (ChildHandle::Process(child), ep)
                 }
                 Role::Renderer(origin) => {
@@ -830,7 +845,8 @@ impl Spawner {
                     unsafe { ipc::send_fd(fork_control.as_raw_fd(), child_end.as_raw_fd()) }
                         .expect("send fd");
                     drop(child_end);
-                    let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
+                    let ep = Endpoint::from_channel(crate::channel::Channel::from_stream(parent_end))
+                        .expect("wrap parent end");
                     (ChildHandle::ForkServed, ep)
                 }
             },
@@ -844,9 +860,11 @@ impl Spawner {
                     Role::Renderer(origin) => vec!["renderer", origin],
                 };
                 let (parent_end, child_end) =
-                    std::os::unix::net::UnixStream::pair().expect("socketpair");
-                let child = spawn_inherited(exe, &role_args, child_end);
-                let ep = Endpoint::from_stream(parent_end).expect("wrap parent end");
+                    crate::channel::Channel::pair().expect("channel pair");
+                // No-op off Linux (no namespaces), but kept truthful per role.
+                let isolate_network = matches!(role, Role::Renderer(_));
+                let child = spawn_inherited(exe, &role_args, child_end, isolate_network);
+                let ep = Endpoint::from_channel(parent_end).expect("wrap parent end");
                 (ChildHandle::Process(child), ep)
             }
         }
@@ -871,35 +889,28 @@ impl Spawner {
 /// travels on argv, which is not a secret. Resource ceilings are imposed in
 /// `pre_exec`, before the child runs its own code, and are inherited across
 /// exec (and, for the fork server, across its later `fork()`s).
+///
+/// `isolate_network` additionally drops the child into an empty network
+/// namespace. Like the rlimits, it is inherited across exec *and* across the
+/// fork server's later `fork()`s — which is precisely how renderers get it,
+/// since they are forked rather than spawned through this function. The net
+/// component is the one role that must not have it.
 #[cfg(feature = "multi-process")]
 fn spawn_inherited(
     exe: &std::path::Path,
     args: &[&str],
-    child_end: std::os::unix::net::UnixStream,
-) -> std::process::Child {
-    use std::os::fd::IntoRawFd;
-    use std::os::unix::process::CommandExt;
-
-    let child_fd = child_end.into_raw_fd();
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(args).arg(child_fd.to_string());
-    // Clear FD_CLOEXEC on the child's end so it survives exec. Every other fd
-    // the engine holds keeps CLOEXEC and is NOT leaked into the child.
-    unsafe {
-        cmd.pre_exec(move || {
-            crate::sandbox::apply_child_rlimits()?;
-            let flags = libc::fcntl(child_fd, libc::F_GETFD);
-            if flags < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::fcntl(child_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    child_end: crate::channel::Channel,
+    isolate_network: bool,
+) -> crate::spawn::Child {
+    let child = crate::spawn::spawn(exe, args, child_end, isolate_network)
+        .expect("spawn child process");
+    // Parent-side confinement, for the mechanisms a child cannot apply to
+    // itself. A no-op outside Windows, where everything is self-applied.
+    if let Err(e) = crate::sandbox::confine_spawned_child(&child) {
+        // Fail closed, matching the lockdown precedent: a child that was meant
+        // to be capped and silently is not is worse than an honest refusal.
+        panic!("could not confine spawned child: {e}");
     }
-    let child = cmd.spawn().expect("spawn child process");
-    unsafe { libc::close(child_fd) };
     child
 }
 

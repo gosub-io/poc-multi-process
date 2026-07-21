@@ -24,3 +24,18 @@ libc = "0.2"
 # seccomp sandboxing is Linux-only; referenced under cfg(target_os = "linux").
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.4"
+
+# windows-sys: anonymous-pipe transport (CreatePipe), handle inheritance
+# (SetHandleInformation), and the process mitigation policies the sandbox
+# backend installs (Set/GetProcessMitigationPolicy, VirtualAlloc for its probes).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }

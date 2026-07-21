@@ -1,50 +1,128 @@
-//! URL host extraction and IP classification for the SSRF policy — the pure
+//! URL host extraction and IP classification for the SSRF policy — the
 //! "is this destination allowed?" logic, factored out of the net component so
-//! it can be read (and audited) without the transport around it. No I/O, no
-//! resolver: everything here works on the URL string and numeric addresses.
+//! it can be read (and audited) without the transport around it.
+//!
+//! ## Deciding and connecting must be one step
+//!
+//! The obvious API — "is this URL allowed?", answered yes or no — cannot be
+//! made safe for hostnames, however good the classification behind it is. The
+//! caller still has to connect, connecting re-resolves the name, and the
+//! attacker controls what the *second* lookup returns. That is DNS rebinding,
+//! and no amount of checking inside a boolean-returning function closes it.
+//!
+//! So [`resolve_and_pin`] returns the **address the caller must connect to**,
+//! not a verdict. One resolution happens, every answer is classified, and the
+//! survivor is handed back for the connection to use directly. A caller that
+//! takes the returned [`Pinned`] and connects to it cannot be rebound, because
+//! there is no second lookup to poison.
+//!
+//! Resolution goes through the [`Resolver`] seam so the policy is testable
+//! without a network: the tests inject hostile answer sets (a fixed resolver)
+//! that a real DNS server would have to be compromised to produce.
 
 use std::net::{IpAddr, Ipv4Addr};
 
-/// The centralized SSRF policy the issue calls for: requests to loopback,
-/// link-local (cloud metadata!), private and other internal ranges are
-/// rejected for all renderers, no matter what a compromised renderer asks for.
+/// How a hostname becomes addresses. A seam, so the SSRF policy can be tested
+/// against hostile answer sets offline — the interesting cases (a name
+/// answering `127.0.0.1`, or mixing a public address with a private one) need
+/// a cooperating DNS server to reproduce for real.
+pub trait Resolver {
+    /// Every address `host` resolves to, in the order the resolver returned
+    /// them. An empty result is a resolution failure.
+    fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>>;
+}
+
+/// The real resolver: whatever the OS says.
 ///
-/// The classification works on the *numeric* address, not a string prefix, so
-/// it can't be slipped past with alternate encodings (`http://2130706433/`,
-/// `0x7f.1`, `[::ffff:169.254.169.254]`), userinfo confusion
-/// (`http://real.com@127.0.0.1/`), or a trailing dot. What it can't do here is
-/// resolve a *hostname*: a real net component would resolve DNS and re-check
-/// the resolved IPs, and pin that IP for the connection to defeat DNS
-/// rebinding. The PoC synthesizes responses offline, so a non-literal host is
-/// allowed with that caveat noted.
-pub fn ssrf_block_reason(url: &str) -> Option<String> {
-    // Scheme allowlist: the net component speaks HTTP(S) only. Anything else
-    // (`file:`, `gopher:`, `ftp:`, …) is refused outright rather than reasoned
-    // about — a renderer confined to its own *host* origin can still name a
-    // non-HTTP scheme, since origin identity here is scheme-blind.
+/// Unused in this PoC — the net component synthesizes responses offline and
+/// resolves through its own stand-in, so wiring this in would make every fetch
+/// depend on a working network. It is the implementation a real deployment
+/// selects, kept here so the production path is one line rather than a design
+/// exercise.
+#[allow(dead_code)]
+pub struct SystemResolver;
+
+impl Resolver for SystemResolver {
+    fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+        use std::net::ToSocketAddrs;
+        // Port is irrelevant to the lookup; `to_socket_addrs` just needs one.
+        Ok((host, 0u16).to_socket_addrs()?.map(|sa| sa.ip()).collect())
+    }
+}
+
+/// A resolver with a canned answer, for tests.
+#[cfg(test)]
+pub struct FixedResolver(pub Vec<IpAddr>);
+
+#[cfg(test)]
+impl Resolver for FixedResolver {
+    fn resolve(&self, _host: &str) -> std::io::Result<Vec<IpAddr>> {
+        Ok(self.0.clone())
+    }
+}
+
+/// A destination that passed policy: the exact address to connect to.
+///
+/// The point of returning this rather than `bool` is that it removes the second
+/// DNS lookup. Connect to `addr` and rebinding is structurally impossible;
+/// re-resolve `host` and every guarantee here is void.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pinned {
+    pub host: String,
+    pub addr: IpAddr,
+}
+
+/// Resolve `url`'s host and decide the destination, returning the address to
+/// pin the connection to or the reason it is refused.
+///
+/// IP literals skip resolution — there is nothing to look up and nothing to
+/// rebind. Names are resolved once, and **every** returned address must pass:
+/// if any answer is internal the whole name is refused, rather than connecting
+/// to whichever answers survive. That is deliberate. Which address the OS hands
+/// out of a multi-answer set is not the caller's choice, so a name answering
+/// `[1.2.3.4, 127.0.0.1]` is one round-robin away from being loopback. Treating
+/// the good answer as usable would be trusting an attacker-supplied answer set
+/// to be partly honest. The cost is that a host with one stray private address
+/// becomes unreachable, which is the right side to err on for a fetch a
+/// renderer asked for.
+pub fn resolve_and_pin(url: &str, resolver: &impl Resolver) -> Result<Pinned, String> {
     match scheme_of(url) {
         Some(s) if s == "http" || s == "https" => {}
-        Some(s) => return Some(format!("scheme {s}:// is not allowed (SSRF policy)")),
-        None => return Some("unparseable URL".into()),
+        Some(s) => return Err(format!("scheme {s}:// is not allowed (SSRF policy)")),
+        None => return Err("unparseable URL".into()),
     }
 
     let Some(host) = host_of(url) else {
-        return Some("unparseable URL".into());
+        return Err("unparseable URL".into());
     };
 
-    // Names that resolve to loopback without touching a resolver.
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") {
-        return Some(format!("host {host} resolves to loopback (SSRF policy)"));
+    // A literal is already an address: classify it and pin it as-is. No
+    // resolution means no rebinding window, so this needs no special handling
+    // beyond the classification that was always here.
+    if let Some(ip) = parse_ip_literal(&host) {
+        return match blocked_ip_reason(ip) {
+            Some(category) => Err(format!("host {host} is {category} (SSRF policy)")),
+            None => Ok(Pinned { host, addr: ip }),
+        };
     }
 
-    // If the host is an IP literal (in any accepted encoding), classify it.
-    if let Some(ip) = parse_ip_literal(&host) {
-        if let Some(category) = blocked_ip_reason(ip) {
-            return Some(format!("host {host} is {category} (SSRF policy)"));
+    let addrs = resolver
+        .resolve(&host)
+        .map_err(|e| format!("host {host} did not resolve: {e} (SSRF policy)"))?;
+    if addrs.is_empty() {
+        return Err(format!("host {host} did not resolve (SSRF policy)"));
+    }
+
+    // Fail closed on *any* blocked answer — see the doc comment above.
+    for ip in &addrs {
+        if let Some(category) = blocked_ip_reason(*ip) {
+            return Err(format!(
+                "host {host} resolves to {ip}, which is {category} (SSRF policy)"
+            ));
         }
     }
-    None
+
+    Ok(Pinned { host, addr: addrs[0] })
 }
 
 /// The lowercased URL scheme (the part before `://`), or `None` if the URL has
@@ -200,6 +278,33 @@ fn blocked_v4(v4: Ipv4Addr) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// A resolver standing in for a realistic world: loopback names answer
+    /// loopback, one name is deliberately internal, everything else is public.
+    /// Literal hosts never reach it — they are classified directly.
+    struct TestResolver;
+
+    impl Resolver for TestResolver {
+        fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            let lower = host.to_ascii_lowercase();
+            Ok(match lower.as_str() {
+                "localhost" => vec![ip("127.0.0.1")],
+                h if h.ends_with(".localhost") => vec![ip("127.0.0.1")],
+                "internal.example" => vec![ip("10.0.0.5")],
+                "nx.example" => vec![],
+                _ => vec![ip("93.184.216.34")],
+            })
+        }
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// Convenience: run the policy against the realistic resolver.
+    fn check(url: &str) -> Result<Pinned, String> {
+        resolve_and_pin(url, &TestResolver)
+    }
+
     #[test]
     fn blocks_internal_ranges_and_encoding_bypasses() {
         for u in [
@@ -227,7 +332,7 @@ mod tests {
             // Non-HTTP schemes are refused outright, whatever the host.
             "file://example.com/etc/passwd", "gopher://example.com/", "ftp://127.0.0.1/",
         ] {
-            assert!(ssrf_block_reason(u).is_some(), "should block {u}: {:?}", ssrf_block_reason(u));
+            assert!(check(u).is_err(), "should block {u}: {:?}", check(u));
         }
     }
 
@@ -237,8 +342,8 @@ mod tests {
         assert!(scheme_of("HTTP://example.com/").as_deref() == Some("http")); // case-folded
         assert!(scheme_of("not-a-url").is_none());
         // A public host over http/https is fine; the same host over file:// is not.
-        assert!(ssrf_block_reason("https://example.com/").is_none());
-        assert!(ssrf_block_reason("file://example.com/").is_some());
+        assert!(check("https://example.com/").is_ok());
+        assert!(check("file://example.com/").is_err());
     }
 
     #[test]
@@ -252,7 +357,7 @@ mod tests {
             "http://[2606:2800:220:1::1]/",
             "http://[64:ff9b::808:808]/", // NAT64 embedding a *public* v4 (8.8.8.8)
         ] {
-            assert!(ssrf_block_reason(u).is_none(), "should allow {u}: {:?}", ssrf_block_reason(u));
+            assert!(check(u).is_ok(), "should allow {u}: {:?}", check(u));
         }
     }
 
@@ -270,5 +375,54 @@ mod tests {
         for h in ["2130706433", "0x7f000001", "017700000001", "127.1"] {
             assert_eq!(parse_ip_literal(h), Some(loopback), "{h}");
         }
+    }
+
+    /// The gap the old `ssrf_block_reason(url) -> Option<String>` could not
+    /// close: a name is not an address, and this one answers loopback.
+    #[test]
+    fn hostname_resolving_to_loopback_is_blocked() {
+        let err = check("http://localhost/").unwrap_err();
+        assert!(err.contains("127.0.0.1"), "reason should name the address: {err}");
+    }
+
+    /// A perfectly ordinary-looking name pointing at internal space. Nothing
+    /// about the *string* is suspicious — only the resolved address is.
+    #[test]
+    fn innocuous_name_resolving_to_private_space_is_blocked() {
+        let err = check("https://internal.example/admin").unwrap_err();
+        assert!(err.contains("10.0.0.5"), "reason should name the address: {err}");
+    }
+
+    /// Fail closed on a mixed answer set. Which address the OS hands out is the
+    /// attacker's choice, not ours, so one internal answer poisons the name.
+    #[test]
+    fn any_internal_answer_refuses_the_whole_name() {
+        let hostile = FixedResolver(vec![ip("93.184.216.34"), ip("127.0.0.1")]);
+        let err = resolve_and_pin("http://rebind.example/", &hostile).unwrap_err();
+        assert!(err.contains("127.0.0.1"), "should refuse on the internal answer: {err}");
+
+        // Order must not matter — the internal answer first is the same verdict.
+        let hostile = FixedResolver(vec![ip("169.254.169.254"), ip("93.184.216.34")]);
+        assert!(resolve_and_pin("http://rebind.example/", &hostile).is_err());
+    }
+
+    /// The anti-rebinding property itself: what comes back is an address, so
+    /// the caller never has to resolve again. A second lookup is the only way
+    /// a rebind can land, and the API removes the reason to perform one.
+    #[test]
+    fn allowed_destination_is_pinned_to_an_address() {
+        let pinned = check("https://example.com/page").unwrap();
+        assert_eq!(pinned.host, "example.com");
+        assert_eq!(pinned.addr, ip("93.184.216.34"));
+
+        // An IP literal pins to itself, with no resolution involved at all.
+        let pinned = resolve_and_pin("http://93.184.216.34/", &FixedResolver(vec![])).unwrap();
+        assert_eq!(pinned.addr, ip("93.184.216.34"));
+    }
+
+    /// A name that does not resolve is refused, not treated as allowed.
+    #[test]
+    fn unresolvable_name_is_refused() {
+        assert!(check("http://nx.example/").is_err());
     }
 }

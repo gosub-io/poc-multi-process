@@ -16,10 +16,13 @@ use serde::{Deserialize, Serialize};
 use std::io;
 #[cfg(feature = "multi-process")]
 use std::io::{Read, Write};
-#[cfg(feature = "multi-process")]
+// fd passing is `SCM_RIGHTS`-specific and only the Linux shared-memory paths
+// (sealed tiles, the body ring, the fork server) use it — macOS and Windows
+// multi-process never send a descriptor, so this stays Linux-gated.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(feature = "multi-process")]
-use std::os::unix::net::UnixStream;
+use crate::channel;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 /// A corrupted (or malicious) length prefix must not make the peer allocate
@@ -113,14 +116,14 @@ pub enum FetchOutcome {
 /// Send half of an IPC link.
 pub enum EndpointTx {
     #[cfg(feature = "multi-process")]
-    Socket(UnixStream),
+    Socket(channel::Tx),
     Local(Sender<Vec<u8>>),
 }
 
 /// Receive half of an IPC link.
 pub enum EndpointRx {
     #[cfg(feature = "multi-process")]
-    Socket(UnixStream),
+    Socket(channel::Rx),
     Local(Receiver<Vec<u8>>),
 }
 
@@ -136,7 +139,7 @@ impl EndpointTx {
 
     /// Pass a duplicate of `fd` to the peer. The caller keeps (and should
     /// promptly close) its own copy.
-    #[cfg(feature = "multi-process")]
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
     pub fn send_fd(&mut self, fd: RawFd) -> io::Result<()> {
         match self {
             // SAFETY: both descriptors are valid — the stream is live and the
@@ -168,7 +171,7 @@ impl EndpointTx {
 impl EndpointRx {
     /// Receive a file descriptor the peer announced (e.g. right after a
     /// `TileShm` message). Fails on local channels, which never carry fds.
-    #[cfg(feature = "multi-process")]
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
     pub fn recv_fd(&mut self) -> io::Result<OwnedFd> {
         match self {
             // SAFETY: the stream is a valid open descriptor.
@@ -205,12 +208,12 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    /// Wrap a connected Unix stream (the stream is cloned so the two halves
-    /// can be used independently).
+    /// Wrap a connected transport channel, splitting it into halves that can
+    /// be used independently (a reader thread plus the event loop's writer).
     #[cfg(feature = "multi-process")]
-    pub fn from_stream(stream: UnixStream) -> io::Result<Endpoint> {
-        let write_half = stream.try_clone()?;
-        Ok(Endpoint { tx: EndpointTx::Socket(write_half), rx: EndpointRx::Socket(stream) })
+    pub fn from_channel(ch: channel::Channel) -> io::Result<Endpoint> {
+        let (tx, rx) = ch.split()?;
+        Ok(Endpoint { tx: EndpointTx::Socket(tx), rx: EndpointRx::Socket(rx) })
     }
 
     pub fn send<T: Serialize>(&mut self, msg: &T) -> io::Result<()> {
@@ -274,7 +277,7 @@ pub fn recv_msg<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<T> {
 /// duplicates the fd into the receiver; the sender keeps its own copy.
 ///
 /// SAFETY: `sock_fd` and `fd` must be valid open descriptors.
-#[cfg(feature = "multi-process")]
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
 pub unsafe fn send_fd(sock_fd: RawFd, fd: RawFd) -> io::Result<()> {
     let mut byte = [0u8; 1];
     let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
@@ -311,7 +314,7 @@ pub unsafe fn send_fd(sock_fd: RawFd, fd: RawFd) -> io::Result<()> {
 /// leak descriptors into the engine until its fd table is exhausted.
 ///
 /// SAFETY: `sock_fd` must be a valid open descriptor.
-#[cfg(feature = "multi-process")]
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
 pub unsafe fn recv_fd(sock_fd: RawFd) -> io::Result<OwnedFd> {
     let mut byte = [0u8; 1];
     let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
@@ -373,6 +376,11 @@ pub unsafe fn recv_fd(sock_fd: RawFd) -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The `SCM_RIGHTS` tests below drive a socketpair directly rather than
+    // through `channel`, since what they pin down is fd-passing behaviour —
+    // Linux-only, like the paths that use it.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    use std::os::unix::net::UnixStream;
 
     #[test]
     fn local_pair_roundtrip() {
@@ -399,7 +407,7 @@ mod tests {
     /// Hand-rolled sendmsg attaching `fds` to ONE SCM_RIGHTS cmsg — what a
     /// compromised peer (sendmsg is on its allowlist) can do to smuggle
     /// descriptors into the fd hand-off.
-    #[cfg(feature = "multi-process")]
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
     unsafe fn send_fds_one_cmsg(sock_fd: std::os::fd::RawFd, fds: &[std::os::fd::RawFd]) {
         let mut byte = [0u8; 1];
         let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
@@ -424,7 +432,7 @@ mod tests {
         assert!(libc::sendmsg(sock_fd, &msg, 0) >= 0, "{}", io::Error::last_os_error());
     }
 
-    #[cfg(feature = "multi-process")]
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
     #[test]
     fn recv_fd_roundtrips_exactly_one() {
         let (a, b) = UnixStream::pair().unwrap();
@@ -433,7 +441,7 @@ mod tests {
         assert!(fd.as_raw_fd() >= 0);
     }
 
-    #[cfg(feature = "multi-process")]
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
     #[test]
     fn recv_fd_rejects_smuggled_extra_fds() {
         // Several fds stuffed into the one-fd hand-off must be refused — and
@@ -445,7 +453,7 @@ mod tests {
         assert!(unsafe { recv_fd(b.as_raw_fd()) }.is_err());
     }
 
-    #[cfg(feature = "multi-process")]
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
     #[test]
     fn recv_fd_rejects_data_without_fd() {
         use std::io::Write;

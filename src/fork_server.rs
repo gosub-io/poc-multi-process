@@ -38,6 +38,26 @@ pub fn run(control_fd: &str) {
     // SAFETY: the engine passed us sole ownership of this inherited fd.
     let mut control = unsafe { UnixStream::from_raw_fd(control_fd) };
 
+    // Confine ourselves before touching the control channel — from here the
+    // fork server can fork, reap, and move bytes on fds it already holds, and
+    // nothing else: no sockets, no file opens, no exec. It was previously left
+    // unconfined on the grounds of being minimal and secret-free, but "minimal"
+    // is not "harmless": this process holds `fork()` and the fd-passing path,
+    // which is a useful primitive to land on.
+    //
+    // Also clears the dumpable flag (it does not survive `execve`, so it could
+    // not have been set pre-exec) — and *that* is inherited by every renderer
+    // forked below, covering the window before each reaches its own lockdown.
+    crate::sandbox::lock_down_fork_server();
+
+    // Then prove the filter is right for *this* host's C library before any
+    // renderer stakes its life on it. The allowlist depends on how libc issues
+    // fork and how it splits descriptors, which varies by glibc version and
+    // differs again on musl — none of it visible at compile time, since the
+    // libc we build against is not the one we run against. Failing here costs
+    // one fork; failing later looks like every tab crashing on open.
+    crate::sandbox::verify_fork_server_filter();
+
     loop {
         let req: ForkRequest = match ipc::recv_msg(&mut control) {
             Ok(req) => req,
@@ -73,8 +93,8 @@ fn fork_renderer(control_fd: RawFd, comp_fd: OwnedFd, origin: String) {
             // Child — this IS the renderer now. It inherited the fork server's
             // warm runtime via copy-on-write; no exec, no re-init.
             unsafe { libc::close(control_fd) }; // never touch the engine's control channel
-            let stream = UnixStream::from(comp_fd);
-            let ep = Endpoint::from_stream(stream).expect("fork-server child: wrap fd");
+            let ch = crate::channel::Channel::from_stream(UnixStream::from(comp_fd));
+            let ep = Endpoint::from_channel(ch).expect("fork-server child: wrap fd");
             // Drop privileges, then serve. rlimits were inherited from the
             // fork server; seccomp is per-process, applied here.
             crate::sandbox::lock_down_renderer();

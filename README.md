@@ -28,7 +28,7 @@ enumerated and everything else is a fatal `SIGSYS` (`KillProcess`, not `EPERM`
 — a killed process can't probe the sandbox and adapt). This is fail-closed — a
 syscall we never considered (a new one, or a bypass such as io_uring-based
 networking) is denied for free — which is what real renderer sandboxes
-(Chromium, Firefox) do. `src/sandbox.rs` holds the curated baseline.
+(Chromium, Firefox) do. `src/sandbox/linux.rs` holds the curated baseline.
 
 A few allowed syscalls are **argument-filtered**: `mmap`/`mprotect` are
 permitted only when `PROT_EXEC` is clear, so a renderer can never turn writable
@@ -40,9 +40,29 @@ mode requires seccomp support (use `--single-process` where it's unavailable).
 The renderer gets the baseline only: no `socket`/`connect` (no network), no
 `openat` (no file opens — so the filesystem is capped without Landlock), no
 `execve`/`clone` (no subprocesses), no `io_uring_*`. The net component gets the
-same baseline plus the socket family, since it owns network access. The engine
-(parent) is unsandboxed on purpose — it is the trusted core that spawns
-processes and holds secrets, and it never parses untrusted bytes.
+same baseline plus the socket family, since it owns network access.
+
+The engine (parent) is unsandboxed, because the privileges a filter would drop
+are exactly the ones it exists to exercise: it spawns processes, opens sockets,
+and holds the cookie jar. It is *not* unsandboxed because it is safe from
+hostile input — it plainly is not. Every frame a renderer or the net component
+sends is `bincode::deserialize`d inside the engine (`rx.recv::<FromRenderer>()`
+in the loop's reader threads), so a compromised child's bytes are parsed by the
+one process holding every secret, with full ambient authority and no filter
+behind it.
+
+What bounds that today: frames are length-prefixed and capped at 16 MiB with
+the length checked *before* allocating, the wire types are closed enums, and
+bincode has no type-directed dispatch — it cannot be steered into constructing
+arbitrary types the way a gadget-bearing format (pickle, Java serialization,
+`serde_yaml` tags) can. So this is a narrow surface, not an open one. It is
+still the sharpest edge in the model, because the whole architecture rests on
+the broker being uncompromisable and this is the one place untrusted bytes
+reach it.
+
+A production engine would confine the broker too — Chromium sandboxes its
+browser process, just far more loosely than a renderer — and would keep the
+parser minimal and fuzzed. Neither is done here.
 
 ## Event-driven engine
 
@@ -130,7 +150,7 @@ engine event loop (broker — owns cookie jar & policy)
   only a curated baseline (I/O on existing fds, memory, futex, signals, time).
   A renderer — even one fully code-exec'd by an exploit — physically cannot
   open a socket, an io_uring instance, a file, or a subprocess; the kernel
-  returns `EPERM`. See `src/sandbox.rs`. The net component gets the same
+  returns `EPERM`. See `src/sandbox/linux.rs`. The net component gets the same
   baseline plus the socket family.
 - Children run under **OS resource caps** the engine sets at spawn (Linux):
   `RLIMIT_AS` (512 MiB address space), `RLIMIT_NOFILE`, and `RLIMIT_CORE=0`.
@@ -355,14 +375,15 @@ covers the bounding mechanism itself deterministically.
 |------|----------|
 | `src/events.rs` | Public vocabulary: `EngineCommand`, `TabCommand`, `EngineEvent`, `TabId`, `Tile` |
 | `src/engine.rs` | `start(mode)`, `EngineHandle`, the event loop (broker + policy), `Spawner` |
-| `src/ipc.rs` | `Endpoint` tx/rx halves (socket/local transports), wire messages, bincode framing, `SCM_RIGHTS` fd-passing |
+| `src/ipc.rs` | `Endpoint` tx/rx halves (channel/local transports), wire messages, bincode framing, `SCM_RIGHTS` fd-passing (Linux) |
+| `src/channel/` | Transport seam: the duplex byte channel a link runs over — `unix.rs` (socketpair), `windows.rs` (anonymous pipe pair) |
 | `src/net_daemon.rs` | Net component: `serve` loop, (synthesized) fetching |
 | `src/ip_utils.rs` | SSRF policy: URL host extraction, IP-literal parsing (incl. `inet_aton` encodings), blocked-range classification |
 | `src/renderer.rs` | Per-`(zone,origin)` renderer: `serve` loop, placeholder render pipeline |
 | `src/fork_server.rs` | Fork server (Linux): `fork()`s renderers without exec |
 | `src/shm.rs` | Shared-memory tiles (Linux): sealed-`memfd` producer + validating consumer |
 | `src/ring.rs` | Shared-memory ring (Linux): streams large fetch bodies, futex wakeups, hostile-cursor validation |
-| `src/sandbox.rs` | seccomp-BPF privilege capping for the child processes (Linux) |
+| `src/sandbox/` | Privilege capping seam: `linux.rs` (seccomp-BPF, netns, rlimits), `macos.rs` (Seatbelt), `unsupported.rs` (no-ops) |
 | `src/selftest.rs` | Sandbox-enforcement probes spawned by the integration tests (Linux) |
 | `src/main.rs` | Child-role dispatch for re-exec + minimal event-driven usage |
 | `tests/integration.rs` | End-to-end tests running the built binary (both modes + sandbox) |
@@ -373,12 +394,47 @@ The security *mechanisms* are real (see the isolation section); what's
 simplified is the surrounding browser. What each entry below still needs:
 
 - **Sandboxing**: the seccomp filter is production-shaped (fail-closed
-  allowlist, `KillProcess`, W^X via `PROT_EXEC` argument-filtering). Still
-  missing for a real deployment: a per-arch baseline tested across libc/kernel
-  versions, filesystem restriction (Landlock), and namespaces/`pivot_root` for
-  defense in depth. A real JS JIT needs executable memory, so it would carve out
-  a dedicated JIT exception rather than deny `PROT_EXEC` outright.
-  macOS/Windows need their own mechanisms (Seatbelt, AppContainer).
+  allowlist, `KillProcess`, W^X via `PROT_EXEC` argument-filtering), and
+  renderers additionally run in an empty **network namespace** — unshared on
+  the fork server at spawn and inherited by every renderer it `fork()`s, so
+  "a renderer cannot reach the network" no longer rests on the syscall
+  allowlist alone. The two layers fail independently: an allowlist gap is
+  survivable when the namespace has no interfaces to connect through. The net
+  component is the one role that keeps the host netns. Separately, every process
+  (engine included, in both modes) clears its **dumpable** flag, so other
+  software running as the same user cannot `ptrace`-attach or read
+  `/proc/<pid>/mem` — the engine's cookie jar is the obvious target, and this is
+  the inbound direction that seccomp has no say over. It is set after `execve`,
+  which resets the flag; it survives `fork`, so renderers inherit it from the
+  fork server. Still missing for a real
+  deployment: a per-arch baseline tested across libc/kernel versions,
+  filesystem restriction (Landlock), and the remaining namespaces
+  (mount/PID/IPC) plus `pivot_root`. A real JS JIT needs executable memory, so
+  it would carve out a dedicated JIT exception rather than deny `PROT_EXEC`
+  outright.
+
+  **Platform status.** Linux is the reference implementation: seccomp, an empty
+  netns, rlimits, non-dumpable processes, 12 probes. macOS runs a Seatbelt
+  profile with 11 probes. Windows spawns over a pair of anonymous pipes (see
+  `src/channel/`) and installs **process mitigation policies** — no dynamic
+  code (the W^X analogue), no child processes, no injection extension points,
+  plus win32k lockdown — with 4 probes.
+
+  Windows is deliberately **half a sandbox**, and worth reading as such. Its
+  mitigation policies are self-applied, so they fit the existing contract; the
+  access-confining half — a restricted token, an integrity level, an
+  AppContainer, a job object — is attached by the *parent* at `CreateProcess`
+  and is not implemented. So a Windows renderer cannot run injected code or
+  spawn programs, but it can still read files and reach the network, and the
+  renderer/net distinction the other backends enforce does not exist there.
+  Closing that needs the sixth, parent-side operation described in
+  `src/sandbox/mod.rs`.
+
+  Note the netns is obtained via `CLONE_NEWUSER | CLONE_NEWNET` (an unprivileged
+  `CLONE_NEWNET` alone needs `CAP_SYS_ADMIN`) and the uid map is deliberately
+  left unwritten, so children run as the overflow uid. This makes multi-process
+  mode require unprivileged user namespaces, the same way it already requires
+  seccomp — hosts without them use `--single-process`.
 - **Fetching**: synthesized responses instead of real HTTP; the net component
   handles one request at a time (the engine doesn't block on it, but a real
   daemon would fetch concurrently — with the ring transport that matters

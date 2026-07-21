@@ -44,22 +44,20 @@ fn fill_tile(buf: &mut [u8]) {
     }
 }
 
-/// Multi-process entry point: adopt the inherited IPC fd, sandbox, serve.
+/// Multi-process entry point: adopt the inherited IPC link, sandbox, serve.
 ///
-/// `fd` is the number of the `socketpair(2)` end the engine handed us at
-/// spawn. Possessing it *is* our authentication — an inherited fd cannot be
-/// forged — so there is no connect step and no token to check.
+/// `link` is the transport's argv token for the channel end the engine handed
+/// us at spawn (a descriptor number on Unix, a handle pair on Windows —
+/// opaque here, see [`crate::channel`]). Possessing it *is* our
+/// authentication: an inherited kernel object cannot be forged, so there is no
+/// connect step and no token to check.
 #[cfg(feature = "multi-process")]
-pub fn run(origin: &str, fd: &str) {
-    use std::os::fd::FromRawFd;
-    use std::os::unix::net::UnixStream;
-
-    let fd: std::os::fd::RawFd = fd.parse().expect("renderer: bad fd arg");
-    // SAFETY: the engine passed us sole ownership of this inherited fd.
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    // Split the endpoint *before* sandboxing: try_clone() does a dup, which
-    // the allowlist deliberately does not permit at run time.
-    let ep = Endpoint::from_stream(stream).expect("renderer: wrap fd");
+pub fn run(origin: &str, link: &str) {
+    // SAFETY: the engine passed us sole ownership of this inherited channel.
+    let ch = unsafe { crate::channel::Channel::from_argv(link) }.expect("renderer: bad link arg");
+    // Split the endpoint *before* sandboxing: on Unix the split does a dup,
+    // which the allowlist deliberately does not permit at run time.
+    let ep = Endpoint::from_channel(ch).expect("renderer: wrap link");
     // Drop privileges now that the IPC link is established: from here on the
     // renderer can only push pixels, not open sockets, files, or programs.
     crate::sandbox::lock_down_renderer();
