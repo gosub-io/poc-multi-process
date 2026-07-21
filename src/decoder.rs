@@ -182,4 +182,34 @@ mod tests {
         assert!(decode(&encode(0, 4, &[])).is_err());
         assert!(decode(&encode(4, 0, &[])).is_err());
     }
+
+    /// Deterministic stand-in for `cargo fuzz run decode_image`, so the "any
+    /// byte string returns Ok/Err, never panics or reads OOB" contract is
+    /// checked in the ordinary test suite too (no nightly required). The real
+    /// fuzzer in `fuzz/` explores far more; this pins a regression floor.
+    #[test]
+    fn decode_never_panics_on_arbitrary_bytes() {
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..50_000 {
+            let len = (xorshift(&mut s) % 64) as usize;
+            let mut buf: Vec<u8> = (0..len).map(|_| xorshift(&mut s) as u8).collect();
+            // Half the time, lead with the real magic so the deeper
+            // dimension/length paths are reached, not just the magic rejection.
+            if len >= HEADER_LEN && xorshift(&mut s) & 1 == 0 {
+                buf[..4].copy_from_slice(MAGIC);
+            }
+            let _ = decode(&buf); // the assertion is that this returns at all
+        }
+    }
+
+    /// Tiny deterministic xorshift PRNG — no `rand` dependency, no wall-clock
+    /// seed, so the "fuzz" is reproducible in CI.
+    fn xorshift(s: &mut u64) -> u64 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *s = x;
+        x
+    }
 }

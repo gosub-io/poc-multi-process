@@ -1,65 +1,17 @@
-//! Proof of concept for gosub-engine issue #1080:
-//! "Process Isolation for Security: Multi-Process Architecture".
-//!
-//! The engine is event-driven, shaped like the real gosub engine: commands
-//! in through an `EngineHandle`, events out through a channel. Underneath,
-//! its components run in one of two setups over the *same* code and broker
-//! protocol; only the transport and spawning differ:
-//!
-//! ```text
-//! multi-process (default)             single-process
-//! engine event loop (broker)          engine event loop (broker)
-//! ├── net component     [process]     ├── net component     [thread]
-//! ├── renderer origin A     [""]      ├── renderer origin A     [""]
-//! └── renderer origin B     [""]      └── renderer origin B     [""]
-//! ```
-//!
-//! Selection is two-level:
-//! - compile time: the `multi-process` cargo feature (on by default) gates
-//!   all process/socket code; `--no-default-features` builds a
-//!   single-process-only engine (e.g. for platforms without fork/UDS).
-//! - run time: when the feature is compiled in, `--single-process` still
-//!   selects the thread-based setup (like Chromium's `--single-process`).
+//! Binary entry point for the gosub process-isolation PoC. The engine and all
+//! its components live in the library crate (`src/lib.rs`); this file is only
+//! the child-role dispatch for re-exec plus a minimal event-driven demo. See
+//! the library crate docs for the architecture.
 
-// The transport seam, mirroring `sandbox`: the only place a `target_os` cfg
-// for the IPC byte channel lives. Multi-process only — single-process links
-// are in-process channels.
+use gosub_proc_iso_poc::engine::{self, Mode};
+use gosub_proc_iso_poc::events::{self, EngineEvent, ZoneId};
+use gosub_proc_iso_poc::renderer;
+// Child-role entry points and the selftest exist only in the multi-process
+// build; import them under the same gate the dispatch below uses.
 #[cfg(feature = "multi-process")]
-mod channel;
-mod decoder;
-mod device_service;
-mod engine;
-mod events;
-mod font;
+use gosub_proc_iso_poc::{decoder, device_service, font, net_daemon, selftest, storage};
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
-mod fork_server;
-mod ip_utils;
-mod ipc;
-mod net_daemon;
-mod renderer;
-mod storage;
-// Unconditional: the per-OS confinement machinery inside is feature-gated, but
-// `deny_debugger_attach` applies to the single-process build too — that build
-// still holds the cookie jar in its address space. The platform backend
-// (seccomp / Seatbelt / none) is selected inside the module.
-mod sandbox;
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
-mod ring;
-// Compiled on every platform (not just Linux) so the integration suite can
-// query the probe inventory anywhere — a platform with no probes must fail
-// loudly rather than silently skip its enforcement tests.
-#[cfg(feature = "multi-process")]
-mod selftest;
-// The spawn seam: how a child process is created. Owned rather than delegated
-// to std::process::Command because Windows access controls must be supplied at
-// CreateProcess time.
-#[cfg(feature = "multi-process")]
-mod spawn;
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
-mod shm;
-
-use engine::Mode;
-use events::{EngineEvent, ZoneId};
+use gosub_proc_iso_poc::fork_server;
 
 #[cfg(feature = "multi-process")]
 const DEFAULT_MODE: Mode = Mode::Multi;

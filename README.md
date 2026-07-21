@@ -451,6 +451,30 @@ per-source inbox bound holding engine RSS flat under a message flood (RSS
 sampling: ~2.8 MB steady vs. ~90 MB/s growth without it). The `Gate` unit test
 covers the bounding mechanism itself deterministically.
 
+### Fuzzing
+
+The three surfaces where **untrusted bytes meet a parser** have `cargo-fuzz`
+targets in `fuzz/`, each importing the real code from the library crate:
+
+- `decode_image` — `decoder::decode`, the image parser (the libwebp
+  CVE-2023-4863 lineage: a header that lies about its dimensions).
+- `ipc_frame` — `ipc::recv_msg` for the frames a *compromised child* sends the
+  broker, which deserializes them unconfined with full authority (the sharpest
+  edge in the model — see the sandbox section).
+- `ssrf_url` — `ip_utils::resolve_and_pin`, the URL/host/IP-literal parsing that
+  gates every outbound fetch; a mis-parse there is an SSRF.
+
+```sh
+cargo +nightly fuzz run decode_image     # or ipc_frame / ssrf_url
+```
+
+Each target's contract is *total*: any input returns `Ok`/`Err`, never panics
+or reads out of bounds. So that the property is also checked in ordinary CI
+without nightly, each parser additionally carries a deterministic
+`*_never_panics_on_arbitrary_*` unit test — a seeded xorshift stand-in for the
+fuzzer (50 000 inputs each) that pins a regression floor; the `fuzz/` targets
+explore far more.
+
 ## Layout
 
 | File | Contents |
@@ -471,7 +495,9 @@ covers the bounding mechanism itself deterministically.
 | `src/ring.rs` | Shared-memory ring (Linux): streams large fetch bodies, futex wakeups, hostile-cursor validation |
 | `src/sandbox/` | Privilege capping seam: `linux.rs` (seccomp-BPF, netns, rlimits), `macos.rs` (Seatbelt), `unsupported.rs` (no-ops) |
 | `src/selftest.rs` | Sandbox-enforcement probes spawned by the integration tests (Linux) |
-| `src/main.rs` | Child-role dispatch for re-exec + minimal event-driven usage |
+| `src/lib.rs` | Library crate: `pub` modules the binary, tests, and fuzz targets all build on |
+| `src/main.rs` | Binary: child-role dispatch for re-exec + minimal event-driven usage |
+| `fuzz/` | `cargo-fuzz` targets over the untrusted-input parsers (`decode_image`, `ipc_frame`, `ssrf_url`) |
 | `tests/integration.rs` | End-to-end tests running the built binary (both modes + sandbox) |
 
 ## Shortcuts taken (what a real implementation needs instead)

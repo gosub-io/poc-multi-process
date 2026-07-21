@@ -64,6 +64,10 @@ impl TilePixels {
         self.as_slice().len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
     /// Human-readable transport label, used by the demo/bench output (and
     /// asserted by the integration tests).
     pub fn transport(&self) -> &'static str {

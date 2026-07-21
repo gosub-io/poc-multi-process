@@ -425,4 +425,33 @@ mod tests {
     fn unresolvable_name_is_refused() {
         assert!(check("http://nx.example/").is_err());
     }
+
+    /// Deterministic stand-in for `cargo fuzz run ssrf_url`: throw pseudo-random
+    /// URL-ish strings (from an alphabet that stresses the scheme/host/IP-literal
+    /// parsers — `inet_aton` digits, brackets, `@`, `%`, `:`) at the classifier.
+    /// It must classify or reject any string without panicking; a parser panic in
+    /// the one process allowed to open sockets is itself a bug. The `fuzz/` target
+    /// explores far more; this is the CI floor.
+    #[test]
+    fn resolve_and_pin_never_panics_on_arbitrary_urls() {
+        let alpha = b"htps:/.[]@%:0123456789abcdefABCDEFxX-";
+        let mut s = 0xdead_beef_cafe_babeu64;
+        for _ in 0..50_000 {
+            let len = (xorshift(&mut s) % 40) as usize;
+            let url: String = (0..len)
+                .map(|_| alpha[(xorshift(&mut s) as usize) % alpha.len()] as char)
+                .collect();
+            let _ = resolve_and_pin(&url, &TestResolver); // must return, not panic
+        }
+    }
+
+    /// Tiny deterministic xorshift PRNG — reproducible, no `rand`, no clock seed.
+    fn xorshift(s: &mut u64) -> u64 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *s = x;
+        x
+    }
 }

@@ -382,7 +382,9 @@ pub fn recv_msg<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<T> {
 /// dummy payload (fd-passing must carry at least one data byte). The kernel
 /// duplicates the fd into the receiver; the sender keeps its own copy.
 ///
-/// SAFETY: `sock_fd` and `fd` must be valid open descriptors.
+/// # Safety
+///
+/// `sock_fd` and `fd` must be valid open descriptors.
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 pub unsafe fn send_fd(sock_fd: RawFd, fd: RawFd) -> io::Result<()> {
     let mut byte = [0u8; 1];
@@ -419,7 +421,9 @@ pub unsafe fn send_fd(sock_fd: RawFd, fd: RawFd) -> io::Result<()> {
 /// and every received fd closed — without this, each malicious message would
 /// leak descriptors into the engine until its fd table is exhausted.
 ///
-/// SAFETY: `sock_fd` must be a valid open descriptor.
+/// # Safety
+///
+/// `sock_fd` must be a valid open descriptor.
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 pub unsafe fn recv_fd(sock_fd: RawFd) -> io::Result<OwnedFd> {
     let mut byte = [0u8; 1];
@@ -577,5 +581,35 @@ mod tests {
         let mut cur = std::io::Cursor::new(buf);
         let r: io::Result<NetResponse> = recv_msg(&mut cur);
         assert!(r.is_err(), "should reject an oversized frame");
+    }
+
+    /// Deterministic stand-in for `cargo fuzz run ipc_frame`: hammer the broker's
+    /// untrusted → engine deserialization (the frames a compromised child sends
+    /// in) with arbitrary bytes. Each must return Ok/Err, never panic or
+    /// over-allocate. The `fuzz/` target explores far more; this is the CI floor.
+    #[cfg(feature = "multi-process")]
+    #[test]
+    fn recv_msg_never_panics_on_arbitrary_frames() {
+        let mut s = 0x1234_5678_9abc_def0u64;
+        for _ in 0..50_000 {
+            let len = (xorshift(&mut s) % 128) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| xorshift(&mut s) as u8).collect();
+            let _ = recv_msg::<FromRenderer>(&mut std::io::Cursor::new(&buf));
+            let _ = recv_msg::<NetResponse>(&mut std::io::Cursor::new(&buf));
+            let _ = recv_msg::<FromDecoder>(&mut std::io::Cursor::new(&buf));
+            let _ = recv_msg::<StorageResponse>(&mut std::io::Cursor::new(&buf));
+            let _ = recv_msg::<FontResponse>(&mut std::io::Cursor::new(&buf));
+        }
+    }
+
+    /// Tiny deterministic xorshift PRNG — reproducible, no `rand`, no clock seed.
+    #[cfg(feature = "multi-process")]
+    fn xorshift(s: &mut u64) -> u64 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *s = x;
+        x
     }
 }
