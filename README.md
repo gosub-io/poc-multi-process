@@ -70,15 +70,20 @@ because the whole architecture rests on the broker being uncompromisable and
 this is the one place untrusted bytes reach it.
 
 The broker is not left *entirely* unconfined, though. Like Chromium's browser
-process — which is sandboxed, just far more loosely than a renderer — it gets a
-**loose Landlock sandbox**: it may read and execute anywhere (it must, to spawn
-children and load their libraries), but may only *write* beneath the temp dir.
-So a broker subverted through the deserialization surface still cannot plant
-persistence, overwrite its own binary, or corrupt the user's files and configs
-— the write-side blast radius is contained. What is still missing for a
-production broker: a seccomp filter around the (minimal, fuzzed) parser, so the
-*read* and *execute* surface is bounded too. See `lock_down_broker` in
-`src/sandbox/`.
+process — which is sandboxed, just far more loosely than a renderer — it gets
+two loose, best-effort layers. A **Landlock sandbox** on the filesystem: it may
+read and execute anywhere (it must, to spawn children and load their libraries),
+but may only *write* beneath the temp dir — so a broker subverted through the
+deserialization surface cannot plant persistence, overwrite its own binary, or
+corrupt the user's files. And a **deny-list seccomp filter**: it keeps the broad
+syscall surface it genuinely needs (exec, threads, files, sockets — which is why
+a renderer-style allowlist does not fit, and why Chromium's browser process is
+not allowlisted either), but the escalation primitives it never uses are a fatal
+`SIGSYS` — `ptrace`/`process_vm_*`, kernel-module loading, `kexec`, `bpf`,
+`perf_event_open`, `userfaultfd`, the keyring, `mount`/`setns`/`pivot_root`. So a
+broker compromise can no longer reach for a kernel exploit. Every denied syscall
+is also one no child needs, because this filter is inherited before each child
+installs its own stricter allowlist. See `lock_down_broker` in `src/sandbox/`.
 
 ## Event-driven engine
 
@@ -496,8 +501,10 @@ targets in `fuzz/`, each importing the real code from the library crate:
 - `decode_image` — `decoder::decode`, the image parser (the libwebp
   CVE-2023-4863 lineage: a header that lies about its dimensions).
 - `ipc_frame` — `ipc::recv_msg` for the frames a *compromised child* sends the
-  broker, which deserializes them unconfined with full authority (the sharpest
-  edge in the model — see the sandbox section).
+  broker, which deserializes them in its own address space with full authority
+  over every secret (the broker's deny-list seccomp removes escalation syscalls
+  but not this data reach — the sharpest edge in the model, see the sandbox
+  section).
 - `ssrf_url` — `ip_utils::resolve_and_pin`, the URL/host/IP-literal parsing that
   gates every outbound fetch; a mis-parse there is an SSRF.
 

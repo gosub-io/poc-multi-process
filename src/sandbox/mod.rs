@@ -276,15 +276,18 @@ pub fn landlock_available() -> bool {
     imp::landlock_available()
 }
 
-/// Confine the **broker** (engine) process's filesystem: read and execute
-/// anywhere, but write only beneath the temp dir. A *loose* sandbox — like a
-/// browser's main process — for the one process that holds every secret and
-/// deserializes untrusted frames without a seccomp filter: it cannot be
-/// tightened to a renderer's degree (it must spawn children and exec their
-/// libraries), but its *write* blast radius can be. Called by the binary on its
-/// main thread before the engine starts, so every engine thread and child
-/// inherits it. Linux/Landlock only; a no-op elsewhere (a macOS Seatbelt
-/// broker profile would be the equivalent, and is not built yet).
+/// Confine the **broker** (engine) process: a *loose* sandbox — like a browser's
+/// main process — for the one process that holds every secret and deserializes
+/// untrusted frames. It cannot be tightened to a renderer's degree (it must spawn
+/// children, exec their libraries, thread, and open files and sockets), but two
+/// blast radii can be reduced: a **Landlock** ruleset limits *writes* to the temp
+/// dir (read/exec stay open), and a **deny-list seccomp filter** removes the
+/// escalation syscalls it never uses (`ptrace`, kernel-module/`kexec`/`bpf`, the
+/// keyring, `mount`/`setns`, …) while allowing everything else. Called by the
+/// binary on its main thread before the engine starts, so every engine thread and
+/// child inherits both. Linux only; a no-op elsewhere (a macOS Seatbelt broker
+/// profile would be the equivalent, and is not built yet). Best-effort: a kernel
+/// missing either mechanism leaves that layer off rather than aborting.
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 pub fn lock_down_broker() {
     imp::lock_down_broker();

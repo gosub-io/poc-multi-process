@@ -560,6 +560,7 @@ mod probe_inventory {
         "service-device-ioctl",
         "service-landlock",
         "broker-landlock",
+        "broker-seccomp",
     ];
 
     /// The Seatbelt profile's enforcement. `PT_DENY_ATTACH` and the rlimits
@@ -762,6 +763,18 @@ mod sandbox_enforcement {
     fn broker_filesystem_writes_are_confined_to_temp() {
         let st = probe("broker-landlock");
         assert!(st.success(), "broker landlock should confine writes to temp, got {st:?}");
+    }
+
+    /// The broker's deny-list seccomp filter is not a no-op: it keeps the broad
+    /// surface the engine needs but `Trap`s the escalation syscalls. `ptrace` is
+    /// one, so a broker that tries it is killed by `SIGSYS` exactly as a renderer
+    /// reaching for a socket is — proving the trusted process lost its reach for a
+    /// kernel exploit while (per the demo) still doing its job.
+    #[test]
+    fn broker_denies_escalation_syscalls() {
+        let st = probe("broker-seccomp");
+        assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (ptrace denied), got {st:?}");
+        assert!(st.code().is_none(), "should be killed, not exit");
     }
 
     #[test]

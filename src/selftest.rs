@@ -105,6 +105,8 @@ pub const PROBES: &[&str] = &[
     "service-landlock",
     #[cfg(target_os = "linux")]
     "broker-landlock",
+    #[cfg(target_os = "linux")]
+    "broker-seccomp",
     #[cfg(target_os = "macos")]
     "seatbelt-file",
     #[cfg(target_os = "macos")]
@@ -925,6 +927,23 @@ fn run_platform_probe(probe: &str) {
              outside_denied={outside_denied}"
         );
         std::process::exit(if control_ok && inside_ok && outside_denied { 0 } else { 1 });
+    }
+
+    // The broker's deny-list seccomp filter must actually *bite*. `lock_down_broker`
+    // installs it (default-allow, `Trap` the escalation syscalls); `ptrace` is on
+    // that list, so any call to it is a fatal `SIGSYS` — the same terminate-on-
+    // violation the allowlist probes assert. `PTRACE_TRACEME` needs no target and
+    // would ordinarily *succeed* (return 0), so if this process is still alive on
+    // the next line the deny-list did not bind, and we exit non-zero to say so.
+    // The paired positive case — the broker doing its real work under this filter
+    // — is the whole multi-process demo, which spawns, execs, and opens files.
+    if probe == "broker-seccomp" {
+        crate::sandbox::lock_down_broker();
+        // SAFETY: a plain ptrace request; the point is that the syscall is trapped
+        // before it returns, not what it would have done.
+        unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) };
+        eprintln!("[selftest] broker-seccomp: ptrace was NOT denied — deny-list did not bind");
+        std::process::exit(1);
     }
 
     // Fork-server probes: this role's filter is not the renderer's, and it is

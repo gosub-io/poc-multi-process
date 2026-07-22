@@ -646,17 +646,73 @@ pub fn landlock_available() -> bool {
     landlock::available()
 }
 
-/// Confine the **broker** (engine) process's filesystem with Landlock: read and
-/// execute anywhere, but write only beneath the temp dir (see
-/// [`landlock::restrict_broker`]). Called on the process's main thread before it
-/// spawns anything, so every engine thread and every fork+exec'd child inherits
-/// it.
+/// The dangerous syscalls the broker (engine) is denied, even though it keeps
+/// the broad set it legitimately needs. Unlike a renderer — capped to an
+/// allowlist — the broker execs helpers, spawns threads, and opens files and
+/// sockets, so a tight allowlist does not fit (Chromium's *browser* process is
+/// likewise not seccomp-allowlisted). What it never needs are the
+/// post-compromise **escalation primitives**: attaching to or reading another
+/// process's memory (`ptrace`, `process_vm_*`), loading kernel code
+/// (`init_module`/`finit_module`, `kexec_*`, `bpf`), the classic local-privilege
+/// escalation surfaces (`perf_event_open`, `userfaultfd`, the kernel keyring,
+/// `kcmp`), and namespace/mount escapes (`setns`, `mount`, `umount2`,
+/// `pivot_root`, `swapon`/`swapoff`, `reboot`). Denying exactly those turns the
+/// trusted process from seccomp-unconfined into "can still do its job, cannot
+/// reach for a kernel exploit" — a deny-list, the inverse of the allowlist the
+/// children carry.
+///
+/// **Every entry must be a syscall no child needs either.** This filter is
+/// inherited by the fork server and by every renderer (before each installs its
+/// own, stricter allowlist), and when filters stack a `Trap` outranks a child's
+/// `Allow` — so a syscall denied here is denied for the children too. `unshare`
+/// (the renderer's network isolation), `clone`/`execve` (spawning), and
+/// `seccomp`/`prctl` (a child sandboxing itself) are therefore deliberately
+/// absent: denying any of them would kill the children this process exists to
+/// launch.
+#[cfg(feature = "multi-process")]
+const BROKER_DENY: &[libc::c_long] = &[
+    // Attach to / read / write another process — injection and secret theft.
+    libc::SYS_ptrace,
+    libc::SYS_process_vm_readv,
+    libc::SYS_process_vm_writev,
+    // Load kernel code — the shortest path from a broker compromise to ring 0.
+    libc::SYS_kexec_load,
+    libc::SYS_kexec_file_load,
+    libc::SYS_init_module,
+    libc::SYS_finit_module,
+    libc::SYS_delete_module,
+    libc::SYS_bpf,
+    // Classic LPE / exploit-primitive surfaces.
+    libc::SYS_perf_event_open,
+    libc::SYS_userfaultfd,
+    libc::SYS_add_key,
+    libc::SYS_request_key,
+    libc::SYS_keyctl,
+    libc::SYS_kcmp,
+    // Namespace / mount escapes (the broker uses `unshare`, never these).
+    libc::SYS_setns,
+    libc::SYS_mount,
+    libc::SYS_umount2,
+    libc::SYS_pivot_root,
+    libc::SYS_swapon,
+    libc::SYS_swapoff,
+    libc::SYS_reboot,
+];
+
+/// Confine the **broker** (engine) process. Two best-effort layers, applied on
+/// the process's main thread before it spawns anything, so every engine thread
+/// and every fork+exec'd child inherits both:
+///
+/// 1. **Landlock** on the filesystem — read and execute anywhere, but write only
+///    beneath the temp dir (see [`landlock::restrict_broker`]).
+/// 2. A **deny-list seccomp filter** — allow by default (the broker's job needs a
+///    broad surface), `Trap` the [`BROKER_DENY`] escalation syscalls it never uses.
 ///
 /// Best-effort, deliberately unlike the child lockdowns: the broker is not the
 /// boundary that *contains* a compromised renderer — it is defense in depth on
-/// the one process that holds every secret and parses untrusted frames without a
-/// seccomp filter behind it. A kernel without Landlock leaves it as it was
-/// (filesystem-unconfined), rather than the engine refusing to start.
+/// the one process that holds every secret and parses untrusted frames. A kernel
+/// missing either mechanism leaves that layer off rather than refusing to start;
+/// the children's fail-closed allowlists are what actually contain a compromise.
 #[cfg(feature = "multi-process")]
 pub fn lock_down_broker() {
     let temp = std::env::temp_dir();
@@ -671,6 +727,54 @@ pub fn lock_down_broker() {
             eprintln!("[broker] landlock could not be applied ({e}); broker filesystem unconfined")
         }
     }
+
+    // Seccomp after Landlock: the deny-list is default-allow, so it never blocks
+    // Landlock's own setup syscalls, and keeping the same order as the services
+    // (Landlock first, then seccomp) is one less thing to reason about.
+    match install_broker_seccomp() {
+        Ok(()) => eprintln!(
+            "[broker] seccomp deny-list active (escalation syscalls denied, SIGSYS + report)"
+        ),
+        Err(e) => eprintln!(
+            "[broker] seccomp deny-list could not be applied ({e}); broker syscall surface unconfined"
+        ),
+    }
+}
+
+/// Install the broker's deny-list seccomp filter: allow by default, `Trap`
+/// (→ SIGSYS, named by [`install_sigsys_reporter`], then re-raised) on any
+/// [`BROKER_DENY`] syscall. The inverse polarity of [`install_with`]'s
+/// allowlist — default action `Allow`, matched action `Trap` — so listing a
+/// syscall *denies* it and everything unlisted passes.
+#[cfg(feature = "multi-process")]
+fn install_broker_seccomp() -> Result<(), Box<dyn std::error::Error>> {
+    use seccompiler::{apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
+    use std::collections::BTreeMap;
+
+    #[cfg(target_arch = "x86_64")]
+    let arch = seccompiler::TargetArch::x86_64;
+    #[cfg(target_arch = "aarch64")]
+    let arch = seccompiler::TargetArch::aarch64;
+
+    // Each denied syscall matches unconditionally (an empty rule vec); every
+    // other syscall falls through to the default `Allow`.
+    let rules: BTreeMap<i64, Vec<SeccompRule>> =
+        BROKER_DENY.iter().map(|&nr| (nr as i64, Vec::new())).collect();
+
+    // Name a denied syscall on stderr before it kills us, exactly as the
+    // allowlist path does — "broker tried ptrace (#101), killed" rather than a
+    // bare SIGSYS. Its own syscalls are all on the default-allow side here.
+    install_sigsys_reporter();
+
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow, // default & argument-mismatch: allow (the broker needs breadth)
+        SeccompAction::Trap,  // matched (a BROKER_DENY syscall): SIGSYS → report → re-raise
+        arch,
+    )?;
+    let program: BpfProgram = filter.try_into()?;
+    apply_filter(&program)?;
+    Ok(())
 }
 
 /// What a *device*-backed service (audio, GPU) needs: open a device node and
