@@ -1174,10 +1174,22 @@ fn write_i32(out: &mut [u8], v: i32) -> usize {
 /// async-signal-safe: nothing but `setrlimit` syscalls here.
 #[cfg(feature = "multi-process")]
 pub fn apply_child_rlimits() -> std::io::Result<()> {
-    // Address space: enough for legitimate rendering, but a renderer that
-    // tries to allocate the host to death instead hits a failed mmap → Rust's
-    // alloc-error path aborts *that process*, not the machine.
-    set_rlimit(libc::RLIMIT_AS, 512 * 1024 * 1024)?;
+    // Memory: bound the *heap*, not the address space. `RLIMIT_DATA` caps
+    // committed writable anonymous memory (brk + writable `mmap`), and since
+    // Linux 4.7 it deliberately does *not* count `PROT_NONE` reservations — so a
+    // real JIT's multi-GiB virtual cage (V8 reserves ~4 GiB up front) still fits,
+    // while a renderer trying to allocate the host to death hits a failed
+    // `mmap`/`brk` → Rust's alloc-error path aborts *that process*, not the
+    // machine. `RLIMIT_AS` — the *virtual* cap this used to be — is the wrong
+    // axis: it would kill V8 at init for reserving address space it never
+    // commits. (A production browser bounds true RSS with a cgroup `memory.max`,
+    // whose OOM kill is scoped to the offending renderer; this self-applied
+    // rlimit is the cheap approximation of that — see the architecture doc.)
+    set_rlimit(libc::RLIMIT_DATA, 512 * 1024 * 1024)?;
+    // A generous *virtual* ceiling on top: high enough to clear a JIT's cage, low
+    // enough to catch a runaway that reserves absurd address space. Belt to the
+    // `RLIMIT_DATA` braces — a JIT-less renderer never approaches it.
+    set_rlimit(libc::RLIMIT_AS, 16 * 1024 * 1024 * 1024)?;
     // A child needs only a handful of fds (its IPC socket + std streams).
     set_rlimit(libc::RLIMIT_NOFILE, 128)?;
     // No core dumps — a crash must not spill page contents (cookies, tokens).

@@ -122,9 +122,10 @@ pub fn deny_debugger_attach() {
     imp::deny_debugger_attach();
 }
 
-/// Impose resource ceilings (address space, fd count, no core dumps, lowered
-/// scheduling priority) on a child. Called from `pre_exec`, so it must stay
-/// async-signal-safe. rlimits only ever lower, so a child cannot undo them.
+/// Impose resource ceilings (committed heap plus an address-space ceiling, fd
+/// count, no core dumps, lowered scheduling priority) on a child. Called from
+/// `pre_exec`, so it must stay async-signal-safe. rlimits only ever lower, so a
+/// child cannot undo them.
 #[cfg(feature = "multi-process")]
 pub fn apply_child_rlimits() -> std::io::Result<()> {
     imp::apply_child_rlimits()

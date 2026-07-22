@@ -51,14 +51,17 @@ The renderer gets the baseline only: no `socket`/`connect` (no network), no
 `execve`/`clone` (no subprocesses), no `io_uring_*`. The net component gets the
 same baseline plus the socket family, since it owns network access.
 
-The engine (parent) gets no *seccomp* filter, because the privileges one would
-drop are exactly the ones it exists to exercise: it spawns processes, opens
-sockets, and holds the cookie jar. It is *not* exempt because it is safe from
-hostile input — it plainly is not. Every frame a renderer or the net component
-sends is `bincode::deserialize`d inside the engine (`rx.recv::<FromRenderer>()`
-in the loop's reader threads), so a compromised child's bytes are parsed by the
-one process holding every secret, with full ambient authority and no syscall
-filter behind it.
+The engine (parent) can't be capped to a renderer's *allowlist*: the privileges
+that would drop are exactly the ones it exists to exercise — it spawns
+processes, opens sockets, and holds the cookie jar. What it *does* carry is a
+**deny-list** seccomp filter (see the broker paragraph below): the broad surface
+stays, but the escalation syscalls it never needs are a fatal `SIGSYS`. It is
+*not* exempt because it is safe from hostile input — it plainly is not. Every
+frame a renderer or the net component sends is `bincode::deserialize`d inside the
+engine (`rx.recv::<FromRenderer>()` in the loop's reader threads), so a
+compromised child's bytes are parsed by the one process holding every secret,
+with full ambient authority over that memory — the deny-list removes
+kernel-escalation reach, not the parser's reach into those secrets.
 
 What bounds that today: frames are length-prefixed and capped at 16 MiB with
 the length checked *before* allocating, the wire types are closed enums, and
@@ -84,6 +87,55 @@ not allowlisted either), but the escalation primitives it never uses are a fatal
 broker compromise can no longer reach for a kernel exploit. Every denied syscall
 is also one no child needs, because this filter is inherited before each child
 installs its own stricter allowlist. See `lock_down_broker` in `src/sandbox/`.
+
+## What a real renderer would force open
+
+W^X is not a one-off exception — it is the clearest case of a broader pattern:
+several of the tightest measures here are enforceable *only because this renderer
+is a stub*. A production renderer (a real JIT plus a full media/GPU/worker stack)
+would force each of them open, and then compensate elsewhere — which is exactly
+what Chromium and Firefox do. Naming them keeps the honest ones honest and stops
+"we enforce X" from reading as "a real browser could too":
+
+- **W^X (`PROT_EXEC` denial)** — a JIT needs writable→executable memory, and
+  `dlopen`ing a media codec or GPU driver maps code executable *after* the sandbox
+  is on. The fix is a narrow JIT/loader carve-out (one RWX region, or a
+  dual-mapping `memfd` RX+RW alias), not blanket RX. (Chromium even disables Intel
+  CET in the renderer for the JIT.)
+- **No threads** — the renderer baseline has no `clone` at all, and the fork
+  server filters `clone` to a plain fork (no `CLONE_THREAD`/`CLONE_VM`). A real
+  renderer is deeply multithreaded: V8's compiler and GC threads, the
+  compositor/raster threads, Web Workers, WASM. `clone` with the thread flags has
+  to be allowed — arguably the biggest relaxation after W^X, and easy to miss
+  because this renderer happens to be single-threaded.
+- **The renderer memory cap** (*axis already fixed*) — this was `RLIMIT_AS =
+  512 MiB`, a *virtual* address-space cap enforceable only because the renderer is
+  JIT-less: V8's pointer-compression cage reserves ~4 GiB up front, so that cap
+  would kill it at init. The PoC now bounds the *heap* instead — `RLIMIT_DATA`,
+  which since Linux 4.7 ignores `PROT_NONE` reservations — with a generous 16 GiB
+  `RLIMIT_AS` kept only as a virtual sanity ceiling. The step a real browser adds
+  on top is a true *physical* bound whose OOM kill is scoped to the offending
+  renderer (cgroup `memory.max`); the rlimit is the cheap, self-applied
+  approximation. Chromium likewise does not `RLIMIT_AS` its renderers.
+- **Zero file opens** — a real renderer still needs runtime `openat` for
+  ICU/locale data, fonts, the GPU shader cache, `dlopen`'d libraries, and
+  `/proc/self/maps`; "no `openat` ever" is tighter than reality. It moves to a
+  path broker + Landlock rather than an outright denial.
+- **Net component is outbound-only** — no `bind`/`listen`, which is right for a
+  fetcher, but WebRTC's ICE/STUN/TURN binds local UDP sockets. Real-time media
+  reopens `bind` (QUIC is fine — it is connected UDP).
+- **Inbound-debug lockdown + the broker deny-list vs. crash reporting** —
+  `PR_SET_DUMPABLE=0` plus the broker's `ptrace`/`process_vm_readv` denial is
+  exactly what a crash reporter (Crashpad) must *do* to read a crashed renderer
+  and build a minidump. Real crash reporting means threading that needle with a
+  dedicated, more-privileged handler process.
+
+For calibration, what *survives* contact with a real browser and stays as-is: no
+raw sockets in the renderer and its empty network namespace, no `execve`
+anywhere, the brokered network and HttpOnly stripping, default-deny seccomp as a
+*posture* (the allowlist just grows with V8), and the `clone3`→`ENOSYS` zygote
+model. So W^X belongs to a class of **stub-only guarantees** — each relaxed, then
+compensated for — not a lone asterisk.
 
 ## Event-driven engine
 
@@ -256,10 +308,14 @@ capability the zygote gave up cannot be its child.
   See `src/sandbox/linux.rs`. The net component gets the same baseline plus the
   socket family.
 - Children run under **OS resource caps** the engine sets at spawn (Linux):
-  `RLIMIT_AS` (512 MiB address space), `RLIMIT_NOFILE`, and `RLIMIT_CORE=0`.
-  seccomp caps *what* a child may do; these cap *how much*, so a compromised
-  renderer can't exhaust host memory/fds — an over-allocation aborts that
-  process, not the machine — and a crash won't dump a core full of secrets.
+  `RLIMIT_DATA` (512 MiB committed heap — the *heap*, not the address space, so a
+  future JIT's multi-GiB virtual cage still fits) with a generous 16 GiB
+  `RLIMIT_AS` sanity ceiling, plus `RLIMIT_NOFILE` and `RLIMIT_CORE=0`. seccomp
+  caps *what* a child may do; these cap *how much*, so a compromised renderer
+  can't exhaust host memory/fds — an over-allocation aborts that process, not the
+  machine — and a crash won't dump a core full of secrets. (A production browser
+  bounds true RSS with a cgroup `memory.max`; see *What a real renderer would
+  force open*.)
 - On the IPC side, the shared event-loop inbox is **bounded per source**. Every
   component (each renderer, the net process) may have at most
   `MAX_QUEUED_PER_SOURCE` messages queued-but-unprocessed: its reader thread
@@ -569,7 +625,9 @@ simplified is the surrounding browser. What each entry below still needs:
   fork server. Filesystem restriction with **Landlock** is used by the
   filesystem services (storage, font) to path-confine their `openat`, and the
   **broker** gets a loose Landlock too (read/exec anywhere, write only the temp
-  dir). Two namespaces are deliberately *not* added, each blocked by a concrete
+  dir) plus a **deny-list seccomp filter** (allow by default, `SIGSYS` on the
+  escalation syscalls it never uses — `ptrace`, kernel-module loading, `kexec`,
+  `bpf`, `mount`/`setns`). Two namespaces are deliberately *not* added, each blocked by a concrete
   reason rather than merely unimplemented: an empty-root **mount** namespace
   needs `pivot_root`, which needs mount capability that the deliberately-unmapped
   (`uid_map`-less) user namespace does not confer — and writing a `uid_map` to
@@ -580,12 +638,14 @@ simplified is the surrounding browser. What each entry below still needs:
   are documented at `isolate_network` in `src/sandbox/linux.rs`, and seccomp's
   `open`/`openat` and `kill`/`ptrace` denials cover the properties regardless.
   Also still wanted: a per-arch seccomp baseline tested across libc/kernel
-  versions. A real JS JIT needs executable memory, so it would carve out a
-  dedicated JIT exception rather than deny `PROT_EXEC` outright.
+  versions. And several of the tightest limits here (W^X, no renderer threads,
+  the 512 MiB `RLIMIT_AS`, zero file opens) are enforceable only because this
+  renderer is a stub — a real JIT-and-media renderer relaxes each and compensates
+  elsewhere; see *What a real renderer would force open* above.
 
   **Platform status.** Linux is the reference implementation: seccomp, empty
-  net/IPC/UTS namespaces, rlimits, non-dumpable processes, broker Landlock, 18
-  probes. macOS runs a Seatbelt `(deny default)`
+  net/IPC/UTS namespaces, rlimits, non-dumpable processes, broker Landlock + a
+  seccomp deny-list, 19 probes. macOS runs a Seatbelt `(deny default)`
   profile with 12 probes — including **path-scoped file services** (storage/font
   get `subpath` read/write grants for their own directory plus a broad
   `file-read-metadata` so path lookup resolves, while contents outside the scope
