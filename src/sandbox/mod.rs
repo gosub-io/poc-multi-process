@@ -217,6 +217,39 @@ pub fn restricted_token() -> Option<::windows_sys::Win32::Foundation::HANDLE> {
     imp::restricted_token()
 }
 
+/// The AppContainer (lowbox) identity for a Windows child — the capability
+/// sandbox that gives content roles no network and the net component
+/// `internetClient`. Windows only. See the backend for the image-loading caveat.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub use imp::AppContainerIdentity;
+
+/// Build the AppContainer identity for a child (`internet` grants the
+/// `internetClient` capability), or `None` if the SIDs cannot be built (the
+/// spawner then falls back to the restricted-token path). Windows only.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub fn app_container_identity(name: &str, internet: bool) -> Option<AppContainerIdentity> {
+    imp::app_container_identity(name, internet)
+}
+
+/// Grant ALL APPLICATION PACKAGES read+execute on `path` so an AppContainer
+/// child can load the image (the install-time ACL, done at spawn). Windows only.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub fn grant_app_package_execute(path: &std::path::Path) -> std::io::Result<()> {
+    imp::grant_app_package_execute(path)
+}
+
+/// Give a service's own AppContainer access to its file/directory (`writable`
+/// also relabels it Low integrity) — the Windows analogue of the Linux services'
+/// `openat` + Landlock to their own path. Windows only.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub fn grant_container_path_access(
+    path: &std::path::Path,
+    container_sid: *mut std::ffi::c_void,
+    writable: bool,
+) -> std::io::Result<()> {
+    imp::grant_container_path_access(path, container_sid, writable)
+}
+
 /// Apply a job-object memory cap to a process. Exposed for the probe suite,
 /// which assigns the caps to itself to verify they bind. Windows only.
 #[cfg(all(feature = "multi-process", target_os = "windows"))]

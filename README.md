@@ -582,17 +582,27 @@ simplified is the surrounding browser. What each entry below still needs:
   profile with 11 probes. Windows spawns over a pair of anonymous pipes (see
   `src/channel/`) and installs **process mitigation policies** — no dynamic
   code (the W^X analogue), no child processes, no injection extension points,
-  plus win32k lockdown — with 4 probes.
+  plus win32k lockdown — with 4 probes, plus the parent-side access controls
+  below.
 
-  Windows is deliberately **half a sandbox**, and worth reading as such. Its
-  mitigation policies are self-applied, so they fit the existing contract; the
-  access-confining half — a restricted token, an integrity level, an
-  AppContainer, a job object — is attached by the *parent* at `CreateProcess`
-  and is not implemented. So a Windows renderer cannot run injected code or
-  spawn programs, but it can still read files and reach the network, and the
-  renderer/net distinction the other backends enforce does not exist there.
-  Closing that needs the sixth, parent-side operation described in
-  `src/sandbox/mod.rs`.
+  Windows has **both halves of a sandbox** now. The self-applied half is the
+  mitigation policies above (plus low integrity and a job-object memory cap).
+  The parent-side, object-confining half is an **AppContainer** — the "lowbox"
+  token UWP apps and Chromium's renderer run under — attached at `CreateProcess`
+  via a `SECURITY_CAPABILITIES` attribute: a **per-role** container gives a
+  renderer **no network and no broad file access**, the net component
+  **`internetClient`**, and each filesystem service access to **only its own
+  path** (with a Low-integrity relabel so the lowbox can write it) — the same
+  renderer/net split and per-service file scoping Linux gets from seccomp+netns
+  and Landlock. It is **env-gated** (`GOSUB_WIN_APPCONTAINER`) rather than
+  default-on for one concrete reason: a lowbox process can only load images the
+  filesystem grants an app-package SID, so the binary must sit at an
+  app-package-accessible install location (`C:\ProgramData`, `C:\Program Files`)
+  — exactly what a real installer targets, and what CI's `target\` dir is not.
+  With that, it is validated end to end on Windows 11 (registered containers,
+  the capability split, and storage/font round-tripping under the lowbox). The
+  *restricting-SID* token stays out for the same image-loading reason; the
+  AppContainer is what actually clears that wall. See `src/sandbox/windows.rs`.
 
   Note the netns is obtained via `CLONE_NEWUSER | CLONE_NEWNET` (an unprivileged
   `CLONE_NEWNET` alone needs `CAP_SYS_ADMIN`) and the uid map is deliberately

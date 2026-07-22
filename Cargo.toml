@@ -38,4 +38,5 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemServices",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
 ] }

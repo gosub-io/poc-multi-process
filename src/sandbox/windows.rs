@@ -7,48 +7,53 @@
 //!
 //! ## What this is, and what it is not
 //!
-//! Windows confinement comes in two halves, and only one of them can be
-//! applied by the process to itself:
+//! Windows confinement comes in two halves:
 //!
 //! * **Process mitigation policies** — `SetProcessMitigationPolicy`, called by
 //!   a process *on itself*, irreversibly. These remove classes of capability:
 //!   allocating executable memory, creating child processes, accepting
-//!   injected DLLs. That is what this file implements.
+//!   injected DLLs. That is the self-applied half.
 //! * **Access confinement** — a restricted token, a low/untrusted integrity
-//!   level, an AppContainer, a job object. These decide what *objects* the
+//!   level, an **AppContainer**, a job object. These decide what *objects* the
 //!   process may touch: files, registry keys, the network, other processes.
-//!   Every one of them is attached by the **parent** at `CreateProcess` time
-//!   and cannot be self-applied. That is not implemented yet.
+//!   Every one is attached by the **parent** at `CreateProcess` time (that is
+//!   what [`crate::spawn`] owning the spawn call buys).
 //!
-//! The split matters for reading the guarantees honestly. What follows removes
-//! the ability to *run new code* and to *spawn programs* — the tail end of most
-//! exploit chains. It does **not** stop a compromised renderer from reading
-//! your files or opening a socket, because on Windows those are token
-//! decisions. Linux gets both halves (seccomp for syscalls, netns for reach)
-//! and macOS gets both (SBPL covers operations and objects in one profile);
-//! Windows here gets the first half only.
+//! Both halves are now here. What the mitigation policies remove is the ability
+//! to *run new code* and to *spawn programs* — the tail end of most exploit
+//! chains. What the AppContainer adds is the *object* confinement Linux gets
+//! from seccomp+netns and macOS from SBPL: a renderer with **no network and no
+//! broad file access**, the net component with **`internetClient`**, and each
+//! filesystem service reaching **only its own path** — the per-role split the
+//! other backends enforce, which Windows can only express through an
+//! AppContainer (a "lowbox" token, what UWP apps and Chromium's renderer run
+//! under). See [`app_container_identity`] and [`crate::spawn`].
 //!
-//! Concretely, the per-role distinction the other backends enforce — renderers
-//! have no network, the net component does — is **not enforced here**, because
-//! the mechanism that would express it (AppContainer capabilities) is
-//! parent-side. Both roles currently receive the same policy set.
+//! ## What is applied, and how the AppContainer is gated
 //!
-//! ## What is applied, and what is left
+//! Always applied: the mitigation policies (self-applied), low integrity (a
+//! token can always lower its own), a job object with a memory cap, and a
+//! **restricted primary token** — privileges stripped, groups deny-only.
 //!
-//! Applied: the mitigation policies (self-applied), low integrity (a token can
-//! always lower its own), a job object with a memory cap, and a **restricted
-//! primary token** — privileges stripped, groups deny-only — handed to the
-//! child at `CreateProcessAsUserW` (see [`crate::spawn`]).
+//! The **AppContainer** is applied when `GOSUB_WIN_APPCONTAINER` is set, and it
+//! then replaces the restricted token (the lowbox *is* the confinement). It is
+//! env-gated, not default-on, for one honest reason: a lowbox process can only
+//! load images (its own executable, DLLs) that the filesystem grants an
+//! app-package SID, so the binary must live at an **app-package-accessible
+//! location** — `C:\ProgramData` or `C:\Program Files`, where installers put
+//! programs (Chromium ACLs its own install dir for exactly this). Run from an
+//! ordinary build/`target` directory it cannot load, so leaving it default-on
+//! would break a from-`target` run (and CI). The `grant_app_package_execute`
+//! and per-service `grant_container_path_access` calls at spawn are what make it
+//! work once the binary is at such a location; validated end to end on Windows 11.
 //!
-//! Left: the *restricting-SID* form of the token, which would confine file
-//! access much further but cannot start a process without the executable being
-//! ACLed for the `RESTRICTED` SID (established empirically — see
-//! [`restricted_token`]); and an AppContainer, which is what would give the
-//! renderer/net network split. Both are parent-side and neither is here.
+//! The *restricting-SID* form of the token remains out for the same
+//! image-loading reason it always was (see [`restricted_token`]); the
+//! AppContainer above is the mechanism that actually clears that wall.
 //!
-//! Startup is **fail-closed** as on the other platforms: if a policy this file
-//! considers essential cannot be installed, the component aborts rather than
-//! run believing itself confined.
+//! Startup is **fail-closed** as on the other platforms: if a mitigation policy
+//! this file considers essential cannot be installed, the component aborts
+//! rather than run believing itself confined.
 
 use std::ffi::c_void;
 
@@ -531,4 +536,373 @@ pub fn restricted_token() -> Option<windows_sys::Win32::Foundation::HANDLE> {
         return None;
     }
     Some(out)
+}
+
+/// An AppContainer identity for a spawned child: the container SID plus any
+/// capability SIDs, kept alive so a `SECURITY_CAPABILITIES` can point into it
+/// across `CreateProcess`. Frees the SIDs on drop.
+///
+/// AppContainer is the Windows capability sandbox — the "lowbox" token that UWP
+/// apps and Chromium's renderer run under. A lowbox process can reach a securable
+/// object only if the object's ACL grants an app-package or *capability* SID, on
+/// top of the ordinary user check. A **content** role (renderer, decoder,
+/// services) gets an AppContainer with **no** capabilities — no network, no
+/// broad file access; the **net** component gets the **`internetClient`**
+/// capability. That is the renderer/net split the Unix and macOS backends enforce
+/// and the Windows backend otherwise could not.
+///
+/// One caveat, shared with the restricting-SID token (see [`restricted_token`]):
+/// a lowbox process can only load images the filesystem grants an app-package SID
+/// — system DLLs already do, but the PoC's own executable in `target\…` does not,
+/// so without an install-time (or spawn-time) ACL granting `ALL_APPLICATION_PACKAGES`
+/// the child dies in the loader. That is what [`grant_app_package_execute`]
+/// exists to work around.
+#[cfg(feature = "multi-process")]
+pub struct AppContainerIdentity {
+    container_sid: *mut c_void,
+    capability_sids: Vec<*mut c_void>,
+}
+
+// SAFETY: the contained SIDs are heap allocations owned solely by this struct;
+// they are not tied to the creating thread and are only read (by CreateProcess)
+// or freed (on drop).
+#[cfg(feature = "multi-process")]
+unsafe impl Send for AppContainerIdentity {}
+
+#[cfg(feature = "multi-process")]
+impl AppContainerIdentity {
+    /// The AppContainer (lowbox) SID, for `SECURITY_CAPABILITIES::AppContainerSid`.
+    pub fn container_sid(&self) -> *mut c_void {
+        self.container_sid
+    }
+
+    /// The capability SIDs, for the `SECURITY_CAPABILITIES::Capabilities` array.
+    pub fn capability_sids(&self) -> &[*mut c_void] {
+        &self.capability_sids
+    }
+}
+
+#[cfg(feature = "multi-process")]
+impl Drop for AppContainerIdentity {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::FreeSid;
+        // SAFETY: `container_sid` came from DeriveAppContainerSidFromAppContainerName
+        // (released with FreeSid); each capability SID from ConvertStringSidToSidW
+        // (released with LocalFree). Null guards cover a partially-built identity.
+        unsafe {
+            for &cap in &self.capability_sids {
+                if !cap.is_null() {
+                    LocalFree(cap);
+                }
+            }
+            if !self.container_sid.is_null() {
+                FreeSid(self.container_sid);
+            }
+        }
+    }
+}
+
+/// Build the AppContainer identity for a child. `name` is the container name (its
+/// SID is *derived* from it — no registered profile is needed for the process's
+/// lifetime); `internet` adds the `internetClient` capability (the net
+/// component's one privilege). Returns `None` if the SIDs cannot be built, so the
+/// spawner can fall back to the restricted-token path.
+#[cfg(feature = "multi-process")]
+pub fn app_container_identity(name: &str, internet: bool) -> Option<AppContainerIdentity> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows_sys::Win32::Security::Isolation::{
+        CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    };
+    use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
+    use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
+
+    // HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) — the profile is already registered.
+    const ALREADY_EXISTS: i32 = 0x8007_00B7u32 as i32;
+
+    let w = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+
+    // Build the capability SIDs first — they are needed both to register the
+    // profile and for the launch-time SECURITY_CAPABILITIES.
+    let mut capability_sids: Vec<*mut c_void> = Vec::new();
+    if internet {
+        // The `internetClient` capability's well-known SID (outbound network).
+        let mut cap: *mut c_void = std::ptr::null_mut();
+        // SAFETY: NUL-terminated SID string in; an owned PSID out on success.
+        if unsafe { ConvertStringSidToSidW(w("S-1-15-3-1").as_ptr(), &mut cap) } == 0 || cap.is_null()
+        {
+            eprintln!("[sandbox] could not build internetClient capability SID");
+            return None;
+        }
+        capability_sids.push(cap);
+    }
+    let mut cap_attrs: Vec<SID_AND_ATTRIBUTES> = capability_sids
+        .iter()
+        .map(|&c| SID_AND_ATTRIBUTES { Sid: c, Attributes: SE_GROUP_ENABLED as u32 })
+        .collect();
+    let (caps_ptr, caps_len) = if cap_attrs.is_empty() {
+        (std::ptr::null_mut(), 0u32)
+    } else {
+        (cap_attrs.as_mut_ptr(), cap_attrs.len() as u32)
+    };
+
+    // Register the AppContainer profile. This is what creates the container's
+    // on-disk profile (its LocalState folders) that a launched process needs —
+    // deriving the SID alone does not, and `CreateProcess` into an unregistered
+    // container fails with ERROR_FILE_NOT_FOUND. Idempotent: a container that is
+    // already registered is fetched with `DeriveAppContainerSidFromAppContainerName`.
+    let name_w = w(name);
+    let mut container_sid: *mut c_void = std::ptr::null_mut();
+    // SAFETY: NUL-terminated strings; the capability array with its length; an
+    // owned PSID out.
+    let hr = unsafe {
+        CreateAppContainerProfile(
+            name_w.as_ptr(),
+            w("gosub PoC").as_ptr(),
+            w("gosub process-isolation PoC sandbox").as_ptr(),
+            caps_ptr,
+            caps_len,
+            &mut container_sid,
+        )
+    };
+    let ok = if hr == ALREADY_EXISTS {
+        // SAFETY: NUL-terminated name; an owned PSID out.
+        let d = unsafe {
+            DeriveAppContainerSidFromAppContainerName(name_w.as_ptr(), &mut container_sid)
+        };
+        d >= 0 && !container_sid.is_null()
+    } else {
+        hr >= 0 && !container_sid.is_null()
+    };
+    if !ok {
+        eprintln!("[sandbox] could not set up AppContainer profile {name} (hr={hr:#010x})");
+        // SAFETY: free the capability SIDs we built (nothing else was allocated).
+        for &c in &capability_sids {
+            unsafe { LocalFree(c) };
+        }
+        return None;
+    }
+
+    Some(AppContainerIdentity { container_sid, capability_sids })
+}
+
+// File-generic rights.
+#[cfg(feature = "multi-process")]
+const GENERIC_READ: u32 = 0x8000_0000;
+#[cfg(feature = "multi-process")]
+const GENERIC_WRITE: u32 = 0x4000_0000;
+#[cfg(feature = "multi-process")]
+const GENERIC_EXECUTE: u32 = 0x2000_0000;
+// ACE inheritance flags: propagate to child objects (files) and containers
+// (subdirectories) so a granted directory covers what is created under it.
+#[cfg(feature = "multi-process")]
+const OBJECT_INHERIT_ACE: u32 = 0x1;
+#[cfg(feature = "multi-process")]
+const CONTAINER_INHERIT_ACE: u32 = 0x2;
+
+/// Merge one ALLOW ACE — `sid`, `rights`, `inheritance` — into `path`'s existing
+/// DACL. The building block for the app-package and per-container grants below.
+/// Idempotent: `SetEntriesInAclW` with `GRANT_ACCESS` folds into any existing ACE
+/// for the same trustee rather than stacking duplicates.
+#[cfg(feature = "multi-process")]
+fn add_allow_ace(
+    path: &std::path::Path,
+    sid: *mut c_void,
+    rights: u32,
+    inheritance: u32,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+        GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    };
+    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION};
+
+    let mut path_w: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+    // Read the current DACL so the new grant merges rather than replaces it.
+    let mut old_dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: *mut c_void = std::ptr::null_mut();
+    // SAFETY: valid path; out-params for the DACL and its owning descriptor.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut old_dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(rc as i32));
+    }
+
+    // SAFETY: a zeroed EXPLICIT_ACCESS_W is valid; we set the fields we need.
+    let mut ea: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
+    ea.grfAccessPermissions = rights;
+    ea.grfAccessMode = GRANT_ACCESS;
+    ea.grfInheritance = inheritance;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+    ea.Trustee.ptstrName = sid.cast();
+
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: one entry, merged onto `old_dacl`; `new_dacl` owned (LocalFree).
+    let rc = unsafe { SetEntriesInAclW(1, &ea, old_dacl, &mut new_dacl) };
+    if rc != ERROR_SUCCESS {
+        // SAFETY: allocated above.
+        unsafe { LocalFree(sd) };
+        return Err(std::io::Error::from_raw_os_error(rc as i32));
+    }
+
+    // SAFETY: valid path; applies the merged DACL.
+    let rc = unsafe {
+        SetNamedSecurityInfoW(
+            path_w.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: all owned by us and no longer needed.
+    unsafe {
+        LocalFree(new_dacl.cast());
+        LocalFree(sd);
+    }
+    if rc != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(rc as i32));
+    }
+    Ok(())
+}
+
+/// Build a SID from its string form (`ConvertStringSidToSidW`), or `None`.
+/// Owned; free with `LocalFree`.
+#[cfg(feature = "multi-process")]
+fn sid_from_string(sddl: &str) -> Option<*mut c_void> {
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    let s: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sid: *mut c_void = std::ptr::null_mut();
+    // SAFETY: NUL-terminated SID string in; an owned PSID out on success.
+    if unsafe { ConvertStringSidToSidW(s.as_ptr(), &mut sid) } == 0 || sid.is_null() {
+        return None;
+    }
+    Some(sid)
+}
+
+/// Grant **ALL APPLICATION PACKAGES** read+execute on `path` so an AppContainer
+/// (lowbox) child can load this image.
+///
+/// This is the install-time step Chromium performs on its own directory, done
+/// here at spawn instead. Without it a lowbox child cannot read the PoC's
+/// executable — under the user profile it grants no app-package access — and
+/// `CreateProcess` fails with `ERROR_FILE_NOT_FOUND`. System DLLs already carry
+/// this ACE (that is how UWP apps load them). Note the *directory* path to the
+/// image must also be app-package-traversable, which is why the binary is run
+/// from an app-package-accessible location (e.g. `C:\ProgramData`).
+#[cfg(feature = "multi-process")]
+pub fn grant_app_package_execute(path: &std::path::Path) -> std::io::Result<()> {
+    // ALL APPLICATION PACKAGES.
+    let sid = sid_from_string("S-1-15-2-1")
+        .ok_or_else(|| std::io::Error::other("could not build ALL APPLICATION PACKAGES SID"))?;
+    let r = add_allow_ace(path, sid, GENERIC_READ | GENERIC_EXECUTE, 0);
+    // SAFETY: built above and no longer needed.
+    unsafe { windows_sys::Win32::Foundation::LocalFree(sid) };
+    r
+}
+
+/// Give one service's AppContainer access to *its* file/directory, the way the
+/// Linux services get `openat` + Landlock to their own path — so a lowbox
+/// storage or font service can still reach its data even though it has no broad
+/// file access. `container_sid` is the service's own container (each service has
+/// its own, so this never widens another role's reach). `writable` adds write
+/// and, because the lowbox runs at Low integrity while the engine-created path is
+/// Medium, relabels the path to Low integrity so the write is actually permitted.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub fn grant_container_path_access(
+    path: &std::path::Path,
+    container_sid: *mut c_void,
+    writable: bool,
+) -> std::io::Result<()> {
+    let mut rights = GENERIC_READ | GENERIC_EXECUTE;
+    if writable {
+        rights |= GENERIC_WRITE;
+    }
+    // A directory grant must propagate to the files created under it.
+    let inheritance = if path.is_dir() { CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE } else { 0 };
+    add_allow_ace(path, container_sid, rights, inheritance)?;
+    if writable {
+        set_low_integrity_label(path)?;
+    }
+    Ok(())
+}
+
+/// Relabel `path` to **Low** integrity (inherited, no-write-up), so a
+/// Low-integrity lowbox process may write to it — the engine creates the path at
+/// its own Medium integrity, which a Low process otherwise cannot write.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+fn set_low_integrity_label(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorSacl, ACL, LABEL_SECURITY_INFORMATION,
+    };
+
+    // SACL with one mandatory-label ACE: object+container inherit, no-write-up,
+    // Low integrity level.
+    let sddl: Vec<u16> = "S:(ML;OICI;NW;;;LW)\0".encode_utf16().collect();
+    let mut psd: *mut c_void = std::ptr::null_mut();
+    // SAFETY: NUL-terminated SDDL in; an owned security descriptor out (LocalFree).
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1 as u32,
+            &mut psd,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut present: i32 = 0;
+    let mut sacl: *mut ACL = std::ptr::null_mut();
+    let mut defaulted: i32 = 0;
+    // SAFETY: valid descriptor; out-params for the SACL.
+    if unsafe { GetSecurityDescriptorSacl(psd, &mut present, &mut sacl, &mut defaulted) } == 0 {
+        // SAFETY: allocated above.
+        unsafe { LocalFree(psd) };
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut path_w: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: valid path; the label goes in the SACL slot.
+    let rc = unsafe {
+        SetNamedSecurityInfoW(
+            path_w.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            sacl,
+        )
+    };
+    // SAFETY: owns the descriptor (which owns the SACL); no longer needed.
+    unsafe { LocalFree(psd) };
+    if rc != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(rc as i32));
+    }
+    Ok(())
 }
