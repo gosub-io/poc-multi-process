@@ -51,27 +51,34 @@ The renderer gets the baseline only: no `socket`/`connect` (no network), no
 `execve`/`clone` (no subprocesses), no `io_uring_*`. The net component gets the
 same baseline plus the socket family, since it owns network access.
 
-The engine (parent) is unsandboxed, because the privileges a filter would drop
-are exactly the ones it exists to exercise: it spawns processes, opens sockets,
-and holds the cookie jar. It is *not* unsandboxed because it is safe from
+The engine (parent) gets no *seccomp* filter, because the privileges one would
+drop are exactly the ones it exists to exercise: it spawns processes, opens
+sockets, and holds the cookie jar. It is *not* exempt because it is safe from
 hostile input — it plainly is not. Every frame a renderer or the net component
 sends is `bincode::deserialize`d inside the engine (`rx.recv::<FromRenderer>()`
 in the loop's reader threads), so a compromised child's bytes are parsed by the
-one process holding every secret, with full ambient authority and no filter
-behind it.
+one process holding every secret, with full ambient authority and no syscall
+filter behind it.
 
 What bounds that today: frames are length-prefixed and capped at 16 MiB with
 the length checked *before* allocating, the wire types are closed enums, and
 bincode has no type-directed dispatch — it cannot be steered into constructing
 arbitrary types the way a gadget-bearing format (pickle, Java serialization,
-`serde_yaml` tags) can. So this is a narrow surface, not an open one. It is
-still the sharpest edge in the model, because the whole architecture rests on
-the broker being uncompromisable and this is the one place untrusted bytes
-reach it.
+`serde_yaml` tags) can. Those parsers are also fuzzed (see Fuzzing). So this is
+a narrow surface, not an open one. It is still the sharpest edge in the model,
+because the whole architecture rests on the broker being uncompromisable and
+this is the one place untrusted bytes reach it.
 
-A production engine would confine the broker too — Chromium sandboxes its
-browser process, just far more loosely than a renderer — and would keep the
-parser minimal and fuzzed. Neither is done here.
+The broker is not left *entirely* unconfined, though. Like Chromium's browser
+process — which is sandboxed, just far more loosely than a renderer — it gets a
+**loose Landlock sandbox**: it may read and execute anywhere (it must, to spawn
+children and load their libraries), but may only *write* beneath the temp dir.
+So a broker subverted through the deserialization surface still cannot plant
+persistence, overwrite its own binary, or corrupt the user's files and configs
+— the write-side blast radius is contained. What is still missing for a
+production broker: a seccomp filter around the (minimal, fuzzed) parser, so the
+*read* and *execute* surface is bounded too. See `lock_down_broker` in
+`src/sandbox/`.
 
 ## Event-driven engine
 
@@ -464,8 +471,12 @@ a real security boundary with a process behind them.
   transports, and (Linux) the children both *announce* and *enforce* their
   seccomp sandbox — the `selftest` probes confirm that making memory
   executable (`PROT_EXEC`), opening a socket, and any `fcntl` beyond the seal
-  commands are each killed by `SIGSYS`, while the sealed-memfd tile dance and
-  the ring produce/consume dance both survive. The `shm` and `ring` unit
+  commands are each killed by `SIGSYS`, that the fork server can fork but a
+  `clone` unsharing a namespace is killed, that a filesystem service's `openat`
+  is scoped by Landlock, and that the **broker's** Landlock confines its writes
+  to the temp dir (a write outside is `EACCES`, with a control proving it worked
+  before lockdown) — while the sealed-memfd tile dance and the ring
+  produce/consume dance both survive. The `shm` and `ring` unit
   tests additionally pin the consumer-side refusals: unsealed fds, undersized
   fds, absurd dimensions/lengths, corrupt ring cursors, aborted and truncated
   streams — plus a two-thread ring round-trip that wraps the window 256×.

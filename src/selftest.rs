@@ -103,6 +103,8 @@ pub const PROBES: &[&str] = &[
     "service-device-ioctl",
     #[cfg(target_os = "linux")]
     "service-landlock",
+    #[cfg(target_os = "linux")]
+    "broker-landlock",
     #[cfg(target_os = "macos")]
     "seatbelt-file",
     #[cfg(target_os = "macos")]
@@ -835,6 +837,45 @@ fn run_platform_probe(probe: &str) {
         let errno = attach_refused(true).expect("a non-dumpable child must refuse PTRACE_ATTACH");
         assert_eq!(errno, libc::EPERM, "expected EPERM, got errno {errno}");
         std::process::exit(0);
+    }
+
+    // The broker's *loose* Landlock: read/exec anywhere, write only beneath the
+    // temp dir. Runs before any seccomp lockdown (it needs `openat` to test file
+    // writes). Prove both halves — a write inside temp succeeds, a write outside
+    // is denied (`EACCES`) — with a control that shows the outside write worked
+    // *before* lockdown, so the denial is Landlock's and not a plain permission
+    // error. Skips cleanly where Landlock is unavailable, like the service probe.
+    if probe == "broker-landlock" {
+        if !crate::sandbox::landlock_available() {
+            eprintln!("[selftest] landlock unavailable — skipping");
+            std::process::exit(0);
+        }
+        let inside = std::env::temp_dir().join("gosub-broker-inside.tmp");
+        // Outside temp: the cwd the probe was spawned from (the crate root),
+        // which the user can normally write — a real control, not `/`.
+        let outside =
+            std::env::current_dir().unwrap_or_else(|_| "/".into()).join("gosub-broker-outside.tmp");
+
+        let control_ok = std::fs::write(&outside, b"pre").is_ok();
+        let _ = std::fs::remove_file(&outside);
+
+        crate::sandbox::lock_down_broker();
+
+        let inside_ok = std::fs::write(&inside, b"x").is_ok();
+        let _ = std::fs::remove_file(&inside);
+        let outside_denied = match std::fs::write(&outside, b"x") {
+            Err(e) if e.raw_os_error() == Some(libc::EACCES) => true,
+            Ok(()) => {
+                let _ = std::fs::remove_file(&outside); // Landlock didn't bind — clean up
+                false
+            }
+            Err(_) => false,
+        };
+        eprintln!(
+            "[selftest] broker-landlock: control_ok={control_ok} inside_ok={inside_ok} \
+             outside_denied={outside_denied}"
+        );
+        std::process::exit(if control_ok && inside_ok && outside_denied { 0 } else { 1 });
     }
 
     // Fork-server probes: this role's filter is not the renderer's, and it is

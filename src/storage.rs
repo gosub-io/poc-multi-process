@@ -39,8 +39,16 @@ pub const MAX_STORE_BYTES: u64 = 64 * 1024 * 1024;
 /// The directory every stored value lives in. The engine creates it before the
 /// service starts (the service's filter has `openat` but not `mkdirat`, and the
 /// engine is unconfined), so the service only ever *opens* files here.
+///
+/// An engine-chosen per-instance dir when `GOSUB_STORAGE_DIR` is set — the
+/// binary sets it so parallel runs (the test suite launches many at once) never
+/// share `/tmp` state and race each other's files — inherited by the storage
+/// service via the environment; the fixed default otherwise.
 pub fn storage_dir() -> PathBuf {
-    std::env::temp_dir().join("gosub-storage")
+    match std::env::var_os("GOSUB_STORAGE_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::temp_dir().join("gosub-storage"),
+    }
 }
 
 /// Create the storage directory. Called by the engine at startup, before the

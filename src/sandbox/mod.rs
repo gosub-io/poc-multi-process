@@ -240,6 +240,23 @@ pub fn landlock_available() -> bool {
     imp::landlock_available()
 }
 
+/// Confine the **broker** (engine) process's filesystem: read and execute
+/// anywhere, but write only beneath the temp dir. A *loose* sandbox — like a
+/// browser's main process — for the one process that holds every secret and
+/// deserializes untrusted frames without a seccomp filter: it cannot be
+/// tightened to a renderer's degree (it must spawn children and exec their
+/// libraries), but its *write* blast radius can be. Called by the binary on its
+/// main thread before the engine starts, so every engine thread and child
+/// inherits it. Linux/Landlock only; a no-op elsewhere (a macOS Seatbelt
+/// broker profile would be the equivalent, and is not built yet).
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn lock_down_broker() {
+    imp::lock_down_broker();
+}
+
+#[cfg(all(feature = "multi-process", not(target_os = "linux")))]
+pub fn lock_down_broker() {}
+
 /// Cap the fork server (Linux only — it is the one platform with a zygote).
 ///
 /// Sits outside the five-operation table above because it is not a per-platform

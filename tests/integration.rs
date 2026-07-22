@@ -550,6 +550,7 @@ mod probe_inventory {
         "service-fs-no-socket",
         "service-device-ioctl",
         "service-landlock",
+        "broker-landlock",
     ];
 
     /// The Seatbelt profile's enforcement. `PT_DENY_ATTACH` and the rlimits
@@ -741,6 +742,16 @@ mod sandbox_enforcement {
     fn landlock_scopes_a_service_to_its_directory() {
         let st = probe("service-landlock");
         assert!(st.success(), "landlock should confine openat to the ruleset, got {st:?}");
+    }
+
+    /// The broker's loose Landlock: read/exec anywhere, write only beneath temp.
+    /// The probe proves a write inside temp works while one outside is denied
+    /// (with a control showing the outside write worked before lockdown), so the
+    /// write-confinement is not a silent no-op. Skips (exit 0) without Landlock.
+    #[test]
+    fn broker_filesystem_writes_are_confined_to_temp() {
+        let st = probe("broker-landlock");
+        assert!(st.success(), "broker landlock should confine writes to temp, got {st:?}");
     }
 
     #[test]

@@ -16,9 +16,14 @@ use crate::ipc::{Endpoint, FontMetrics, FontRequest, FontResponse};
 use std::path::PathBuf;
 
 /// The stand-in font file the service reads. One flat file (not a directory),
-/// so the service needs only `openat`, not `mkdirat`.
+/// so the service needs only `openat`, not `mkdirat`. Per-instance via
+/// `GOSUB_FONT_FILE` (set by the binary, inherited by the service) so parallel
+/// runs don't share it; the fixed default otherwise.
 pub fn font_file() -> PathBuf {
-    std::env::temp_dir().join("gosub-font.dat")
+    match std::env::var_os("GOSUB_FONT_FILE") {
+        Some(f) => PathBuf::from(f),
+        None => std::env::temp_dir().join("gosub-font.dat"),
+    }
 }
 
 /// Deterministic stand-in contents, written by the engine at startup.

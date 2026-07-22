@@ -1552,7 +1552,10 @@ mod tests {
         // then renders. (The broker/swap code is identical in both modes; the
         // single-process engine exercises it deterministically.)
         let (engine, events) = start(Mode::Single);
-        engine.open_tab(ZoneId(0), "https://example.com").unwrap();
+        // A distinct zone from the other rendering unit test, so their
+        // (zone, origin)-keyed storage files never collide in the shared default
+        // storage dir when the two tests run in parallel.
+        engine.open_tab(ZoneId(9), "https://example.com").unwrap();
 
         let (mut swapped, mut framed_after_swap) = (false, false);
         for ev in events {

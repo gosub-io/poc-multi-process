@@ -79,6 +79,29 @@ fn main() {
 
 /// Minimal event-driven usage: send commands, react to events.
 fn run(mode: Mode) {
+    // Give this engine instance its own storage dir and font file, so parallel
+    // runs (the integration suite launches many binaries at once) never share a
+    // `/tmp` path and race each other's files. Children inherit these via the
+    // environment. Set on the main thread before any thread spawns (so the
+    // `set_var` is race-free) and before the broker Landlock below.
+    #[cfg(feature = "multi-process")]
+    {
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        std::env::set_var("GOSUB_STORAGE_DIR", tmp.join(format!("gosub-storage-{pid}")));
+        std::env::set_var("GOSUB_FONT_FILE", tmp.join(format!("gosub-font-{pid}.dat")));
+    }
+
+    // Confine the broker process's filesystem before it spawns anything or loads
+    // the cookie jar: it may read and exec (to launch children and load their
+    // libraries) but may only *write* beneath the temp dir, so a compromised
+    // broker cannot plant persistence or tamper with the user's files. Applied
+    // here, on the main thread, so every engine thread and every child inherits
+    // it. Done in the binary rather than `engine::start` so unit tests and
+    // embedders — which drive the engine directly — are not confined.
+    #[cfg(feature = "multi-process")]
+    gosub_proc_iso_poc::sandbox::lock_down_broker();
+
     let (engine, events) = engine::start(mode);
 
     // Two zones = two storage/cookie partitions (think "Work" and "Personal").
@@ -186,6 +209,18 @@ fn run(mode: Mode) {
                 println!("engine shut down");
                 break;
             }
+        }
+    }
+
+    // Best-effort cleanup of this instance's per-run storage/font paths, so the
+    // per-PID directories do not accumulate in the temp dir across runs.
+    #[cfg(feature = "multi-process")]
+    {
+        if let Some(dir) = std::env::var_os("GOSUB_STORAGE_DIR") {
+            let _ = std::fs::remove_dir_all(std::path::PathBuf::from(dir));
+        }
+        if let Some(file) = std::env::var_os("GOSUB_FONT_FILE") {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(file));
         }
     }
 

@@ -491,19 +491,18 @@ mod landlock {
         h
     }
 
-    /// Rights to grant one path. Directory-only rights (`READ_DIR`, `MAKE_REG`,
-    /// `REMOVE_FILE`) must not be set on a *file* path or `add_rule` rejects the
-    /// whole ruleset with `EINVAL` — so the grant depends on `is_dir`.
-    fn grant(is_dir: bool, writable: bool, abi: i32) -> u64 {
+    /// Rights to grant one *service* path. Directory-only rights (`READ_DIR`,
+    /// `MAKE_REG`, `REMOVE_FILE`) must not be set on a *file* path or `add_rule`
+    /// rejects the ruleset with `EINVAL` — so the grant depends on `is_dir`.
+    /// `TRUNCATE` (ABI v3) is included unconditionally; [`apply`] masks it off on
+    /// older kernels.
+    fn grant(is_dir: bool, writable: bool) -> u64 {
         let mut a = READ_FILE;
         if is_dir {
             a |= READ_DIR;
         }
         if writable {
-            a |= WRITE_FILE;
-            if abi >= 3 {
-                a |= TRUNCATE;
-            }
+            a |= WRITE_FILE | TRUNCATE;
             if is_dir {
                 // Create and remove entries under the directory.
                 a |= MAKE_REG | REMOVE_FILE;
@@ -512,10 +511,25 @@ mod landlock {
         a
     }
 
-    /// Restrict this thread's filesystem access to exactly `rules`
-    /// `(path, writable)`. `Ok(true)` = applied, `Ok(false)` = Landlock
-    /// unavailable (caller degrades to seccomp), `Err` = a real failure.
-    pub fn restrict(rules: &[(&Path, bool)]) -> std::io::Result<bool> {
+    /// Directory-only rights — invalid on a *file* path, so [`apply`] strips them
+    /// there rather than let one file rule `EINVAL` the whole ruleset.
+    const DIR_ONLY: u64 = READ_DIR
+        | MAKE_REG
+        | MAKE_DIR
+        | REMOVE_FILE
+        | REMOVE_DIR
+        | MAKE_CHAR
+        | MAKE_SOCK
+        | MAKE_FIFO
+        | MAKE_BLOCK
+        | MAKE_SYM;
+
+    /// Create a ruleset handling all fs access, add each `(path, rights)` rule
+    /// (rights masked to this ABI, and to what the path — file vs directory —
+    /// can carry), then enforce it on the calling thread and everything it later
+    /// spawns. `Ok(true)` = applied, `Ok(false)` = Landlock unavailable (caller
+    /// degrades), `Err` = a real failure.
+    fn apply(rules: &[(&Path, u64)]) -> std::io::Result<bool> {
         let abi = abi();
         if abi < 1 {
             return Ok(false);
@@ -535,7 +549,7 @@ mod landlock {
         }
         let rs = rs as RawFd;
 
-        for (path, writable) in rules {
+        for (path, rights) in rules {
             let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
             // SAFETY: NUL-terminated path; O_PATH just anchors the rule.
@@ -545,10 +559,11 @@ mod landlock {
                 unsafe { libc::close(rs) };
                 return Err(e);
             }
-            let rule = PathBeneathAttr {
-                allowed_access: grant(path.is_dir(), *writable, abi) & handled(abi),
-                parent_fd: pfd,
-            };
+            let mut allowed = *rights & handled(abi);
+            if !path.is_dir() {
+                allowed &= !DIR_ONLY;
+            }
+            let rule = PathBeneathAttr { allowed_access: allowed, parent_fd: pfd };
             // SAFETY: valid ruleset fd, rule pointer, and rule type.
             let rc = unsafe {
                 libc::syscall(
@@ -568,7 +583,7 @@ mod landlock {
         }
 
         // restrict_self requires NO_NEW_PRIVS (the seccomp install would set it
-        // too, but that runs later).
+        // too, but that runs later — and the broker never installs seccomp).
         // SAFETY: a one-way prctl switch.
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
             let e = std::io::Error::last_os_error();
@@ -584,12 +599,78 @@ mod landlock {
         }
         Ok(true)
     }
+
+    /// Restrict this thread's filesystem access to exactly `rules`
+    /// `(path, writable)` — the *service* confinement (read, plus write on a
+    /// `writable` path).
+    pub fn restrict(rules: &[(&Path, bool)]) -> std::io::Result<bool> {
+        let mapped: Vec<(&Path, u64)> =
+            rules.iter().map(|(p, w)| (*p, grant(p.is_dir(), *w))).collect();
+        apply(&mapped)
+    }
+
+    /// The *broker* confinement — a loose sandbox for the engine process.
+    ///
+    /// It may **read and execute anywhere**: it forks+execs its children, whose
+    /// shared libraries can live in distro-specific places all over the host, so
+    /// an allowlist of library directories would be fragile (this is the same
+    /// reason a browser's main process is only loosely sandboxed). But it may
+    /// only **write beneath `temp`**, where the storage dir and font file live.
+    /// So a broker subverted through its one untrusted surface — the frames it
+    /// `bincode::deserialize`s — cannot plant persistence, overwrite its own
+    /// binary, or corrupt the user's files and configs. The ruleset is inherited
+    /// by every engine thread and every fork+exec'd child, so nothing in the
+    /// process tree can write outside `temp` either; each child then further
+    /// restricts itself.
+    pub fn restrict_broker(temp: &Path) -> std::io::Result<bool> {
+        // Read + traverse + execute everything, so the loader can `execve` the
+        // child binary and mmap its shared libraries PROT_EXEC wherever they are.
+        let root = READ_FILE | READ_DIR | EXECUTE;
+        // Full write beneath the temp dir: create/remove the storage dir and the
+        // font file, and write/truncate them.
+        let temp_rw = READ_FILE
+            | READ_DIR
+            | WRITE_FILE
+            | TRUNCATE
+            | MAKE_REG
+            | MAKE_DIR
+            | REMOVE_FILE
+            | REMOVE_DIR;
+        apply(&[(Path::new("/"), root), (temp, temp_rw)])
+    }
 }
 
 /// Whether Landlock is usable on this host (for probes and diagnostics).
 #[cfg(feature = "multi-process")]
 pub fn landlock_available() -> bool {
     landlock::available()
+}
+
+/// Confine the **broker** (engine) process's filesystem with Landlock: read and
+/// execute anywhere, but write only beneath the temp dir (see
+/// [`landlock::restrict_broker`]). Called on the process's main thread before it
+/// spawns anything, so every engine thread and every fork+exec'd child inherits
+/// it.
+///
+/// Best-effort, deliberately unlike the child lockdowns: the broker is not the
+/// boundary that *contains* a compromised renderer — it is defense in depth on
+/// the one process that holds every secret and parses untrusted frames without a
+/// seccomp filter behind it. A kernel without Landlock leaves it as it was
+/// (filesystem-unconfined), rather than the engine refusing to start.
+#[cfg(feature = "multi-process")]
+pub fn lock_down_broker() {
+    let temp = std::env::temp_dir();
+    match landlock::restrict_broker(&temp) {
+        Ok(true) => {
+            eprintln!("[broker] landlock active (writes confined to {})", temp.display())
+        }
+        Ok(false) => {
+            eprintln!("[broker] landlock unavailable on this kernel; broker filesystem unconfined")
+        }
+        Err(e) => {
+            eprintln!("[broker] landlock could not be applied ({e}); broker filesystem unconfined")
+        }
+    }
 }
 
 /// What a *device*-backed service (audio, GPU) needs: open a device node and
