@@ -807,16 +807,24 @@ fn run_platform_probe(probe: &str) {
             names
         };
 
-        let before = std::fs::read_link("/proc/self/ns/net").expect("read netns link");
+        let ns_link = |kind: &str| {
+            std::fs::read_link(format!("/proc/self/ns/{kind}")).expect("read ns link")
+        };
+        // `isolate_network` unshares net + ipc + uts together, so all three
+        // namespace ids must change — checking only net would miss a regression
+        // that dropped ipc/uts from the flag set.
+        let (net0, ipc0, uts0) = (ns_link("net"), ns_link("ipc"), ns_link("uts"));
         assert!(interfaces().len() > 1, "host netns looks empty already — probe proves nothing");
 
-        crate::sandbox::isolate_network(true).expect("unshare netns");
+        crate::sandbox::isolate_network(true).expect("unshare namespaces");
 
-        // The namespace must actually have changed, and the new one must hold
-        // nothing but loopback: no route off this machine exists at all.
-        let after = std::fs::read_link("/proc/self/ns/net").expect("read netns link");
-        assert_ne!(before, after, "still in the host network namespace");
+        // The network namespace must actually have changed, and the new one must
+        // hold nothing but loopback: no route off this machine exists at all.
+        assert_ne!(net0, ns_link("net"), "still in the host network namespace");
         assert_eq!(interfaces(), vec!["lo".to_string()], "netns is not empty");
+        // ...and the IPC and UTS namespaces changed too (defense in depth).
+        assert_ne!(ipc0, ns_link("ipc"), "still in the host IPC namespace");
+        assert_ne!(uts0, ns_link("uts"), "still in the host UTS namespace");
         std::process::exit(0);
     }
 

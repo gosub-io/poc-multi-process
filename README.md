@@ -546,26 +546,39 @@ simplified is the surrounding browser. What each entry below still needs:
 - **Sandboxing**: the seccomp filter is production-shaped (fail-closed
   allowlist, SIGSYS-kill-on-violation with the blocked syscall reported, W^X via
   `PROT_EXEC` argument-filtering), and
-  renderers additionally run in an empty **network namespace** — unshared on
-  the fork server at spawn and inherited by every renderer it `fork()`s, so
-  "a renderer cannot reach the network" no longer rests on the syscall
-  allowlist alone. The two layers fail independently: an allowlist gap is
-  survivable when the namespace has no interfaces to connect through. The net
-  component is the one role that keeps the host netns. Separately, every process
+  renderers additionally run in an empty **network namespace** (plus **IPC** and
+  **UTS** namespaces) — unshared on the fork server at spawn and inherited by
+  every renderer it `fork()`s, so "a renderer cannot reach the network" no longer
+  rests on the syscall allowlist alone. The two layers fail independently: an
+  allowlist gap is survivable when the namespace has no interfaces to connect
+  through. The net component is the one role that keeps the host netns; the IPC
+  and UTS namespaces are defense in depth for properties seccomp also covers (no
+  shared System V IPC, its own hostname). Separately, every process
   (engine included, in both modes) clears its **dumpable** flag, so other
   software running as the same user cannot `ptrace`-attach or read
   `/proc/<pid>/mem` — the engine's cookie jar is the obvious target, and this is
   the inbound direction that seccomp has no say over. It is set after `execve`,
   which resets the flag; it survives `fork`, so renderers inherit it from the
-  fork server. Filesystem restriction with **Landlock** is now used by the
-  filesystem services (storage, font) to path-confine their `openat`; still
-  missing for a real deployment: a per-arch baseline tested across libc/kernel
-  versions, and the remaining namespaces (mount/PID/IPC) plus `pivot_root`. A
-  real JS JIT needs executable memory, so it would carve out a dedicated JIT
-  exception rather than deny `PROT_EXEC` outright.
+  fork server. Filesystem restriction with **Landlock** is used by the
+  filesystem services (storage, font) to path-confine their `openat`, and the
+  **broker** gets a loose Landlock too (read/exec anywhere, write only the temp
+  dir). Two namespaces are deliberately *not* added, each blocked by a concrete
+  reason rather than merely unimplemented: an empty-root **mount** namespace
+  needs `pivot_root`, which needs mount capability that the deliberately-unmapped
+  (`uid_map`-less) user namespace does not confer — and writing a `uid_map` to
+  fix that is blocked *both* by AppArmor on modern hosts and by the broker
+  Landlock (`/proc/self/uid_map` is outside the temp dir); a **PID** namespace
+  collides with the fork server's own `clone` hardening and with fault isolation
+  (a shared-namespace PID 1's death would `SIGKILL` every other renderer). Both
+  are documented at `isolate_network` in `src/sandbox/linux.rs`, and seccomp's
+  `open`/`openat` and `kill`/`ptrace` denials cover the properties regardless.
+  Also still wanted: a per-arch seccomp baseline tested across libc/kernel
+  versions. A real JS JIT needs executable memory, so it would carve out a
+  dedicated JIT exception rather than deny `PROT_EXEC` outright.
 
-  **Platform status.** Linux is the reference implementation: seccomp, an empty
-  netns, rlimits, non-dumpable processes, 12 probes. macOS runs a Seatbelt
+  **Platform status.** Linux is the reference implementation: seccomp, empty
+  net/IPC/UTS namespaces, rlimits, non-dumpable processes, broker Landlock, 18
+  probes. macOS runs a Seatbelt
   profile with 11 probes. Windows spawns over a pair of anonymous pipes (see
   `src/channel/`) and installs **process mitigation policies** — no dynamic
   code (the W^X analogue), no child processes, no injection extension points,

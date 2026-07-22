@@ -1088,20 +1088,51 @@ pub fn apply_child_rlimits() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Move the calling process into a fresh, empty network namespace when
-/// `enable` is set (renderers); a no-op otherwise (the net component, which is
-/// the one role that must keep the network).
+/// Move the calling process into fresh, empty namespaces when `enable` is set
+/// (content processes and the engine-spawned services); a no-op otherwise (the
+/// net component, the one role that must keep the host network).
 ///
-/// This is defense in depth for the *same* property the seccomp allowlist
-/// already provides: a renderer must never reach the network. The two fail
-/// independently. seccomp's guarantee is "we enumerated the syscalls correctly"
-/// — one missing entry on a new architecture, one novel socket-obtaining path,
-/// and it is gone. An empty netns has no interfaces at all, so there is nothing
-/// to connect *to* even if a syscall slips through the filter.
+/// The load-bearing one is the **network** namespace — defense in depth for the
+/// same property the seccomp allowlist already gives: a renderer must never
+/// reach the network, and the two fail independently (a missing socket syscall
+/// in the filter is survivable when the namespace has no interface to connect
+/// through). Alongside it, as cheaper defense in depth for properties seccomp
+/// also already covers, are the **IPC** namespace (no shared System V IPC or
+/// POSIX message queues with the host — `shmget`/`msgget`/`semget` are off the
+/// allowlist too) and the **UTS** namespace (its own hostname/domainname —
+/// `sethostname` is off the allowlist too).
 ///
-/// `CLONE_NEWNET` on its own requires `CAP_SYS_ADMIN`. Pairing it with
-/// `CLONE_NEWUSER` gets it unprivileged: the new user namespace grants a full
-/// capability set *within itself*, which is enough to create the netns.
+/// Two namespaces are deliberately *not* here, each for a concrete reason worth
+/// recording rather than a shortcut:
+///
+/// - **Mount** (an empty root, the filesystem analogue of the empty netns).
+///   Emptying the root needs `pivot_root`, which needs `CAP_SYS_ADMIN` over the
+///   mount that `/` lives on. A renderer's user namespace has **no `uid_map`**
+///   (deliberate — see below — so it runs as the unmapped overflow uid), and an
+///   unmapped userns confers no usable mount capability over the parent-owned
+///   `/` (verified: the mount `EPERM`s even in an `apparmor=unconfined`
+///   container). The fix — write a `uid_map` mapping to root-in-ns — is blocked
+///   *twice*: by AppArmor on modern hosts (`apparmor_restrict_unprivileged_userns`
+///   refuses the `uid_map` write) and, everywhere, by the **broker Landlock**,
+///   which confines writes to the temp dir and `/proc/self/uid_map` is not there.
+///   So it is genuinely blocked by two other (deliberate) hardening choices, not
+///   merely unimplemented. Seccomp's `openat`/`open` denial is the actual no-fs
+///   guarantee regardless.
+/// - **PID**. Isolating the fork server's renderers cleanly needs the fork server
+///   to be its ns's PID 1 (init/reaper), which needs the *engine* to
+///   `clone(CLONE_NEWPID)` when spawning it — and `std::process::Command` cannot
+///   pass clone flags. Giving each renderer its *own* PID namespace instead needs
+///   the fork server to `clone(CLONE_NEWPID)` per renderer — which its own
+///   hardening now forbids (clone3 → `ENOSYS` plus the `CLONE_NEW*` mask). And a
+///   plain `unshare(CLONE_NEWPID)` in the fork server would make the *first*
+///   renderer PID 1, whose death `SIGKILL`s every other renderer, breaking the
+///   fault isolation a single crashed tab must not violate. It waits on a
+///   spawn-path rework; seccomp denies `kill`/`ptrace` in the meantime.
+///
+/// `CLONE_NEWNET`/`NEWIPC`/`NEWUTS` on their own require `CAP_SYS_ADMIN`. Pairing
+/// them with `CLONE_NEWUSER` in the *same* `unshare` gets it unprivileged: the
+/// new user namespace grants a full capability set within itself, enough to
+/// create the rest in that one call.
 ///
 /// We deliberately do **not** write `/proc/self/uid_map`. Leaving it unmapped
 /// means the process runs as the overflow uid (`nobody`) inside the namespace,
@@ -1119,8 +1150,10 @@ pub fn isolate_network(enable: bool) -> std::io::Result<()> {
     if !enable {
         return Ok(());
     }
+    let flags =
+        libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS;
     // SAFETY: unshare with valid flags; affects only the calling process.
-    if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } < 0 {
+    if unsafe { libc::unshare(flags) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())

@@ -130,10 +130,13 @@ pub fn apply_child_rlimits() -> std::io::Result<()> {
     imp::apply_child_rlimits()
 }
 
-/// Isolate a child from the network when `enable` is set (renderers), leaving
-/// it in place otherwise (the net component). Called from `pre_exec`, so it
-/// must stay async-signal-safe. On platforms without network namespaces this
-/// is deferred into the lockdown profile — see the backend docs.
+/// Isolate a child's namespaces when `enable` is set (content processes and
+/// services), leaving them in place otherwise (the net component). On Linux this
+/// unshares the network namespace (the load-bearing one) plus IPC and UTS as
+/// defense in depth; the mount and PID namespaces are deliberately left out for
+/// concrete reasons (see the backend docs). Called from `pre_exec`, so it must
+/// stay async-signal-safe. On platforms without namespaces this is deferred into
+/// the lockdown profile — see the backend docs.
 #[cfg(feature = "multi-process")]
 pub fn isolate_network(enable: bool) -> std::io::Result<()> {
     imp::isolate_network(enable)
