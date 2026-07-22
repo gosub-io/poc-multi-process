@@ -578,8 +578,11 @@ simplified is the surrounding browser. What each entry below still needs:
 
   **Platform status.** Linux is the reference implementation: seccomp, empty
   net/IPC/UTS namespaces, rlimits, non-dumpable processes, broker Landlock, 18
-  probes. macOS runs a Seatbelt
-  profile with 11 probes. Windows spawns over a pair of anonymous pipes (see
+  probes. macOS runs a Seatbelt `(deny default)`
+  profile with 12 probes — including **path-scoped file services** (storage/font
+  get `subpath` read/write grants for their own directory plus a broad
+  `file-read-metadata` so path lookup resolves, while contents outside the scope
+  stay unreadable). Windows spawns over a pair of anonymous pipes (see
   `src/channel/`) and installs **process mitigation policies** — no dynamic
   code (the W^X analogue), no child processes, no injection extension points,
   plus win32k lockdown — with 4 probes, plus the parent-side access controls

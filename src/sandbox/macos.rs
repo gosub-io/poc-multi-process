@@ -26,10 +26,26 @@
 //!   syscall arguments, so the fine-grained "writable-xor-executable" rule the
 //!   seccomp filter carries has no direct analogue here. `(deny default)` still
 //!   denies the file/network/exec escalation surface.
-//! * **Seatbelt is deprecated API.** `sandbox_init` has been marked deprecated
-//!   since 10.7 yet remains the mechanism every shipping browser uses; a
-//!   production build would move to the modern App Sandbox entitlement model.
-//!   We suppress the deprecation warning at the call site.
+//! * **Filesystem services are path-scoped** — the SBPL counterpart of the Linux
+//!   services' Landlock ruleset. A storage/font service is granted `file-read*`
+//!   (and, where writable, `file-write*`) on *only* its own declared path via
+//!   `(subpath …)`/`(literal …)`, not the blanket `file-read* file-write*` a
+//!   compromised service could turn on the whole disk. See [`lock_down_service`].
+//!
+//! ### Why SBPL, not the "modern" App Sandbox
+//!
+//! `sandbox_init` is marked deprecated since 10.7, and the obvious "modernize"
+//! is the App Sandbox entitlement model. For a *multi-process browser* that is
+//! the **wrong** move, not a pending one: App Sandbox capabilities are declared
+//! as **entitlements in the code signature**, so every process launched from the
+//! same signed binary gets the *same* entitlements. The PoC re-execs one binary
+//! into every role, so App Sandbox could not give the net component the network
+//! while denying it to renderers — the per-role split would collapse. SBPL is
+//! **self-applied at runtime**, so each process installs a *different* profile
+//! for its role; that is precisely why Chromium and Firefox sandbox their
+//! renderer/GPU/network helpers with `sandbox_init`/SBPL rather than App Sandbox.
+//! The deprecation is API hygiene (silenced at the call site), not a signal to
+//! switch mechanisms.
 //!
 //! Startup is **fail-closed** exactly as on Linux: if `sandbox_init` refuses
 //! the profile the component aborts rather than run unconfined.
@@ -98,23 +114,78 @@ pub fn lock_down_net() {
 
 /// Cap an engine-spawned service. Seatbelt gates *operations* rather than
 /// syscalls, so the Linux `filesystem`/`device` distinction maps onto profile
-/// clauses: a filesystem service is granted `file-read*`/`file-write*`, a
-/// device service additionally `iokit-open` (the closest analogue to `ioctl`
-/// on a device node). Everything else stays `(deny default)`.
+/// clauses.
+///
+/// A **filesystem** service (storage, font) that declares `fs_allow` paths is
+/// path-scoped, the SBPL counterpart of the Linux services' Landlock ruleset:
+/// `file-read*` (and, where writable, `file-write*`) on *only* those paths, via
+/// `(subpath …)` for a directory or `(literal …)` for a file — so a compromised
+/// storage service cannot read `/etc` or write outside its own directory. The
+/// paths are canonicalized first, because SBPL matches the *resolved* path (on
+/// macOS `/tmp` is a symlink to `/private/tmp`).
+///
+/// A **device** service (audio, GPU) instead gets the broad `file-read*
+/// file-write*` plus `iokit-open` (the `ioctl`/device-node analogue): a driver
+/// node is not a simple path to scope, exactly as the Linux device filter is
+/// coarser than the filesystem one. Everything else stays `(deny default)`.
 #[cfg(feature = "multi-process")]
-pub fn lock_down_service(name: &str, filesystem: bool, device: bool, _fs_allow: &[(&std::path::Path, bool)]) {
+pub fn lock_down_service(name: &str, filesystem: bool, device: bool, fs_allow: &[(&std::path::Path, bool)]) {
     deny_debugger_attach();
     let mut profile = String::from("(version 1)\n(deny default)\n");
     profile.push_str("(allow signal (target self))\n");
     profile.push_str("(allow process-info* (target self))\n");
-    if filesystem || device {
+
+    if !fs_allow.is_empty() {
+        // Path resolution first: opening a file deep in the tree requires
+        // metadata (lookup/stat) access to its *ancestor* directories, which a
+        // `(subpath …)` grant does not cover — it grants the subtree, not the
+        // path *to* it. Without this a scoped service's own open fails `EPERM`
+        // during namei. `file-read-metadata` reveals only names/attributes,
+        // never contents — the actual read/write below stays scoped — so this is
+        // the standard Seatbelt pattern, not a widening of what can be *read*.
+        profile.push_str("(allow file-read-metadata)\n");
+        // Path-scoped data access: read (and optionally write) only the declared
+        // paths. macOS `/var` and `/tmp` are symlinks (to `/private/…`), and it
+        // is not obvious which spelling Seatbelt matches against — so grant
+        // *both* the path as given and its canonical (symlink-resolved) form.
+        for (path, writable) in fs_allow {
+            let mut variants: Vec<std::path::PathBuf> = vec![path.to_path_buf()];
+            if let Ok(canon) = std::fs::canonicalize(path) {
+                if canon != **path {
+                    variants.push(canon);
+                }
+            }
+            for v in &variants {
+                let matcher = if v.is_dir() { "subpath" } else { "literal" };
+                let p = sbpl_escape(&v.to_string_lossy());
+                profile.push_str(&format!("(allow file-read* ({matcher} \"{p}\"))\n"));
+                if *writable {
+                    profile.push_str(&format!("(allow file-write* ({matcher} \"{p}\"))\n"));
+                }
+            }
+        }
+    } else if filesystem || device {
+        // No path list to scope by (a device service opening a driver node):
+        // the broad grant, deliberately coarser like the Linux device filter.
         profile.push_str("(allow file-read* file-write*)\n");
     }
     if device {
         profile.push_str("(allow iokit-open)\n");
     }
+    // Diagnostic: dump the exact profile when GOSUB_DEBUG_SBPL is set.
+    if std::env::var_os("GOSUB_DEBUG_SBPL").is_some() {
+        eprintln!("[{name}] SBPL profile:\n{}", profile);
+    }
     profile.push('\0');
     enforce(name, &profile);
+}
+
+/// Escape a path for embedding in an SBPL double-quoted string. macOS paths do
+/// not normally contain `"` or `\`, but a stray one would otherwise break the
+/// profile (or worse, widen it), so quote them.
+#[cfg(feature = "multi-process")]
+fn sbpl_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Apply an SBPL profile to this process, or die trying. Fail-closed, matching

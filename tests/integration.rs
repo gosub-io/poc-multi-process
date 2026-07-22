@@ -374,6 +374,15 @@ mod seatbelt_enforcement {
         check("seatbelt-sysctl");
     }
 
+    /// A filesystem service is path-scoped to its own directory — read/write
+    /// inside, denied outside — the SBPL counterpart of the Linux services'
+    /// Landlock ruleset, so a compromised storage/font service cannot roam the
+    /// disk despite being a filesystem-service profile.
+    #[test]
+    fn service_filesystem_is_path_scoped() {
+        check("seatbelt-service-scope");
+    }
+
     /// The rlimits are a mechanism wholly separate from Seatbelt, and were
     /// entirely unverified on macOS.
     #[test]
@@ -566,6 +575,7 @@ mod probe_inventory {
         "seatbelt-fork",
         "seatbelt-signal-other",
         "seatbelt-sysctl",
+        "seatbelt-service-scope",
         "rlimits",
         "ptrace-deny-accepted",
     ];

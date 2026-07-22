@@ -124,6 +124,8 @@ pub const PROBES: &[&str] = &[
     #[cfg(target_os = "macos")]
     "seatbelt-sysctl",
     #[cfg(target_os = "macos")]
+    "seatbelt-service-scope",
+    #[cfg(target_os = "macos")]
     "rlimits",
     #[cfg(target_os = "macos")]
     "ptrace-deny-accepted",
@@ -759,6 +761,45 @@ fn run_macos_probe(probe: &str) {
                 std::process::exit(code::NOT_DENIED);
             }
             std::process::exit(0);
+        }
+
+        // A filesystem service is path-scoped to *its own* directory — the SBPL
+        // counterpart of the Linux services' Landlock ruleset. It may read+write
+        // inside its declared path but is denied outside, even though the profile
+        // is a filesystem-service profile. Mirrors the Linux `service-landlock`
+        // probe. The control (both work pre-lockdown) keeps a broken path or a
+        // read-only temp dir from passing this vacuously.
+        "seatbelt-service-scope" => {
+            let dir = std::env::temp_dir().join("gosub-seatbelt-scope");
+            let _ = std::fs::create_dir_all(&dir);
+            let inside = dir.join("inside.tmp");
+            let outside = std::env::temp_dir().join("gosub-seatbelt-outside.tmp");
+            let _ = std::fs::write(&outside, b"pre");
+            if std::fs::write(&inside, b"x").is_err() || std::fs::read(&outside).is_err() {
+                std::process::exit(code::CONTROL_FAILED);
+            }
+
+            crate::sandbox::lock_down_service(
+                "probe",
+                crate::sandbox::ServiceCaps { filesystem: true, device: false },
+                &[(dir.as_path(), true)],
+            );
+
+            // Inside the scope: writing must still work (the allow rule took).
+            if let Err(e) = std::fs::write(&inside, b"after") {
+                eprintln!(
+                    "[selftest] seatbelt-service-scope: inside write DENIED errno={:?} path={}",
+                    e.raw_os_error(),
+                    inside.display()
+                );
+                std::process::exit(code::WRONG_VALUE);
+            }
+            // Outside the scope: reading must be refused with EPERM.
+            match std::fs::read(&outside) {
+                Ok(_) => std::process::exit(code::NOT_DENIED),
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) => std::process::exit(0),
+                Err(_) => std::process::exit(code::WRONG_ERROR),
+            }
         }
 
         other => {
