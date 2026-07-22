@@ -102,10 +102,18 @@ fn run(mode: Mode) {
     // outcome, not a reason to wait forever — see `TabCrashed` below.
     let mut tabs_finished = 0;
     let mut crashed = 0;
+    // The work tab, and whether it has already demonstrated a cross-origin
+    // renderer swap. After its first frame it navigates cross-origin once, so
+    // the demo exercises site isolation's renderer swap end to end.
+    let mut work_tab: Option<events::TabId> = None;
+    let mut work_swapped = false;
     for event in events {
         match event {
             EngineEvent::TabOpened { tab_id, zone, origin } => {
                 println!("{tab_id} [{zone}]: opened for {origin}");
+                if zone == work {
+                    work_tab = Some(tab_id);
+                }
                 // The personal tab fetches a large (4 MiB) body — the PoC's
                 // stand-in for a big download — to exercise the shared-memory
                 // ring transport; the work tab fetches a small in-band page.
@@ -124,7 +132,21 @@ fn run(mode: Mode) {
                     tile.pixels.transport(),
                     if tile_matches_pattern(&tile) { "ok" } else { "MISMATCH" },
                 );
-                engine.close_tab(tab_id).unwrap();
+                // Site isolation: with `GOSUB_DEMO_SWAP` set, the work tab
+                // navigates cross-origin after its first frame. The engine swaps
+                // in a fresh renderer for the new origin — two origins never
+                // share a process — then renders it, after which we close. The
+                // flag keeps the *default* run (and every other integration
+                // test that drives it) at its original process count; only the
+                // swap's own test opts the extra renderer in. Every other frame
+                // just closes its tab.
+                let demo_swap = std::env::var_os("GOSUB_DEMO_SWAP").is_some();
+                if demo_swap && Some(tab_id) == work_tab && !work_swapped {
+                    work_swapped = true;
+                    engine.navigate(tab_id, "https://other.example/page").unwrap();
+                } else {
+                    engine.close_tab(tab_id).unwrap();
+                }
             }
             EngineEvent::TabClosed { tab_id } => {
                 println!("{tab_id}: closed");
@@ -135,6 +157,9 @@ fn run(mode: Mode) {
             }
             EngineEvent::OpenTabFailed { url, reason } => {
                 println!("could not open {url}: {reason}");
+            }
+            EngineEvent::TabNavigated { tab_id, origin } => {
+                println!("{tab_id}: swapped to a new renderer for {origin}");
             }
             EngineEvent::NavigationFailed { tab_id, reason } => {
                 println!("{tab_id}: navigation failed: {reason}");

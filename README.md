@@ -185,8 +185,13 @@ capability the zygote gave up cannot be its child.
   `(zone, origin)`. So the same origin opened in two zones runs as two separate
   processes with independent cookie jars — one can never touch the other's
   partition. The engine knows each tab's `(zone, origin)` because *it* spawned
-  the renderer; identity fields inside messages are never trusted. Navigation
-  is same-origin per renderer (site isolation).
+  the renderer; identity fields inside messages are never trusted. A renderer
+  only ever serves its own origin: a **cross-origin navigation swaps the
+  renderer** (site isolation) — the engine tears the old one down and brings up
+  a fresh process bound to the new `(zone, origin)`, the way Chromium changes
+  `RenderFrameHost`, rather than letting one process serve two origins. The
+  teardown is distinguished from a crash (the tab's gate is closed first) so the
+  reused tab id never surfaces a spurious `TabCrashed`.
 - **HttpOnly cookies never reach a renderer.** Cookies carry an `http_only`
   flag; the net component receives all of a request's cookies to attach to the
   outbound fetch (it must — that's how authenticated requests work), but a
@@ -206,9 +211,9 @@ capability the zygote gave up cannot be its child.
   readable; a cross-origin no-cors *embeddable* type (image/script/CSS/font) is
   delivered **opaque** (usable, not readable as data); a cross-origin *data* type
   (HTML/JSON/XML) or anything not clearly embeddable is **blocked** — its bytes
-  never enter the renderer. Cross-origin navigation is still refused outright (a
-  real engine swaps renderers); only subresources cross the boundary, and only
-  under ORB.
+  never enter the renderer. Cross-origin *navigation* is handled by swapping the
+  renderer (above); ORB is the separate mechanism for cross-origin
+  *subresources*, which a page loads without navigating.
 - SSRF policy is centralized in the net component (the one place allowed to
   open sockets), so no renderer bug can bypass it. It classifies the *numeric*
   address (loopback, private incl. `172.16/12`, link-local/cloud-metadata,
@@ -444,10 +449,13 @@ a real security boundary with a process behind them.
   (per-value cap, overwrite-as-delta, saturating arithmetic), and origin
   parsing. The
   single-process engine is also driven end to end (open → navigate → frame →
-  close → shutdown, cross-origin refusal, unparseable URL) — the broker/policy
-  code is identical in both modes, so this exercises the real thing.
+  close → shutdown, the **cross-origin renderer swap** committing the new origin
+  and rendering it, unparseable URL) — the broker/policy code is identical in
+  both modes, so this exercises the real thing.
 - **Integration tests** (`tests/integration.rs`) run the actual built binary:
-  multi- and single-process runs render and shut down cleanly, unknown args are
+  multi- and single-process runs render and shut down cleanly (the default run
+  also performs a cross-origin renderer swap with real child processes and no
+  spurious crash), unknown args are
   rejected, tiles arrive via shared memory (multi-process) or in-band copy
   (single-process) and byte-match the expected pattern either way, the tile
   bench completes on both transports, large fetch bodies stream through the
@@ -594,11 +602,15 @@ simplified is the surrounding browser. What each entry below still needs:
 - **Origins**: the engine's `origin_of` now canonicalizes the full
   `scheme://host[:port]` tuple (default ports folded), so different schemes
   or ports are different origins — the cookie jar is partitioned by scheme
-  too, closing the HTTPS→HTTP secure-cookie downgrade, and an `https:`
-  renderer can't be navigated to `http:`. Still not a real URL parser (no
-  IDNA, no userinfo; the SSRF filter's `host_of` remains the
-  deliberately-hostile one — a real engine would share one implementation),
-  and cross-origin navigation is refused instead of swapping renderers.
+  too, closing the HTTPS→HTTP secure-cookie downgrade. A cross-origin
+  navigation (including an `https:`→`http:` scheme change) **swaps the
+  renderer** rather than being refused, which is the real site-isolation
+  mechanism — but a *simplified* one: it swaps a single-frame tab, not the
+  frame tree, so the genuinely hard parts (out-of-process iframes,
+  `document.domain` agent clusters, BrowsingInstances, back-forward cache) are
+  still absent. Also still not a real URL parser (no IDNA, no userinfo; the
+  SSRF filter's `host_of` remains the deliberately-hostile one — a real engine
+  would share one implementation).
 - **Fork server**: it is `exec`'d fresh (one exec) rather than forked from the
   engine early to inherit the *engine's* warm libraries; the modeled behavior
   is renderers fork-without-exec from a warm process. It is unsandboxed

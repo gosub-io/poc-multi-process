@@ -59,15 +59,30 @@ fn run_env(args: &[&str], env: &[(&str, &str)]) -> Output {
 }
 
 /// The default run (multi-process where the feature is on) must open two tabs,
-/// render a frame for each, and shut down cleanly with no crash.
+/// render a frame for each, and shut down cleanly with no crash — *including* a
+/// cross-origin renderer swap. With `GOSUB_DEMO_SWAP` the work tab navigates
+/// cross-origin after its first frame; the engine tears that renderer down and
+/// brings up a fresh one bound to the new origin (site isolation), which renders
+/// too — all with real child processes and, crucially, no `TabCrashed` leaking
+/// from the teardown. Folded into this run rather than a separate one so the
+/// integration suite does not spawn an extra full process tree in parallel.
 #[test]
 fn default_run_renders_and_shuts_down() {
-    let out = run(&[]);
+    let out = run_env(&[], &[("GOSUB_DEMO_SWAP", "1")]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "exit {:?}\nstdout: {stdout}", out.status);
     assert!(stdout.contains("frame ready"), "no frame rendered:\n{stdout}");
     assert!(stdout.contains("engine shut down"), "no clean shutdown:\n{stdout}");
     assert!(!stdout.contains("crashed"), "unexpected crash:\n{stdout}");
+
+    // The cross-origin swap: the tab commits the new origin, and a frame arrives
+    // *after* the swap line — proof the freshly-spawned renderer rendered.
+    assert!(
+        stdout.contains("swapped to a new renderer for https://other.example"),
+        "no cross-origin renderer swap:\n{stdout}"
+    );
+    let after_swap = stdout.split("swapped to a new renderer").nth(1).unwrap_or("");
+    assert!(after_swap.contains("frame ready"), "swapped renderer produced no frame:\n{stdout}");
 }
 
 /// Every rendered page decodes an image in a throwaway process; the renderer

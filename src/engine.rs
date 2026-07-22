@@ -234,6 +234,15 @@ impl Gate {
         s.closed = true;
         self.ready.notify_all();
     }
+
+    /// Whether this gate has been closed — i.e. its tab was torn down on
+    /// purpose (close, shutdown, or a cross-origin swap). The reader thread
+    /// checks this on EOF to tell an intentional teardown from a real crash: a
+    /// closed gate means "do not raise `TabGone`", which is what stops a swap
+    /// (reusing the tab id) from looking like the old renderer crashing.
+    fn is_closed(&self) -> bool {
+        self.state.lock().unwrap().closed
+    }
 }
 
 struct Tab {
@@ -562,65 +571,9 @@ impl EngineLoop {
         // process from the same origin in another zone, so it can never touch
         // that zone's partition.
         let (handle, ep) = self.spawner.spawn(Role::Renderer(&origin));
-        let (tx, mut rx) = ep.split();
+        let (tx, rx) = ep.split();
         let gate = Gate::new(MAX_QUEUED_PER_SOURCE);
-
-        // Reader thread: forward everything this renderer says into the
-        // inbox, tagged with the tab it belongs to; report EOF as TabGone.
-        // Acquiring a gate permit before each forward bounds how many of this
-        // renderer's messages can sit unprocessed — and blocks (backpressuring
-        // the renderer's socket) if it floods. A closed gate means the tab was
-        // torn down, so the thread exits without a spurious TabGone.
-        {
-            let inbox = self.inbox.clone();
-            let gate = Arc::clone(&gate);
-            std::thread::spawn(move || {
-                // Loop ends when `recv` errors (renderer gone) or a shm tile
-                // fails validation; either way we fall through to `TabGone`.
-                while let Ok(msg) = rx.recv::<FromRenderer>() {
-                    match msg {
-                        // A shared-memory tile: the fd follows the message on
-                        // the same socket, so this thread — the socket's only
-                        // reader — receives and validates it here. The message
-                        // dimensions are a claim; map_sealed_tile refuses an
-                        // fd that isn't sealed or can't actually hold them. A
-                        // tile that fails validation is a protocol violation:
-                        // drop the link and report the tab gone.
-                        #[cfg(all(feature = "multi-process", target_os = "linux"))]
-                        FromRenderer::TileShm { width, height } => {
-                            let mapped = rx
-                                .recv_fd()
-                                .and_then(|fd| crate::shm::map_sealed_tile(fd, width, height));
-                            match mapped {
-                                Ok(mapping) => {
-                                    if !gate.acquire() {
-                                        return;
-                                    }
-                                    let tile =
-                                        Tile { width, height, pixels: TilePixels::Shared(mapping) };
-                                    if inbox.send(LoopMsg::ShmTile { tab_id, tile }).is_err() {
-                                        return;
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[engine] {tab_id}: rejected shm tile: {e}");
-                                    break;
-                                }
-                            }
-                        }
-                        msg => {
-                            if !gate.acquire() {
-                                return;
-                            }
-                            if inbox.send(LoopMsg::FromTab { tab_id, msg }).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-                let _ = inbox.send(LoopMsg::TabGone { tab_id });
-            });
-        }
+        self.spawn_tab_reader(tab_id, rx, Arc::clone(&gate));
 
         self.tabs.insert(
             tab_id,
@@ -637,25 +590,94 @@ impl EngineLoop {
         self.emit(EngineEvent::TabOpened { tab_id, zone, origin });
     }
 
+    /// Spawn the reader thread that forwards one renderer's messages into the
+    /// engine inbox, tagged with its tab. A gate permit is taken before each
+    /// forward, bounding how many of this renderer's messages sit unprocessed
+    /// (and backpressuring its socket when it floods).
+    ///
+    /// On EOF (or a rejected shm tile) the renderer is gone. Whether that is a
+    /// *crash* depends on the gate: an intentional teardown — close, shutdown,
+    /// or a cross-origin renderer swap — closes the gate first, so `is_closed()`
+    /// suppresses the `TabGone`. Without that, a swap (which reuses the tab id)
+    /// would race a spurious `TabCrashed` from the old renderer's reader against
+    /// the freshly installed one. A real crash leaves the gate open → `TabGone`.
+    fn spawn_tab_reader(&self, tab_id: TabId, mut rx: crate::ipc::EndpointRx, gate: Arc<Gate>) {
+        let inbox = self.inbox.clone();
+        std::thread::spawn(move || {
+            // Loop ends when `recv` errors (renderer gone) or a shm tile fails
+            // validation.
+            while let Ok(msg) = rx.recv::<FromRenderer>() {
+                match msg {
+                    // A shared-memory tile: the fd follows the message on the
+                    // same socket, so this thread — the socket's only reader —
+                    // receives and validates it here. The message dimensions are
+                    // a claim; map_sealed_tile refuses an fd that isn't sealed or
+                    // can't actually hold them. A tile that fails validation is a
+                    // protocol violation: drop the link and report the tab gone.
+                    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                    FromRenderer::TileShm { width, height } => {
+                        let mapped = rx
+                            .recv_fd()
+                            .and_then(|fd| crate::shm::map_sealed_tile(fd, width, height));
+                        match mapped {
+                            Ok(mapping) => {
+                                if !gate.acquire() {
+                                    return;
+                                }
+                                let tile =
+                                    Tile { width, height, pixels: TilePixels::Shared(mapping) };
+                                if inbox.send(LoopMsg::ShmTile { tab_id, tile }).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[engine] {tab_id}: rejected shm tile: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    msg => {
+                        if !gate.acquire() {
+                            return;
+                        }
+                        if inbox.send(LoopMsg::FromTab { tab_id, msg }).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            // Intentional teardown closes the gate first; only an *unexpected*
+            // death (gate still open) is a crash worth reporting.
+            if !gate.is_closed() {
+                let _ = inbox.send(LoopMsg::TabGone { tab_id });
+            }
+        });
+    }
+
     fn tab_command(&mut self, tab_id: TabId, cmd: TabCommand) {
         if !self.tabs.contains_key(&tab_id) {
             return; // tab already gone; the Crashed/Closed event said so
         }
         match cmd {
             TabCommand::Navigate { url } => {
-                // Site isolation: this tab's renderer only ever handles its
-                // own origin. A real engine swaps in a renderer for the new
-                // origin here; the PoC refuses.
-                let tab_origin = &self.tabs[&tab_id].origin;
-                if origin_of(&url).as_deref() != Some(tab_origin.as_str()) {
-                    let reason = format!("{url} is outside this renderer's origin {tab_origin}");
-                    self.emit(EngineEvent::NavigationFailed { tab_id, reason });
+                let Some(new_origin) = origin_of(&url) else {
+                    self.emit(EngineEvent::NavigationFailed {
+                        tab_id,
+                        reason: format!("unparseable URL {url}"),
+                    });
                     return;
+                };
+                if new_origin == self.tabs[&tab_id].origin {
+                    // Same origin: the existing renderer handles it.
+                    let tab = self.tabs.get_mut(&tab_id).unwrap();
+                    // On failure the renderer is gone; its reader thread will
+                    // report TabGone.
+                    let _ = tab.tx.send(&ToRenderer::RenderPage { url });
+                } else {
+                    // Cross-origin: site isolation forbids one renderer serving
+                    // two origins, so swap in a fresh renderer for the new one.
+                    self.swap_renderer(tab_id, new_origin, url);
                 }
-                let tab = self.tabs.get_mut(&tab_id).unwrap();
-                // On failure the renderer is gone; its reader thread will
-                // report TabGone.
-                let _ = tab.tx.send(&ToRenderer::RenderPage { url });
             }
             TabCommand::Close => {
                 let mut tab = self.tabs.remove(&tab_id).unwrap();
@@ -670,6 +692,64 @@ impl EngineLoop {
                 self.emit(EngineEvent::TabClosed { tab_id });
             }
         }
+    }
+
+    /// Swap a tab's renderer for a fresh one bound to `new_origin`, then render
+    /// `url` — the site-isolation mechanism a real browser uses for cross-origin
+    /// navigation (Chromium's renderer swap / RenderFrameHost change), in place
+    /// of the PoC's former outright refusal. The new origin gets its *own*
+    /// process, so two origins never share an address space; the same code runs
+    /// in single-process mode with the "renderer" as a thread.
+    ///
+    /// The old renderer is torn down exactly like `Close`, with one difference
+    /// that matters: its gate is closed *first*, so its reader thread exits
+    /// quietly (see [`spawn_tab_reader`]) instead of racing a `TabCrashed` for
+    /// the tab id this swap immediately reuses. In-flight broker state for the
+    /// tab is dropped — a late reply to the *old* renderer finds no pending
+    /// entry and is discarded, and the new renderer starts with zero in-flight.
+    ///
+    /// [`spawn_tab_reader`]: Self::spawn_tab_reader
+    fn swap_renderer(&mut self, tab_id: TabId, new_origin: String, url: String) {
+        let Some(mut old) = self.tabs.remove(&tab_id) else {
+            return;
+        };
+        let zone = old.zone;
+
+        // Tear down the old renderer. Closing the gate before ending the link is
+        // what makes this a *swap* and not a *crash*: the reader sees the gate
+        // closed on EOF and does not raise TabGone for `tab_id`.
+        old.gate.close();
+        let _ = old.tx.send(&ToRenderer::Shutdown);
+        join(old.handle);
+        self.pending_fetches.retain(|_, t| *t != tab_id);
+        self.pending_subresources.retain(|_, t| *t != tab_id);
+        self.pending_decodes.retain(|_, t| *t != tab_id);
+        self.pending_storage.retain(|_, t| *t != tab_id);
+        self.pending_font.retain(|_, t| *t != tab_id);
+
+        // Bring up the new renderer bound to (zone, new_origin), wired exactly
+        // as `open_tab` does.
+        let (handle, ep) = self.spawner.spawn(Role::Renderer(&new_origin));
+        let (tx, rx) = ep.split();
+        let gate = Gate::new(MAX_QUEUED_PER_SOURCE);
+        self.spawn_tab_reader(tab_id, rx, Arc::clone(&gate));
+        self.tabs.insert(
+            tab_id,
+            Tab {
+                zone,
+                origin: new_origin.clone(),
+                tx,
+                handle,
+                inflight_fetches: 0,
+                inflight_decodes: 0,
+                gate,
+            },
+        );
+
+        // Tell the embedder the tab committed a new origin, then render it.
+        self.emit(EngineEvent::TabNavigated { tab_id, origin: new_origin });
+        let tab = self.tabs.get_mut(&tab_id).unwrap();
+        let _ = tab.tx.send(&ToRenderer::RenderPage { url });
     }
 
     /// A renderer asked for something privileged. This dispatch *is* the
@@ -1466,26 +1546,41 @@ mod tests {
     }
 
     #[test]
-    fn cross_origin_navigation_refused() {
+    fn cross_origin_navigation_swaps_renderer() {
+        // A cross-origin navigation is no longer refused: the tab keeps its id
+        // but its renderer is swapped for one bound to the new origin, which
+        // then renders. (The broker/swap code is identical in both modes; the
+        // single-process engine exercises it deterministically.)
         let (engine, events) = start(Mode::Single);
         engine.open_tab(ZoneId(0), "https://example.com").unwrap();
 
-        let mut refused = false;
+        let (mut swapped, mut framed_after_swap) = (false, false);
         for ev in events {
             match ev {
-                EngineEvent::TabOpened { tab_id, .. } => {
+                EngineEvent::TabOpened { tab_id, origin, .. } => {
+                    assert_eq!(origin, "https://example.com");
                     engine.navigate(tab_id, "https://evil.com/").unwrap();
                 }
-                EngineEvent::NavigationFailed { .. } => {
-                    refused = true;
-                    engine.shutdown().unwrap();
+                EngineEvent::TabNavigated { tab_id, origin } => {
+                    assert_eq!(origin, "https://evil.com", "tab should commit the new origin");
+                    swapped = true;
+                    let _ = tab_id;
                 }
-                EngineEvent::FrameReady { .. } => panic!("must not render cross-origin"),
+                EngineEvent::FrameReady { tab_id, .. } => {
+                    // The frame must arrive *after* the swap, from the new
+                    // renderer — never a cross-origin render by the old one.
+                    assert!(swapped, "rendered before the renderer was swapped");
+                    framed_after_swap = true;
+                    engine.close_tab(tab_id).unwrap();
+                }
+                EngineEvent::TabClosed { .. } => engine.shutdown().unwrap(),
+                EngineEvent::NavigationFailed { reason, .. } => panic!("nav should swap, not fail: {reason}"),
+                EngineEvent::TabCrashed { .. } => panic!("swap must not surface as a crash"),
                 EngineEvent::EngineShutdown => break,
                 _ => {}
             }
         }
-        assert!(refused);
+        assert!(swapped && framed_after_swap);
     }
 
     #[test]
