@@ -233,6 +233,16 @@ pub fn cleanup_spawned_cgroups() {
     imp::cleanup_spawned_cgroups();
 }
 
+/// Arm an alternate signal stack for the **current** thread, so the self-capturing
+/// crash reporter can still run when this thread's own stack overflows. The
+/// broker is multithreaded and the reporter's altstack is per-thread, so each
+/// engine thread calls this at startup. A no-op off Linux (only the Linux backend
+/// installs the crash reporter) and safe to call unconditionally.
+pub fn install_thread_crash_altstack() {
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    imp::install_thread_crash_altstack();
+}
+
 /// Test hook for the `cgroup-memory-limit` probe: bound this process's memory via
 /// cgroup v2 `memory.max` and read the ceiling back, or `None` where cgroup v2
 /// memory delegation is unavailable (the probe then skips). Linux only.

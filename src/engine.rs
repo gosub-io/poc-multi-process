@@ -105,7 +105,12 @@ pub fn start(mode: Mode) -> (EngineHandle, Receiver<EngineEvent>) {
     let (inbox_tx, inbox_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
     let handle = EngineHandle { inbox: inbox_tx.clone() };
-    std::thread::spawn(move || EngineLoop::new(mode, inbox_tx, event_tx).run(inbox_rx));
+    std::thread::spawn(move || {
+        // Broker thread: arm its own crash-reporter altstack (the reporter's
+        // altstack is per-thread; see `install_thread_crash_altstack`).
+        crate::sandbox::install_thread_crash_altstack();
+        EngineLoop::new(mode, inbox_tx, event_tx).run(inbox_rx)
+    });
     (handle, event_rx)
 }
 
@@ -213,10 +218,19 @@ struct CrashTracker {
 
 impl CrashTracker {
     /// Record a crash for `(zone, origin)` at `now`.
+    ///
+    /// This is the only method that *inserts* keys, so it is also where the map is
+    /// kept bounded: before inserting, drop every key whose crashes have all aged
+    /// out of the window. Without that sweep, a workload touching many distinct
+    /// origins that each crash once would leave a key per origin forever (each
+    /// method only pruned the *one* key it looked at). Crashes are rare, so the
+    /// full sweep here is cheap.
     fn record(&mut self, zone: ZoneId, origin: &str, now: Instant) {
-        let hist = self.history.entry((zone, origin.to_string())).or_default();
-        hist.retain(|t| now.duration_since(*t) < CRASH_LOOP_WINDOW);
-        hist.push(now);
+        self.history.retain(|_, hist| {
+            hist.retain(|t| now.duration_since(*t) < CRASH_LOOP_WINDOW);
+            !hist.is_empty()
+        });
+        self.history.entry((zone, origin.to_string())).or_default().push(now);
     }
 
     /// Whether `(zone, origin)` has crashed [`CRASH_LOOP_THRESHOLD`]+ times within
@@ -225,7 +239,11 @@ impl CrashTracker {
         match self.history.get_mut(&(zone, origin.to_string())) {
             Some(hist) => {
                 hist.retain(|t| now.duration_since(*t) < CRASH_LOOP_WINDOW);
-                hist.len() >= CRASH_LOOP_THRESHOLD
+                let looping = hist.len() >= CRASH_LOOP_THRESHOLD;
+                if hist.is_empty() {
+                    self.history.remove(&(zone, origin.to_string()));
+                }
+                looping
             }
             None => false,
         }
@@ -414,6 +432,7 @@ impl EngineLoop {
             let inbox = inbox.clone();
             let net_gate = Arc::clone(&net_gate);
             std::thread::spawn(move || {
+                crate::sandbox::install_thread_crash_altstack();
                 while let Ok(resp) = net_rx.recv::<NetResponse>() {
                     // A streaming response's ring fd follows on the same
                     // socket; this thread is its only reader, so take the
@@ -454,6 +473,7 @@ impl EngineLoop {
             let inbox = inbox.clone();
             let gate = Arc::clone(&storage_gate);
             std::thread::spawn(move || {
+                crate::sandbox::install_thread_crash_altstack();
                 while let Ok(resp) = storage_rx.recv::<StorageResponse>() {
                     if !gate.acquire() {
                         break;
@@ -477,6 +497,7 @@ impl EngineLoop {
             let inbox = inbox.clone();
             let gate = Arc::clone(&font_gate);
             std::thread::spawn(move || {
+                crate::sandbox::install_thread_crash_altstack();
                 while let Ok(resp) = font_rx.recv::<FontResponse>() {
                     if !gate.acquire() {
                         break;
@@ -705,6 +726,7 @@ impl EngineLoop {
     ) {
         let inbox = self.inbox.clone();
         std::thread::spawn(move || {
+            crate::sandbox::install_thread_crash_altstack();
             // Loop ends when `recv` errors (renderer gone) or a shm tile fails
             // validation.
             while let Ok(msg) = rx.recv::<FromRenderer>() {
@@ -1103,6 +1125,7 @@ impl EngineLoop {
         // path) so the join below cannot block.
         let inbox = self.inbox.clone();
         std::thread::spawn(move || {
+            crate::sandbox::install_thread_crash_altstack();
             let mut handle = handle;
             let mut dec_rx = dec_rx;
             let _ = dec_rx.set_read_timeout(Some(DECODE_TIMEOUT));
@@ -1207,7 +1230,22 @@ impl EngineLoop {
     fn net_stream(&mut self, resp: NetResponse, fd: std::os::fd::OwnedFd) {
         use std::os::fd::AsRawFd;
         let Some(tab_id) = self.pending_fetches.remove(&resp.request_id) else {
-            return; // requester disappeared while the fetch was in flight
+            // A streamed reply is only valid for a *document* fetch. If the id is
+            // instead a subresource (which must never take the streaming path),
+            // don't silently leak its in-flight slot: clean it up, tell the
+            // renderer, and let `fd` drop. Defends the "subresources never stream"
+            // invariant rather than relying on it.
+            if let Some(tab_id) = self.pending_subresources.remove(&resp.request_id) {
+                if let Some(tab) = self.tabs.get_mut(&tab_id) {
+                    tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1);
+                    let _ = tab.tx.send(&ToRenderer::SubresourceResult(
+                        SubresourceOutcome::Blocked {
+                            reason: "subresource may not use the streaming path".into(),
+                        },
+                    ));
+                }
+            }
+            return; // requester disappeared, or the subresource case handled above
         };
         let Some(tab) = self.tabs.get_mut(&tab_id) else {
             return;

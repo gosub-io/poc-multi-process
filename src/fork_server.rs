@@ -156,16 +156,24 @@ fn fork_pinned_init() {
             std::io::Error::last_os_error()
         ),
         0 => {
-            // Child. Ask the kernel via the raw syscall (not glibc's possibly
-            // cached `getpid`) whether we are PID 1 of a fresh namespace.
+            // Arm parent-death delivery **first**, before anything else, so the
+            // fork→arm window in which the fork server dying would leave us
+            // un-notified is as small as the kernel allows — a single syscall
+            // after fork returns. `getppid()` cannot shrink it further here: as
+            // PID 1 of a fresh PID namespace our real parent (the fork server)
+            // lives in the *outer* namespace, so `getppid()` is always 0 and
+            // can't tell a dead parent from a live one. The residual
+            // sub-microsecond window is benign — at worst an ill-timed fork-server
+            // crash leaves this placeholder holding an otherwise-empty namespace.
+            // (Harmless in the no-namespace fallback below: we exit immediately.)
+            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+            // Ask the kernel via the raw syscall (not glibc's possibly cached
+            // `getpid`) whether we are PID 1 of a fresh namespace.
             let pid = unsafe { libc::syscall(libc::SYS_getpid) };
             if pid != 1 {
                 // No PID namespace here — nothing to pin.
                 unsafe { libc::_exit(0) };
             }
-            // Die when the fork server dies (graceful exit or crash); that death
-            // is what tears the namespace down and reaps the renderers.
-            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
             // Stay alive as PID 1, doing nothing. Long sleeps in a loop; every
             // wake (a stray signal, or the timer) just sleeps again.
             loop {

@@ -352,14 +352,20 @@ impl EndpointRx {
     /// Bound how long a subsequent `recv` will block waiting for bytes:
     /// `Some(dur)` arms a per-read timeout on the underlying socket so a peer
     /// that stops sending is abandoned (recv returns `WouldBlock`/`TimedOut`)
-    /// rather than blocking the caller forever; `None` clears it. A no-op on
-    /// local (in-process) channels, which are the same address space and not a
-    /// security boundary.
-    #[cfg_attr(not(feature = "multi-process"), allow(unused_variables))]
+    /// rather than blocking the caller forever; `None` clears it.
+    ///
+    /// A no-op on local (in-process) channels — same address space, not a
+    /// security boundary — and on Windows, whose transport is an anonymous pipe
+    /// (`File`) that std gives no per-read timeout for; the decode-timeout caller
+    /// simply blocks there as it did before, and Windows is not the reference
+    /// platform for this bound.
+    #[cfg_attr(not(all(feature = "multi-process", unix)), allow(unused_variables))]
     pub fn set_read_timeout(&mut self, dur: Option<std::time::Duration>) -> io::Result<()> {
         match self {
-            #[cfg(feature = "multi-process")]
+            #[cfg(all(feature = "multi-process", unix))]
             EndpointRx::Socket(stream) => stream.set_read_timeout(dur),
+            #[cfg(all(feature = "multi-process", not(unix)))]
+            EndpointRx::Socket(_) => Ok(()),
             EndpointRx::Local(_) => Ok(()),
         }
     }
@@ -648,7 +654,7 @@ mod tests {
         assert!(unsafe { recv_fd(b.as_raw_fd()) }.is_err());
     }
 
-    #[cfg(all(feature = "multi-process", unix))]
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
     #[test]
     fn recv_returns_a_timeout_error_when_the_peer_is_silent() {
         // The primitive behind the decode stall timeout: with a read timeout

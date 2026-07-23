@@ -336,13 +336,22 @@ fn fail_canary(detail: &str) -> ! {
 pub fn lock_down_fork_server() {
     deny_debugger_attach();
     // Stack the `clone3` → `ENOSYS` pre-filter *first*, so glibc's `fork()` uses
-    // the register-based `clone` the main filter can constrain. Best-effort: if
-    // it cannot install, `clone3` stays allowed (coarse but safe, the prior
-    // behaviour) rather than the fork server refusing to start. If it installs
-    // but a libc does not honour the fallback, `verify_fork_server_filter`
-    // catches it at startup.
+    // the register-based `clone` the main filter can constrain. This is
+    // **fail-closed**, like the rest of the sandbox: `clone3` cannot be
+    // argument-filtered (its flags live in a struct seccomp can't read), so if
+    // this pre-filter is absent `clone3` stays *allowed and unconstrained* —
+    // reopening the `CLONE_NEWUSER`/`CLONE_VM`/namespace vectors the
+    // register-based `clone` rule blocks. So a failure to install it refuses the
+    // fork server rather than running it with that hole. (It uses `seccomp(2)`
+    // exactly as the main filter does, so in practice if one installs so does the
+    // other; a host without seccomp uses `--single-process`.) If it installs but
+    // a libc does not honour the fallback, `verify_fork_server_filter` catches it.
     if let Err(e) = install_clone3_enosys() {
-        eprintln!("[fork-server] warning: could not install clone3->ENOSYS filter ({e}); clone3 stays coarse");
+        eprintln!(
+            "[fork-server] FATAL: could not install clone3->ENOSYS pre-filter ({e}); \
+             refusing to run with clone3 unconstrained"
+        );
+        std::process::exit(1);
     }
     let allowed: Vec<libc::c_long> =
         BASELINE.iter().chain(FORK_SERVER_EXTRA).copied().collect();
@@ -559,8 +568,17 @@ mod landlock {
                 unsafe { libc::close(rs) };
                 return Err(e);
             }
+            // Decide dir-ness from the *opened inode* (`fstat` on the `O_PATH`
+            // fd), not a second by-name `is_dir()` lookup: a path swapped
+            // (file↔dir↔symlink) between the `open` above and the check would
+            // otherwise mask `DIR_ONLY` against a different inode than the rule is
+            // anchored to. `fstat` on the O_PATH fd is TOCTOU-free. Falls back to
+            // "not a dir" (strips `DIR_ONLY`) on any stat error, as before.
             let mut allowed = *rights & handled(abi);
-            if !path.is_dir() {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let is_dir = unsafe { libc::fstat(pfd, &mut st) } == 0
+                && (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+            if !is_dir {
                 allowed &= !DIR_ONLY;
             }
             let rule = PathBeneathAttr { allowed_access: allowed, parent_fd: pfd };
@@ -1421,8 +1439,13 @@ extern "C" fn sigsys_handler(
 #[cfg(feature = "multi-process")]
 fn install_crash_reporter() {
     // Alternate signal stack, so a stack-overflow SIGSEGV can still run the
-    // handler (the faulting stack is unusable). Per-thread; installed on the
-    // thread that locks down — every content process is single-threaded here.
+    // handler (the faulting stack is unusable). `sigaltstack` is **per-thread**,
+    // while `sigaction` below sets the handler process-wide. Content processes are
+    // single-threaded, so registering it on the locking-down thread suffices for
+    // them. The broker is multithreaded, so each engine thread additionally calls
+    // [`install_thread_crash_altstack`] to arm its own — otherwise a stack
+    // overflow on a broker worker thread would run the handler on the already
+    // overflowed stack (the process still dies, but with no scrubbed report).
     static mut ALTSTACK: [u8; 16384] = [0; 16384];
     // SAFETY: a zeroed sigaction with the handler set; registered for the
     // synchronous crash signals only. `addr_of_mut!` avoids a reference to the
@@ -1443,6 +1466,29 @@ fn install_crash_reporter() {
             libc::sigaction(sig, &sa, std::ptr::null_mut());
         }
     }
+}
+
+/// Register an alternate signal stack for the **current** thread, so the
+/// process-wide crash reporter can still run when *this* thread's own stack
+/// overflows. [`install_crash_reporter`] arms the altstack only on the thread it
+/// runs on; the broker is multithreaded, so each engine thread calls this at
+/// startup. Backing storage lives in thread-local storage for the thread's
+/// lifetime. A no-op-safe extra where the reporter was never installed.
+#[cfg(feature = "multi-process")]
+pub fn install_thread_crash_altstack() {
+    thread_local! {
+        static ALT: std::cell::UnsafeCell<[u8; 16384]> =
+            const { std::cell::UnsafeCell::new([0u8; 16384]) };
+    }
+    ALT.with(|cell| {
+        // SAFETY: the TLS buffer lives for this thread's lifetime and is handed
+        // only to sigaltstack; we never otherwise alias it. sigaltstack is
+        // async-signal-safe and on every filter.
+        let ss = libc::stack_t { ss_sp: cell.get().cast(), ss_flags: 0, ss_size: 16384 };
+        unsafe {
+            libc::sigaltstack(&ss, std::ptr::null_mut());
+        }
+    });
 }
 
 /// Signal handler for the crash signals: emit a scrubbed one-line report, then
