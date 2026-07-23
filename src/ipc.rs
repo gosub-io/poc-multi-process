@@ -318,6 +318,28 @@ impl EndpointTx {
         }
     }
 
+    /// Bound how long a subsequent `send` will block trying to hand bytes to
+    /// the peer: `Some(dur)` arms a per-write timeout on the underlying socket
+    /// so a peer that refuses to read (a full socket buffer) is abandoned
+    /// (send returns `WouldBlock`/`TimedOut`) rather than blocking the caller
+    /// forever; `None` clears it.
+    ///
+    /// A no-op on local (in-process) channels — same address space, not a
+    /// security boundary — and on Windows, whose transport is an anonymous pipe
+    /// (`File`) that std gives no per-write timeout for; the reply-timeout caller
+    /// simply blocks there as it did before, and Windows is not the reference
+    /// platform for this bound. Mirrors [`EndpointRx::set_read_timeout`].
+    #[cfg_attr(not(all(feature = "multi-process", unix)), allow(unused_variables))]
+    pub fn set_write_timeout(&mut self, dur: Option<std::time::Duration>) -> io::Result<()> {
+        match self {
+            #[cfg(all(feature = "multi-process", unix))]
+            EndpointTx::Socket(stream) => stream.set_write_timeout(dur),
+            #[cfg(all(feature = "multi-process", not(unix)))]
+            EndpointTx::Socket(_) => Ok(()),
+            EndpointTx::Local(_) => Ok(()),
+        }
+    }
+
     pub fn send<T: Serialize>(&mut self, msg: &T) -> io::Result<()> {
         match self {
             #[cfg(feature = "multi-process")]
@@ -678,6 +700,50 @@ mod tests {
             err.kind()
         );
         assert!(elapsed < Duration::from_secs(2), "recv should return near the deadline, took {elapsed:?}");
+    }
+
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    #[test]
+    fn send_returns_a_timeout_error_when_the_peer_never_reads() {
+        // The primitive behind the reply-write timeout: with a write timeout
+        // armed, sending to a peer that never drains eventually fills the socket
+        // buffers, and the send must then return a WouldBlock/TimedOut error near
+        // the deadline — never block forever, which on the single-threaded engine
+        // loop with blocking writes would wedge the whole browser.
+        use std::time::{Duration, Instant};
+        // Keep `_peer` bound and never read from it: the buffers fill (a closed
+        // peer would instead give a broken pipe — a different, already-handled
+        // case).
+        let (mine, _peer) = UnixStream::pair().unwrap();
+        let mut ep = Endpoint::from_channel(channel::Channel::from_stream(mine)).unwrap();
+        ep.tx.set_write_timeout(Some(Duration::from_millis(150))).unwrap();
+
+        // A sizable payload so the fixed-size socket buffers fill in a bounded
+        // number of iterations; the peer reads nothing, so a send must time out.
+        let big = vec![0u8; 256 * 1024];
+        let start = Instant::now();
+        let mut err = None;
+        for _ in 0..1024 {
+            if let Err(e) = ep.send(&big) {
+                err = Some(e);
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "send never blocked against a non-reading peer"
+            );
+        }
+        let err = err.expect("a non-reading peer must eventually make send time out");
+        assert!(
+            matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+            "expected a timeout error, got {:?}",
+            err.kind()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "send should return near the deadline, took {:?}",
+            start.elapsed()
+        );
     }
 
     #[cfg(feature = "multi-process")]

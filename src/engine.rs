@@ -183,6 +183,15 @@ const MAX_INFLIGHT_DECODES: usize = 8;
 /// [`crate::ring`] stall timeout in spirit.
 const DECODE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the engine will block handing a reply to a renderer before giving up
+/// on it. A well-behaved renderer always drains its replies promptly (it asked
+/// for the data), so this only trips on one that floods requests and refuses to
+/// read — which, on the single-threaded loop with blocking writes, would
+/// otherwise wedge the *entire* browser (every tab, the services, and shutdown)
+/// permanently. On timeout the renderer is dropped like a protocol violation. The
+/// residual per-drop stall is removed only by the async broker rewrite.
+const REPLY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Per-source cap on messages queued-but-unprocessed in the shared inbox. All
 /// sources funnel into one inbox, so without this a single renderer flooding
 /// *any* message type would grow it without bound. See [`Gate`].
@@ -555,6 +564,41 @@ impl EngineLoop {
         let _ = self.events.send(event);
     }
 
+    /// Send a reply to a renderer, tearing the tab down on any send failure
+    /// (a write timeout from a renderer that floods and never reads, or a broken
+    /// pipe). Returns whether the send succeeded. This is the failure-aware path
+    /// every renderer-facing reply on the loop thread must use, so one wedged
+    /// renderer cannot block the single-threaded loop forever.
+    fn send_to_tab(&mut self, tab_id: TabId, msg: &ToRenderer) -> bool {
+        let ok = match self.tabs.get_mut(&tab_id) {
+            Some(tab) => tab.tx.send(msg).is_ok(),
+            None => return false,
+        };
+        if !ok {
+            self.drop_tab_crashed(tab_id);
+        }
+        ok
+    }
+
+    /// Tear a tab down as a crash: close its gate, kill and reap its renderer,
+    /// drop its in-flight broker state, record it against the crash-loop guard,
+    /// and tell the embedder. This is the shared teardown behind both a genuine
+    /// `TabGone` and a reply-write failure to a wedged renderer.
+    fn drop_tab_crashed(&mut self, tab_id: TabId) {
+        if let Some(mut tab) = self.tabs.remove(&tab_id) {
+            tab.gate.close();
+            kill_child(&mut tab.handle); // kill-before-join: a renderer we drop *because* it wedged must not hang the join
+            join(tab.handle);
+            self.pending_fetches.retain(|_, t| *t != tab_id);
+            self.pending_subresources.retain(|_, t| *t != tab_id);
+            self.pending_decodes.retain(|_, t| *t != tab_id);
+            self.pending_storage.retain(|_, t| *t != tab_id);
+            self.pending_font.retain(|_, t| *t != tab_id);
+            self.crashes.record(tab.zone, &tab.origin, Instant::now());
+            self.emit(EngineEvent::TabCrashed { tab_id });
+        }
+    }
+
     /// The event loop: one inbox, one message at a time.
     fn run(mut self, inbox_rx: Receiver<LoopMsg>) {
         for msg in inbox_rx {
@@ -606,20 +650,10 @@ impl EngineLoop {
                     if self.tabs.get(&tab_id).is_none_or(|t| t.epoch != epoch) {
                         continue;
                     }
-                    if let Some(tab) = self.tabs.remove(&tab_id) {
-                        tab.gate.close();
-                        join(tab.handle);
-                        self.pending_fetches.retain(|_, t| *t != tab_id);
-                        self.pending_subresources.retain(|_, t| *t != tab_id);
-                        self.pending_decodes.retain(|_, t| *t != tab_id);
-                        self.pending_storage.retain(|_, t| *t != tab_id);
-                        self.pending_font.retain(|_, t| *t != tab_id);
-                        // Count this against the crash-loop guard, so an origin
-                        // that keeps killing its renderer is eventually refused a
-                        // fresh one rather than respawned into a loop.
-                        self.crashes.record(tab.zone, &tab.origin, Instant::now());
-                        self.emit(EngineEvent::TabCrashed { tab_id });
-                    }
+                    // Teardown (close gate, reap, drop in-flight state, record
+                    // against the crash-loop guard, emit TabCrashed) is shared
+                    // with the reply-write-failure path.
+                    self.drop_tab_crashed(tab_id);
                 }
                 LoopMsg::NetReply(resp) => {
                     self.net_reply(resp);
@@ -684,7 +718,11 @@ impl EngineLoop {
         // process from the same origin in another zone, so it can never touch
         // that zone's partition.
         let (handle, ep) = self.spawner.spawn(Role::Renderer(&origin));
-        let (tx, rx) = ep.split();
+        let (mut tx, rx) = ep.split();
+        // Bound how long a reply to this renderer may block the loop: a renderer
+        // that floods requests and never reads must not wedge the single-threaded
+        // loop forever (see REPLY_WRITE_TIMEOUT).
+        let _ = tx.set_write_timeout(Some(REPLY_WRITE_TIMEOUT));
         let gate = Gate::new(MAX_QUEUED_PER_SOURCE);
         let epoch = self.next_epoch;
         self.next_epoch += 1;
@@ -873,7 +911,10 @@ impl EngineLoop {
         // Bring up the new renderer bound to (zone, new_origin), wired exactly
         // as `open_tab` does.
         let (handle, ep) = self.spawner.spawn(Role::Renderer(&new_origin));
-        let (tx, rx) = ep.split();
+        let (mut tx, rx) = ep.split();
+        // Same reply-write bound as open_tab: a flooding renderer must not wedge
+        // the loop (see REPLY_WRITE_TIMEOUT).
+        let _ = tx.set_write_timeout(Some(REPLY_WRITE_TIMEOUT));
         let gate = Gate::new(MAX_QUEUED_PER_SOURCE);
         // A fresh epoch for the new generation: any message still in flight from
         // the old renderer carries the old epoch and is dropped by the loop
@@ -904,152 +945,204 @@ impl EngineLoop {
     /// A renderer asked for something privileged. This dispatch *is* the
     /// security boundary — and it is the same code in both modes.
     fn tab_request(&mut self, tab_id: TabId, msg: FromRenderer) {
-        let Some(tab) = self.tabs.get_mut(&tab_id) else {
-            return; // late message from a tab we already closed
-        };
-        match msg {
-            FromRenderer::NeedFetch { url } => {
-                // Site isolation for fetches: a renderer may only fetch its own
-                // origin. Without this a compromised renderer could name an
-                // attacker-controlled URL and the engine would attach *this*
-                // origin's cookies — including HttpOnly — to it, exfiltrating
-                // the session token the renderer is never allowed to see. Same
-                // rule the engine already applies to cross-origin navigation.
-                if !may_fetch(&tab.origin, &url) {
-                    let reason = format!("{url} is outside this renderer's origin {}", tab.origin);
-                    let _ = tab.tx.send(&ToRenderer::FetchDenied { reason });
-                    return;
+        // A renderer-facing send that fails (a write timeout on a renderer that
+        // floods and never reads, or a broken pipe) sets this; the tab is then
+        // torn down *after* the `tab` borrow ends — `drop_tab_crashed` needs
+        // `&mut self`, which the borrow would conflict with mid-body.
+        let mut send_failed = false;
+        'req: {
+            let Some(tab) = self.tabs.get_mut(&tab_id) else {
+                return; // late message from a tab we already closed
+            };
+            match msg {
+                FromRenderer::NeedFetch { url } => {
+                    // Site isolation for fetches: a renderer may only fetch its own
+                    // origin. Without this a compromised renderer could name an
+                    // attacker-controlled URL and the engine would attach *this*
+                    // origin's cookies — including HttpOnly — to it, exfiltrating
+                    // the session token the renderer is never allowed to see. Same
+                    // rule the engine already applies to cross-origin navigation.
+                    if !may_fetch(&tab.origin, &url) {
+                        let reason =
+                            format!("{url} is outside this renderer's origin {}", tab.origin);
+                        if tab.tx.send(&ToRenderer::FetchDenied { reason }).is_err() {
+                            send_failed = true;
+                        }
+                        break 'req;
+                    }
+                    // Backpressure: refuse a renderer that floods fetches without
+                    // consuming replies, so it can't grow the engine unbounded.
+                    if tab.inflight_fetches >= MAX_INFLIGHT_FETCHES {
+                        if tab
+                            .tx
+                            .send(&ToRenderer::FetchDenied {
+                                reason: "too many in-flight fetches".into(),
+                            })
+                            .is_err()
+                        {
+                            send_failed = true;
+                        }
+                        break 'req;
+                    }
+                    // Forward to the net component, stamped with the identity
+                    // the engine knows for this tab — the renderer cannot spoof
+                    // it. The reply is matched back via the request id.
+                    let request_id = self.next_request_id;
+                    self.next_request_id += 1;
+                    // Attach this (zone, origin)'s cookies — *including HttpOnly* —
+                    // for the net component to put on the request. The zone selects
+                    // the partition, so a fetch in one zone never carries another
+                    // zone's cookies. These values go to the network process,
+                    // never back to the renderer.
+                    let cookies = attachable_cookies(&self.cookies, tab.zone, &tab.origin);
+                    self.pending_fetches.insert(request_id, tab_id);
+                    tab.inflight_fetches += 1;
+                    let req = NetRequest::Fetch {
+                        request_id,
+                        for_zone: tab.zone.0,
+                        for_origin: tab.origin.clone(),
+                        url,
+                        cookies,
+                    };
+                    if self.net_tx.send(&req).is_err() {
+                        self.pending_fetches.remove(&request_id);
+                        tab.inflight_fetches -= 1;
+                        if tab
+                            .tx
+                            .send(&ToRenderer::FetchDenied {
+                                reason: "net component unavailable".into(),
+                            })
+                            .is_err()
+                        {
+                            send_failed = true;
+                        }
+                    }
                 }
-                // Backpressure: refuse a renderer that floods fetches without
-                // consuming replies, so it can't grow the engine unbounded.
-                if tab.inflight_fetches >= MAX_INFLIGHT_FETCHES {
-                    let _ = tab.tx.send(&ToRenderer::FetchDenied {
-                        reason: "too many in-flight fetches".into(),
+                FromRenderer::NeedCookies { origin: requested } => {
+                    // Same-origin check against the tab's authoritative identity,
+                    // not the message contents. The renderer receives only the
+                    // *non-HttpOnly* cookies — the `document.cookie` view — so an
+                    // exploited renderer never sees its origin's session token.
+                    let reply = if requested == tab.origin {
+                        ToRenderer::Cookies(Some(visible_cookies(
+                            &self.cookies,
+                            tab.zone,
+                            &requested,
+                        )))
+                    } else {
+                        ToRenderer::Cookies(None)
+                    };
+                    if tab.tx.send(&reply).is_err() {
+                        send_failed = true;
+                    }
+                }
+                FromRenderer::Tile { width, height, pixels } => {
+                    self.emit(EngineEvent::FrameReady {
+                        tab_id,
+                        tile: Tile { width, height, pixels: TilePixels::Inline(pixels) },
                     });
-                    return;
                 }
-                // Forward to the net component, stamped with the identity
-                // the engine knows for this tab — the renderer cannot spoof
-                // it. The reply is matched back via the request id.
-                let request_id = self.next_request_id;
-                self.next_request_id += 1;
-                // Attach this (zone, origin)'s cookies — *including HttpOnly* —
-                // for the net component to put on the request. The zone selects
-                // the partition, so a fetch in one zone never carries another
-                // zone's cookies. These values go to the network process,
-                // never back to the renderer.
-                let cookies = attachable_cookies(&self.cookies, tab.zone, &tab.origin);
-                self.pending_fetches.insert(request_id, tab_id);
-                tab.inflight_fetches += 1;
-                let req = NetRequest::Fetch {
-                    request_id,
-                    for_zone: tab.zone.0,
-                    for_origin: tab.origin.clone(),
-                    url,
-                    cookies,
-                };
-                if self.net_tx.send(&req).is_err() {
-                    self.pending_fetches.remove(&request_id);
-                    tab.inflight_fetches -= 1;
-                    let _ = tab.tx.send(&ToRenderer::FetchDenied {
-                        reason: "net component unavailable".into(),
-                    });
+                FromRenderer::NeedDecode { image } => {
+                    self.broker_decode(tab_id, image);
                 }
-            }
-            FromRenderer::NeedCookies { origin: requested } => {
-                // Same-origin check against the tab's authoritative identity,
-                // not the message contents. The renderer receives only the
-                // *non-HttpOnly* cookies — the `document.cookie` view — so an
-                // exploited renderer never sees its origin's session token.
-                let reply = if requested == tab.origin {
-                    ToRenderer::Cookies(Some(visible_cookies(&self.cookies, tab.zone, &requested)))
-                } else {
-                    ToRenderer::Cookies(None)
-                };
-                let _ = tab.tx.send(&reply);
-            }
-            FromRenderer::Tile { width, height, pixels } => {
-                self.emit(EngineEvent::FrameReady {
-                    tab_id,
-                    tile: Tile { width, height, pixels: TilePixels::Inline(pixels) },
-                });
-            }
-            FromRenderer::NeedDecode { image } => {
-                self.broker_decode(tab_id, image);
-            }
-            FromRenderer::NeedStorage { op } => {
-                // Identity stamped from engine bookkeeping, never the message —
-                // the same rule as fetches. The storage service partitions by
-                // this pair, so a renderer cannot reach another origin's data.
-                let request_id = self.next_request_id;
-                self.next_request_id += 1;
-                self.pending_storage.insert(request_id, tab_id);
-                let req = StorageRequest::Op {
-                    request_id,
-                    zone: tab.zone.0,
-                    origin: tab.origin.clone(),
-                    op,
-                };
-                if self.storage.tx.send(&req).is_err() {
-                    self.pending_storage.remove(&request_id);
-                    let _ = tab.tx.send(&ToRenderer::StorageResult(None));
+                FromRenderer::NeedStorage { op } => {
+                    // Identity stamped from engine bookkeeping, never the message —
+                    // the same rule as fetches. The storage service partitions by
+                    // this pair, so a renderer cannot reach another origin's data.
+                    let request_id = self.next_request_id;
+                    self.next_request_id += 1;
+                    self.pending_storage.insert(request_id, tab_id);
+                    let req = StorageRequest::Op {
+                        request_id,
+                        zone: tab.zone.0,
+                        origin: tab.origin.clone(),
+                        op,
+                    };
+                    if self.storage.tx.send(&req).is_err() {
+                        self.pending_storage.remove(&request_id);
+                        if tab.tx.send(&ToRenderer::StorageResult(None)).is_err() {
+                            send_failed = true;
+                        }
+                    }
                 }
-            }
-            FromRenderer::NeedFont { family } => {
-                let request_id = self.next_request_id;
-                self.next_request_id += 1;
-                self.pending_font.insert(request_id, tab_id);
-                let req = FontRequest::Metrics { request_id, family };
-                if self.font.tx.send(&req).is_err() {
-                    self.pending_font.remove(&request_id);
-                    let _ = tab.tx.send(&ToRenderer::FontResult(None));
+                FromRenderer::NeedFont { family } => {
+                    let request_id = self.next_request_id;
+                    self.next_request_id += 1;
+                    self.pending_font.insert(request_id, tab_id);
+                    let req = FontRequest::Metrics { request_id, family };
+                    if self.font.tx.send(&req).is_err() {
+                        self.pending_font.remove(&request_id);
+                        if tab.tx.send(&ToRenderer::FontResult(None)).is_err() {
+                            send_failed = true;
+                        }
+                    }
                 }
-            }
-            FromRenderer::NeedSubresource { url, mode } => {
-                // Unlike NeedFetch (own-origin only), a subresource may be
-                // cross-origin. The engine resolves the *destination* origin and
-                // attaches *its* cookies — never this renderer's — so an
-                // exploited renderer cannot redirect its own (HttpOnly) cookies
-                // to another host. What may then be *read back* is decided by
-                // Opaque Response Blocking in the net component; the renderer's
-                // claimed identity is never trusted.
-                let Some(dest_origin) = origin_of(&url) else {
-                    let _ = tab.tx.send(&ToRenderer::SubresourceResult(
-                        SubresourceOutcome::Denied {
-                            reason: format!("unparseable subresource URL: {url}"),
-                        },
-                    ));
-                    return;
-                };
-                // Shares the per-tab in-flight bound with fetches (one net link).
-                if tab.inflight_fetches >= MAX_INFLIGHT_FETCHES {
-                    let _ = tab.tx.send(&ToRenderer::SubresourceResult(
-                        SubresourceOutcome::Denied { reason: "too many in-flight requests".into() },
-                    ));
-                    return;
+                FromRenderer::NeedSubresource { url, mode } => {
+                    // Unlike NeedFetch (own-origin only), a subresource may be
+                    // cross-origin. The engine resolves the *destination* origin and
+                    // attaches *its* cookies — never this renderer's — so an
+                    // exploited renderer cannot redirect its own (HttpOnly) cookies
+                    // to another host. What may then be *read back* is decided by
+                    // Opaque Response Blocking in the net component; the renderer's
+                    // claimed identity is never trusted.
+                    let Some(dest_origin) = origin_of(&url) else {
+                        if tab
+                            .tx
+                            .send(&ToRenderer::SubresourceResult(SubresourceOutcome::Denied {
+                                reason: format!("unparseable subresource URL: {url}"),
+                            }))
+                            .is_err()
+                        {
+                            send_failed = true;
+                        }
+                        break 'req;
+                    };
+                    // Shares the per-tab in-flight bound with fetches (one net link).
+                    if tab.inflight_fetches >= MAX_INFLIGHT_FETCHES {
+                        if tab
+                            .tx
+                            .send(&ToRenderer::SubresourceResult(SubresourceOutcome::Denied {
+                                reason: "too many in-flight requests".into(),
+                            }))
+                            .is_err()
+                        {
+                            send_failed = true;
+                        }
+                        break 'req;
+                    }
+                    let same_origin = dest_origin == tab.origin;
+                    // Destination-origin cookies in this tab's zone (HttpOnly
+                    // included — they reach the net component, never the renderer;
+                    // the response is ORB-filtered regardless).
+                    let cookies = attachable_cookies(&self.cookies, tab.zone, &dest_origin);
+                    let request_id = self.next_request_id;
+                    self.next_request_id += 1;
+                    self.pending_subresources.insert(request_id, tab_id);
+                    tab.inflight_fetches += 1;
+                    let req =
+                        NetRequest::Subresource { request_id, url, mode, same_origin, cookies };
+                    if self.net_tx.send(&req).is_err() {
+                        self.pending_subresources.remove(&request_id);
+                        tab.inflight_fetches -= 1;
+                        if tab
+                            .tx
+                            .send(&ToRenderer::SubresourceResult(SubresourceOutcome::Denied {
+                                reason: "net component unavailable".into(),
+                            }))
+                            .is_err()
+                        {
+                            send_failed = true;
+                        }
+                    }
                 }
-                let same_origin = dest_origin == tab.origin;
-                // Destination-origin cookies in this tab's zone (HttpOnly
-                // included — they reach the net component, never the renderer;
-                // the response is ORB-filtered regardless).
-                let cookies = attachable_cookies(&self.cookies, tab.zone, &dest_origin);
-                let request_id = self.next_request_id;
-                self.next_request_id += 1;
-                self.pending_subresources.insert(request_id, tab_id);
-                tab.inflight_fetches += 1;
-                let req = NetRequest::Subresource { request_id, url, mode, same_origin, cookies };
-                if self.net_tx.send(&req).is_err() {
-                    self.pending_subresources.remove(&request_id);
-                    tab.inflight_fetches -= 1;
-                    let _ = tab.tx.send(&ToRenderer::SubresourceResult(
-                        SubresourceOutcome::Denied { reason: "net component unavailable".into() },
-                    ));
-                }
+                // Consumed (fd received, validated, mapped) by the reader thread;
+                // never reaches the loop as a FromTab message.
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                FromRenderer::TileShm { .. } => {}
             }
-            // Consumed (fd received, validated, mapped) by the reader thread;
-            // never reaches the loop as a FromTab message.
-            #[cfg(all(feature = "multi-process", target_os = "linux"))]
-            FromRenderer::TileShm { .. } => {}
+        }
+        if send_failed {
+            self.drop_tab_crashed(tab_id);
         }
     }
 
@@ -1058,9 +1151,7 @@ impl EngineLoop {
         let Some(tab_id) = self.pending_storage.remove(&request_id) else {
             return;
         };
-        if let Some(tab) = self.tabs.get_mut(&tab_id) {
-            let _ = tab.tx.send(&ToRenderer::StorageResult(value));
-        }
+        self.send_to_tab(tab_id, &ToRenderer::StorageResult(value));
     }
 
     /// Relay a font service reply to the tab that requested it.
@@ -1068,9 +1159,7 @@ impl EngineLoop {
         let Some(tab_id) = self.pending_font.remove(&request_id) else {
             return;
         };
-        if let Some(tab) = self.tabs.get_mut(&tab_id) {
-            let _ = tab.tx.send(&ToRenderer::FontResult(metrics));
-        }
+        self.send_to_tab(tab_id, &ToRenderer::FontResult(metrics));
     }
 
     /// Fork a throwaway decoder for one image, hand it the bytes, and arrange
@@ -1083,81 +1172,103 @@ impl EngineLoop {
     /// (a renderer decoding its own image reveals nothing it did not already
     /// have); the isolation is about containing the *parser*, not the data.
     fn broker_decode(&mut self, tab_id: TabId, image: Vec<u8>) {
-        let Some(tab) = self.tabs.get_mut(&tab_id) else {
-            return;
-        };
-        if tab.inflight_decodes >= MAX_INFLIGHT_DECODES {
-            let _ = tab.tx.send(&ToRenderer::DecodeResult(DecodeOutcome::Failed {
-                reason: "too many in-flight decodes".into(),
-            }));
-            return;
-        }
-
-        let request_id = self.next_request_id;
-        self.next_request_id += 1;
-
-        // Spawn the decoder and hand it the image. If either step fails, the
-        // renderer gets a `Failed` rather than a silent hang.
-        let (handle, ep) = self.spawner.spawn(Role::Decoder);
-        let (mut dec_tx, dec_rx) = ep.split();
-        if dec_tx.send(&ToDecoder::Decode { image }).is_err() {
-            join(handle);
-            let _ = tab.tx.send(&ToRenderer::DecodeResult(DecodeOutcome::Failed {
-                reason: "decoder unavailable".into(),
-            }));
-            return;
-        }
-
-        tab.inflight_decodes += 1;
-        self.pending_decodes.insert(request_id, tab_id);
-
-        // One-shot reader thread: wait for the single reply, forward it, then
-        // reap the decoder. If the link closes *before* a reply, the decoder
-        // died mid-decode — synthesize a `Failed` so the renderer always hears
-        // an outcome. This is the fault-isolation guarantee: a decoder crash is
-        // a decode failure, never a lost request or a broken engine.
-        //
-        // The wait is *bounded* (`DECODE_TIMEOUT`): a wedged decoder that neither
-        // answers nor exits must not pin this thread and the tab's decode slot
-        // forever. On timeout we synthesize a failure (so the slot frees and the
-        // renderer hears an outcome), drop our socket end so a merely-slow decoder
-        // sees EOF, and kill the child where we parent it (the non-fork-served
-        // path) so the join below cannot block.
-        let inbox = self.inbox.clone();
-        std::thread::spawn(move || {
-            crate::sandbox::install_thread_crash_altstack();
-            let mut handle = handle;
-            let mut dec_rx = dec_rx;
-            let _ = dec_rx.set_read_timeout(Some(DECODE_TIMEOUT));
-            let mut timed_out = false;
-            let outcome = match dec_rx.recv::<FromDecoder>() {
-                Ok(FromDecoder::Decoded { width, height, pixels }) => {
-                    DecodeOutcome::Ok { width, height, pixels }
-                }
-                Ok(FromDecoder::Failed { reason }) => DecodeOutcome::Failed { reason },
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    timed_out = true;
-                    DecodeOutcome::Failed { reason: "decoder timed out".into() }
-                }
-                Err(_) => DecodeOutcome::Failed { reason: "decoder died before answering".into() },
+        // Like tab_request: a failed renderer-facing send tears the tab down once
+        // the `tab` borrow has ended (drop_tab_crashed needs `&mut self`).
+        let mut send_failed = false;
+        'dec: {
+            let Some(tab) = self.tabs.get_mut(&tab_id) else {
+                return;
             };
-            let _ = inbox.send(LoopMsg::DecodeReply { request_id, outcome });
-            // Drop our socket end first: a cooperative decoder still finishing up
-            // sees EOF and exits, then is reaped (by the fork server on Linux).
-            drop(dec_rx);
-            // A wedged decoder never exits, so kill it before joining or the join
-            // blocks forever — a no-op for a fork-served child (killed with its
-            // PID namespace at shutdown) or a thread.
-            if timed_out {
-                kill_child(&mut handle);
+            if tab.inflight_decodes >= MAX_INFLIGHT_DECODES {
+                if tab
+                    .tx
+                    .send(&ToRenderer::DecodeResult(DecodeOutcome::Failed {
+                        reason: "too many in-flight decodes".into(),
+                    }))
+                    .is_err()
+                {
+                    send_failed = true;
+                }
+                break 'dec;
             }
-            join(handle);
-        });
+
+            let request_id = self.next_request_id;
+            self.next_request_id += 1;
+
+            // Spawn the decoder and hand it the image. If either step fails, the
+            // renderer gets a `Failed` rather than a silent hang.
+            let (handle, ep) = self.spawner.spawn(Role::Decoder);
+            let (mut dec_tx, dec_rx) = ep.split();
+            if dec_tx.send(&ToDecoder::Decode { image }).is_err() {
+                join(handle);
+                if tab
+                    .tx
+                    .send(&ToRenderer::DecodeResult(DecodeOutcome::Failed {
+                        reason: "decoder unavailable".into(),
+                    }))
+                    .is_err()
+                {
+                    send_failed = true;
+                }
+                break 'dec;
+            }
+
+            tab.inflight_decodes += 1;
+            self.pending_decodes.insert(request_id, tab_id);
+
+            // One-shot reader thread: wait for the single reply, forward it, then
+            // reap the decoder. If the link closes *before* a reply, the decoder
+            // died mid-decode — synthesize a `Failed` so the renderer always hears
+            // an outcome. This is the fault-isolation guarantee: a decoder crash is
+            // a decode failure, never a lost request or a broken engine.
+            //
+            // The wait is *bounded* (`DECODE_TIMEOUT`): a wedged decoder that neither
+            // answers nor exits must not pin this thread and the tab's decode slot
+            // forever. On timeout we synthesize a failure (so the slot frees and the
+            // renderer hears an outcome), drop our socket end so a merely-slow decoder
+            // sees EOF, and kill the child where we parent it (the non-fork-served
+            // path) so the join below cannot block.
+            let inbox = self.inbox.clone();
+            std::thread::spawn(move || {
+                crate::sandbox::install_thread_crash_altstack();
+                let mut handle = handle;
+                let mut dec_rx = dec_rx;
+                let _ = dec_rx.set_read_timeout(Some(DECODE_TIMEOUT));
+                let mut timed_out = false;
+                let outcome = match dec_rx.recv::<FromDecoder>() {
+                    Ok(FromDecoder::Decoded { width, height, pixels }) => {
+                        DecodeOutcome::Ok { width, height, pixels }
+                    }
+                    Ok(FromDecoder::Failed { reason }) => DecodeOutcome::Failed { reason },
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        timed_out = true;
+                        DecodeOutcome::Failed { reason: "decoder timed out".into() }
+                    }
+                    Err(_) => {
+                        DecodeOutcome::Failed { reason: "decoder died before answering".into() }
+                    }
+                };
+                let _ = inbox.send(LoopMsg::DecodeReply { request_id, outcome });
+                // Drop our socket end first: a cooperative decoder still finishing up
+                // sees EOF and exits, then is reaped (by the fork server on Linux).
+                drop(dec_rx);
+                // A wedged decoder never exits, so kill it before joining or the join
+                // blocks forever — a no-op for a fork-served child (killed with its
+                // PID namespace at shutdown) or a thread.
+                if timed_out {
+                    kill_child(&mut handle);
+                }
+                join(handle);
+            });
+        }
+        if send_failed {
+            self.drop_tab_crashed(tab_id);
+        }
     }
 
     /// Relay an ephemeral decoder's result back to the tab that requested it.
@@ -1165,11 +1276,13 @@ impl EngineLoop {
         let Some(tab_id) = self.pending_decodes.remove(&request_id) else {
             return; // requester gone while the decode was in flight
         };
-        let Some(tab) = self.tabs.get_mut(&tab_id) else {
-            return;
-        };
-        tab.inflight_decodes = tab.inflight_decodes.saturating_sub(1);
-        let _ = tab.tx.send(&ToRenderer::DecodeResult(outcome));
+        // Free the decode slot first (short borrow), then deliver through the
+        // failure-aware path so a wedged renderer is dropped rather than blocking.
+        match self.tabs.get_mut(&tab_id) {
+            Some(tab) => tab.inflight_decodes = tab.inflight_decodes.saturating_sub(1),
+            None => return,
+        }
+        self.send_to_tab(tab_id, &ToRenderer::DecodeResult(outcome));
     }
 
     fn net_reply(&mut self, resp: NetResponse) {
@@ -1178,10 +1291,12 @@ impl EngineLoop {
         // engine knows whether to answer with a `FetchResult` or a
         // `SubresourceResult`.
         if let Some(tab_id) = self.pending_fetches.remove(&resp.request_id) {
-            let Some(tab) = self.tabs.get_mut(&tab_id) else {
-                return;
-            };
-            tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1);
+            // Free the in-flight slot (short borrow), then deliver through the
+            // failure-aware path once the borrow has ended.
+            match self.tabs.get_mut(&tab_id) {
+                Some(tab) => tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1),
+                None => return,
+            }
             let reply = match resp.outcome {
                 FetchOutcome::Ok { status, body } => ToRenderer::FetchResult { status, body },
                 FetchOutcome::Denied { reason } => ToRenderer::FetchDenied { reason },
@@ -1195,12 +1310,12 @@ impl EngineLoop {
                 #[cfg(all(feature = "multi-process", target_os = "linux"))]
                 FetchOutcome::OkStreaming { .. } => return,
             };
-            let _ = tab.tx.send(&reply);
+            self.send_to_tab(tab_id, &reply);
         } else if let Some(tab_id) = self.pending_subresources.remove(&resp.request_id) {
-            let Some(tab) = self.tabs.get_mut(&tab_id) else {
-                return;
-            };
-            tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1);
+            match self.tabs.get_mut(&tab_id) {
+                Some(tab) => tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1),
+                None => return,
+            }
             let outcome = match resp.outcome {
                 FetchOutcome::Ok { status, body } => {
                     SubresourceOutcome::Delivered { status, opaque: false, body }
@@ -1214,7 +1329,7 @@ impl EngineLoop {
                 #[cfg(all(feature = "multi-process", target_os = "linux"))]
                 FetchOutcome::OkStreaming { .. } => return,
             };
-            let _ = tab.tx.send(&ToRenderer::SubresourceResult(outcome));
+            self.send_to_tab(tab_id, &ToRenderer::SubresourceResult(outcome));
         }
         // else: requester disappeared while the request was in flight.
     }
@@ -1247,17 +1362,30 @@ impl EngineLoop {
             }
             return; // requester disappeared, or the subresource case handled above
         };
-        let Some(tab) = self.tabs.get_mut(&tab_id) else {
-            return;
-        };
-        tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1);
+        // Free the in-flight slot (short borrow), then deliver.
+        match self.tabs.get_mut(&tab_id) {
+            Some(tab) => tab.inflight_fetches = tab.inflight_fetches.saturating_sub(1),
+            None => return,
+        }
         let FetchOutcome::OkStreaming { status, body_len } = resp.outcome else {
             return;
         };
         // Header first, fd right behind it — the renderer consumes them as
-        // one exchange (the tile path's discipline, direction reversed).
-        if tab.tx.send(&ToRenderer::FetchBodyStream { status, body_len }).is_ok() {
-            let _ = tab.tx.send_fd(fd.as_raw_fd());
+        // one exchange (the tile path's discipline, direction reversed). On any
+        // send failure the renderer is wedged (or gone): drop it rather than let
+        // it block the single-threaded loop.
+        let mut failed = false;
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            if tab.tx.send(&ToRenderer::FetchBodyStream { status, body_len }).is_ok() {
+                if tab.tx.send_fd(fd.as_raw_fd()).is_err() {
+                    failed = true;
+                }
+            } else {
+                failed = true;
+            }
+        }
+        if failed {
+            self.drop_tab_crashed(tab_id);
         }
     }
 

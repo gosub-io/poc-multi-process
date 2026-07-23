@@ -521,8 +521,21 @@ ambient authority over that memory — the deny-list removes kernel-escalation
 reach, not the parser's reach into those secrets. What bounds it today is the
 16 MiB length-checked framing, closed enums, bincode's lack of type-directed
 dispatch, and a `cargo-fuzz` harness over the parsers — a narrow surface, not an
-open one. The remaining step a production engine would take is to run the parser
-in a *minimized subprocess* rather than the secret-holding one.
+open one.
+
+*The fix, for import — shrink the broker*, on the principle that no one process
+should hold both large secrets *and* a large hostile-input surface (the broker
+fails it; so does Chromium's network service, which holds cookies *and* parses
+HTTP/TLS). Two moves: **(1)** move the secrets out — the **cookie jar** goes to a
+dedicated low-authority **`vault`** process (no network; narrow typed interface
+`get-attachable`/`get-visible`/`set`; keyed by broker-stamped `(zone, origin)`;
+structured-cookie hand-off so it parses nothing hostile; origin-scoping enforced
+inside it; optionally partitioned per zone so it does not itself become an
+aggregation point). Storage already follows this shape — its data lives in the
+service, not the broker — so cookies are the outlier to move. **(2)** move the
+untrusted parsing out, or behind validated/codegen'd IPC bindings, rather than
+hand-rolled `bincode::deserialize` in the secret-holding process (a *minimized
+subprocess* parser). Do both and a broker compromise no longer yields the jar.
 
 Others:
 

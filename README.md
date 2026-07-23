@@ -72,6 +72,22 @@ a narrow surface, not an open one. It is still the sharpest edge in the model,
 because the whole architecture rests on the broker being uncompromisable and
 this is the one place untrusted bytes reach it.
 
+The structural fix, for the real engine, is to **shrink the broker** — the
+principle being that no one process should hold both large secrets *and* a large
+hostile-input surface. The broker parses untrusted frames, so the secrets should
+leave it. The biggest secret is the **cookie jar**, which today lives in the
+engine; it should move into a separate low-authority **`vault`** process: no
+network, a narrow typed interface (`get-attachable` for the net component's
+outbound requests, `get-visible` for a renderer's `document.cookie`, `set`),
+keyed by the **broker-stamped `(zone, origin)`** (never a renderer claim), with
+structured-cookie hand-off so the vault itself parses nothing hostile and
+origin-scoping enforced inside it. Then a broker compromise no longer yields the
+jar, and the HttpOnly session tokens never touch the broker at all. Note the
+storage service already follows this shape (its data lives in the service, not
+the broker); cookies are the outlier still to move. This is import-time
+architecture, not implemented here — see *Shortcuts taken* and the
+`browser-architecture-comparison.md` notes.
+
 The broker is not left *entirely* unconfined, though. Like Chromium's browser
 process — which is sandboxed, just far more loosely than a renderer — it gets
 two loose, best-effort layers. A **Landlock sandbox** on the filesystem: it may
