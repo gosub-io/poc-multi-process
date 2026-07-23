@@ -573,6 +573,7 @@ mod probe_inventory {
         "service-landlock",
         "broker-landlock",
         "broker-seccomp",
+        "broker-seccomp-mount",
         "cgroup-memory-limit",
         "crash-report",
     ];
@@ -803,6 +804,17 @@ mod sandbox_enforcement {
     fn broker_denies_escalation_syscalls() {
         let st = probe("broker-seccomp");
         assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (ptrace denied), got {st:?}");
+        assert!(st.code().is_none(), "should be killed, not exit");
+    }
+
+    /// The deny-list must cover the *fd-based* mount API (Linux 5.1+), not just
+    /// the classic `mount`/`pivot_root`: otherwise a compromised broker reaches
+    /// the same mount escape via `fsopen`+`fsmount`+`move_mount`. The probe calls
+    /// `fsopen` under the broker filter and must die by `SIGSYS`.
+    #[test]
+    fn broker_denies_the_fd_based_mount_api() {
+        let st = probe("broker-seccomp-mount");
+        assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (fsopen denied), got {st:?}");
         assert!(st.code().is_none(), "should be killed, not exit");
     }
 

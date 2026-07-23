@@ -110,6 +110,8 @@ pub const PROBES: &[&str] = &[
     #[cfg(target_os = "linux")]
     "broker-seccomp",
     #[cfg(target_os = "linux")]
+    "broker-seccomp-mount",
+    #[cfg(target_os = "linux")]
     "cgroup-memory-limit",
     #[cfg(target_os = "linux")]
     "crash-report",
@@ -1057,6 +1059,21 @@ fn run_platform_probe(probe: &str) {
         // before it returns, not what it would have done.
         unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) };
         eprintln!("[selftest] broker-seccomp: ptrace was NOT denied — deny-list did not bind");
+        std::process::exit(1);
+    }
+
+    // The deny-list must close the *fd-based* mount API too, not only the classic
+    // `mount`/`pivot_root` — otherwise a compromised broker could `fsopen`+
+    // `fsmount`+`move_mount` its way to the same escape. `fsopen` is on the list,
+    // so a raw call to it is a fatal `SIGSYS`; reaching the line past it means the
+    // new mount API was left open, and we exit non-zero to say so.
+    if probe == "broker-seccomp-mount" {
+        crate::sandbox::lock_down_broker();
+        // SAFETY: a raw `fsopen` with a dummy fs name; the point is that the
+        // syscall traps before it returns, not what it would have opened.
+        let name = b"tmpfs\0";
+        unsafe { libc::syscall(libc::SYS_fsopen, name.as_ptr(), 0u32) };
+        eprintln!("[selftest] broker-seccomp-mount: fsopen was NOT denied — the fd-based mount API is not on the deny-list");
         std::process::exit(1);
     }
 

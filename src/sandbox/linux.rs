@@ -873,8 +873,12 @@ pub fn cgroup_confine_self(limit: u64) -> Option<std::io::Result<u64>> {
 /// process's memory (`ptrace`, `process_vm_*`), loading kernel code
 /// (`init_module`/`finit_module`, `kexec_*`, `bpf`), the classic local-privilege
 /// escalation surfaces (`perf_event_open`, `userfaultfd`, the kernel keyring,
-/// `kcmp`), and namespace/mount escapes (`setns`, `mount`, `umount2`,
-/// `pivot_root`, `swapon`/`swapoff`, `reboot`). Denying exactly those turns the
+/// `kcmp`), and namespace/mount escapes — both the classic calls (`setns`,
+/// `mount`, `umount2`, `pivot_root`) *and* the newer fd-based mount API
+/// (`fsopen`/`fsconfig`/`fsmount`/`move_mount`/`open_tree`/`fspick`/
+/// `mount_setattr`), which reach the same capability a different way, plus
+/// `open_by_handle_at` (opening by handle bypasses path-based checks and
+/// Landlock) and `swapon`/`swapoff`/`reboot`. Denying exactly those turns the
 /// trusted process from seccomp-unconfined into "can still do its job, cannot
 /// reach for a kernel exploit" — a deny-list, the inverse of the allowlist the
 /// children carry.
@@ -915,6 +919,22 @@ const BROKER_DENY: &[libc::c_long] = &[
     libc::SYS_swapon,
     libc::SYS_swapoff,
     libc::SYS_reboot,
+    // The newer *fd-based* mount API (Linux 5.1+) — the same capability as
+    // `mount`/`pivot_root` reached a different way, so denying only the classic
+    // calls would leave the escape open via `fsopen`+`fsconfig`+`fsmount`+
+    // `move_mount` (or `open_tree` for a detached mount, `mount_setattr` to
+    // remount). Denied together so the mount surface is closed as a whole.
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_move_mount,
+    libc::SYS_open_tree,
+    libc::SYS_fspick,
+    libc::SYS_mount_setattr,
+    // Open a file straight from a handle, bypassing the path-based access checks
+    // (and the broker's Landlock, which sees paths, not handles). No child needs
+    // it; the broker never does.
+    libc::SYS_open_by_handle_at,
 ];
 
 /// Confine the **broker** (engine) process. Two best-effort layers, applied on
