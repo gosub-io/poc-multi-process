@@ -224,6 +224,14 @@ fn blocked_ip_reason(ip: IpAddr) -> Option<&'static str> {
                 // embedded IPv4 on stacks that still honor it. (::1 and ::
                 // were already handled above.)
                 blocked_v4(embedded_v4(seg))
+            } else if seg[0] == 0x2002 {
+                // 6to4 (2002::/16): the IPv4 is embedded in the *next* 32 bits
+                // (2002:AABB:CCDD::), not the low ones — on a host with a 6to4
+                // pseudo-interface/relay that IPv4 is what gets reached, so
+                // classify it like NAT64. A public embed stays allowed.
+                let v4 =
+                    Ipv4Addr::new((seg[1] >> 8) as u8, seg[1] as u8, (seg[2] >> 8) as u8, seg[2] as u8);
+                blocked_v4(v4)
             } else {
                 None
             }
@@ -325,8 +333,10 @@ mod tests {
             "http://198.19.255.1/", "http://192.0.2.1/", "http://198.51.100.7/",
             "http://203.0.113.9/",
             // IPv6 embeddings that reach internal IPv4: NAT64 + deprecated
-            // IPv4-compatible.
+            // IPv4-compatible + 6to4 (2002:AABB:CCDD::).
             "http://[64:ff9b::7f00:1]/", "http://[64:ff9b::a00:1]/", "http://[::127.0.0.1]/",
+            "http://[2002:c0a8:0101::]/", // 6to4 wrapping 192.168.1.1
+            "http://[2002:7f00:0001::]/", // 6to4 wrapping 127.0.0.1
             // Parser-confusion: userinfo and trailing dot.
             "http://real.com@127.0.0.1/", "http://127.0.0.1.:80/",
             // Non-HTTP schemes are refused outright, whatever the host.
@@ -356,6 +366,7 @@ mod tests {
             "http://198.20.0.1/",    // just outside benchmarking 198.18/15
             "http://[2606:2800:220:1::1]/",
             "http://[64:ff9b::808:808]/", // NAT64 embedding a *public* v4 (8.8.8.8)
+            "http://[2002:5db8:d822::1]/", // 6to4 embedding a *public* v4 (93.184.216.34)
         ] {
             assert!(check(u).is_ok(), "should allow {u}: {:?}", check(u));
         }
