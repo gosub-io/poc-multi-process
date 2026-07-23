@@ -434,7 +434,7 @@ impl EngineLoop {
 
         // Bring up the net component and a reader thread that forwards its
         // replies into the inbox, bounded by the net component's gate.
-        let (net_handle, ep) = spawner.spawn(Role::Net);
+        let (net_handle, ep) = spawner.spawn(Role::Net).expect("spawn net component at startup");
         let (net_tx, mut net_rx) = ep.split();
         let net_gate = Gate::new(MAX_QUEUED_PER_SOURCE);
         {
@@ -475,7 +475,8 @@ impl EngineLoop {
 
         // The storage service: reader thread forwards `StorageResponse`s into
         // the inbox, gated like the net component.
-        let (storage_handle, ep) = spawner.spawn(Role::Service("storage"));
+        let (storage_handle, ep) =
+            spawner.spawn(Role::Service("storage")).expect("spawn storage service at startup");
         let (storage_tx, mut storage_rx) = ep.split();
         let storage_gate = Gate::new(MAX_QUEUED_PER_SOURCE);
         {
@@ -499,7 +500,8 @@ impl EngineLoop {
         }
 
         // The font service: same shape, forwarding `FontResponse`s.
-        let (font_handle, ep) = spawner.spawn(Role::Service("font"));
+        let (font_handle, ep) =
+            spawner.spawn(Role::Service("font")).expect("spawn font service at startup");
         let (font_tx, mut font_rx) = ep.split();
         let font_gate = Gate::new(MAX_QUEUED_PER_SOURCE);
         {
@@ -528,7 +530,8 @@ impl EngineLoop {
         let devices = ["audio", "gpu"]
             .into_iter()
             .map(|name| {
-                let (handle, ep) = spawner.spawn(Role::Service(name));
+                let (handle, ep) =
+                    spawner.spawn(Role::Service(name)).expect("spawn device service at startup");
                 let (tx, _rx) = ep.split();
                 ServiceLink { tx, handle }
             })
@@ -716,8 +719,15 @@ impl EngineLoop {
 
         // The renderer process is bound to this (zone, origin): a separate
         // process from the same origin in another zone, so it can never touch
-        // that zone's partition.
-        let (handle, ep) = self.spawner.spawn(Role::Renderer(&origin));
+        // that zone's partition. A spawn failure here means the fork server is
+        // gone — refuse the tab rather than panic the engine.
+        let Some((handle, ep)) = self.spawner.spawn(Role::Renderer(&origin)) else {
+            self.emit(EngineEvent::OpenTabFailed {
+                url: url.to_string(),
+                reason: "fork server unavailable".into(),
+            });
+            return;
+        };
         let (mut tx, rx) = ep.split();
         // Bound how long a reply to this renderer may block the loop: a renderer
         // that floods requests and never reads must not wedge the single-threaded
@@ -909,8 +919,16 @@ impl EngineLoop {
         self.pending_font.retain(|_, t| *t != tab_id);
 
         // Bring up the new renderer bound to (zone, new_origin), wired exactly
-        // as `open_tab` does.
-        let (handle, ep) = self.spawner.spawn(Role::Renderer(&new_origin));
+        // as `open_tab` does. If the fork server is gone the old renderer is
+        // already torn down, so report the navigation as failed rather than
+        // panicking; the tab ends up closed.
+        let Some((handle, ep)) = self.spawner.spawn(Role::Renderer(&new_origin)) else {
+            self.emit(EngineEvent::NavigationFailed {
+                tab_id,
+                reason: "fork server unavailable".into(),
+            });
+            return;
+        };
         let (mut tx, rx) = ep.split();
         // Same reply-write bound as open_tab: a flooding renderer must not wedge
         // the loop (see REPLY_WRITE_TIMEOUT).
@@ -1196,8 +1214,20 @@ impl EngineLoop {
             self.next_request_id += 1;
 
             // Spawn the decoder and hand it the image. If either step fails, the
-            // renderer gets a `Failed` rather than a silent hang.
-            let (handle, ep) = self.spawner.spawn(Role::Decoder);
+            // renderer gets a `Failed` rather than a silent hang. A None here is
+            // the fork server being gone — same graceful failure.
+            let Some((handle, ep)) = self.spawner.spawn(Role::Decoder) else {
+                if tab
+                    .tx
+                    .send(&ToRenderer::DecodeResult(DecodeOutcome::Failed {
+                        reason: "decoder unavailable (fork server down)".into(),
+                    }))
+                    .is_err()
+                {
+                    send_failed = true;
+                }
+                break 'dec;
+            };
             let (mut dec_tx, dec_rx) = ep.split();
             if dec_tx.send(&ToDecoder::Decode { image }).is_err() {
                 join(handle);
@@ -1490,21 +1520,29 @@ fn origin_of(url: &str) -> Option<String> {
     }
     let authority = rest.split(['/', '?', '#']).next()?;
 
-    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+    let (host, port, is_ipv6) = if let Some(bracketed) = authority.strip_prefix('[') {
         // [IPv6] or [IPv6]:port
         let (host, after) = bracketed.split_once(']')?;
-        (host, after.strip_prefix(':'))
+        (host, after.strip_prefix(':'), true)
     } else if let Some((host, port)) = authority.rsplit_once(':') {
-        (host, Some(port))
+        (host, Some(port), false)
     } else {
-        (authority, None)
+        (authority, None, false)
     };
     if host.is_empty() {
         return None;
     }
 
     let scheme = scheme.to_ascii_lowercase();
-    let host = host.to_ascii_lowercase();
+    // Re-bracket an IPv6 literal in the canonical origin, or `[::1]:8080` and
+    // `[::1:8080]` would both collapse to `::1:8080` — two distinct origins
+    // sharing one cookie/storage partition and passing each other's same-origin
+    // checks. The brackets are load-bearing identity here, not cosmetics.
+    let host = if is_ipv6 {
+        format!("[{}]", host.to_ascii_lowercase())
+    } else {
+        host.to_ascii_lowercase()
+    };
     let port: Option<u16> = match port {
         Some(p) => Some(p.parse().ok()?), // a non-numeric port is not a URL
         None => None,
@@ -1609,8 +1647,8 @@ impl Spawner {
         }
     }
 
-    fn spawn(&mut self, role: Role) -> (ChildHandle, Endpoint) {
-        match self {
+    fn spawn(&mut self, role: Role) -> Option<(ChildHandle, Endpoint)> {
+        Some(match self {
             // Single-process: the component's serve loop runs on a thread,
             // wired up with an in-process channel pair.
             Spawner::Single => {
@@ -1669,13 +1707,27 @@ impl Spawner {
                     };
                     let (parent_end, child_end) =
                         std::os::unix::net::UnixStream::pair().expect("socketpair");
-                    ipc::send_msg(fork_control, &req).expect("fork request");
+                    // If the fork server has died (crash / OOM-kill), these fail
+                    // at steady state. Degrade to a spawn failure the caller can
+                    // report (OpenTabFailed / NavigationFailed / decode Failed)
+                    // rather than panicking the whole engine loop. A fork
+                    // *failure inside a live* fork server is handled elsewhere
+                    // (the child's end is dropped → engine reader sees EOF →
+                    // TabCrashed); only fork-server *death* reaches here.
+                    if ipc::send_msg(fork_control, &req).is_err() {
+                        eprintln!("[engine] fork server unavailable; cannot spawn content process");
+                        return None;
+                    }
                     // SCM_RIGHTS duplicates the fd into the fork server; the
                     // engine then drops its copy of the child's end so it sees
                     // EOF when the child dies (a decoder always, a renderer on
                     // crash).
-                    unsafe { ipc::send_fd(fork_control.as_raw_fd(), child_end.as_raw_fd()) }
-                        .expect("send fd");
+                    if unsafe { ipc::send_fd(fork_control.as_raw_fd(), child_end.as_raw_fd()) }
+                        .is_err()
+                    {
+                        eprintln!("[engine] fork server unavailable; cannot pass content-process fd");
+                        return None;
+                    }
                     drop(child_end);
                     let ep = Endpoint::from_channel(crate::channel::Channel::from_stream(parent_end))
                         .expect("wrap parent end");
@@ -1702,7 +1754,7 @@ impl Spawner {
                 let ep = Endpoint::from_channel(parent_end).expect("wrap parent end");
                 (ChildHandle::Process(child), ep)
             }
-        }
+        })
     }
 
     /// Shut down the fork server (Linux). No-op otherwise.
@@ -1803,9 +1855,13 @@ mod tests {
         );
         assert_eq!(origin_of("http://example.com/").as_deref(), Some("http://example.com"));
         assert_ne!(origin_of("http://example.com/"), origin_of("https://example.com/"));
-        // Case-insensitive scheme/host, IPv6 hosts keep their port handling.
+        // Case-insensitive scheme/host, IPv6 hosts keep their brackets.
         assert_eq!(origin_of("HTTPS://Example.COM/x").as_deref(), Some("https://example.com"));
-        assert_eq!(origin_of("http://[::1]:8080/x").as_deref(), Some("http://::1:8080"));
+        assert_eq!(origin_of("http://[::1]:8080/x").as_deref(), Some("http://[::1]:8080"));
+        assert_eq!(origin_of("http://[::1]/").as_deref(), Some("http://[::1]"));
+        // The brackets are load-bearing: an addr-with-port and a same-text host
+        // must stay distinct origins, not collapse to one partition.
+        assert_ne!(origin_of("http://[::1]:8080/"), origin_of("http://[::1:8080]/"));
         assert_eq!(origin_of("not-a-url"), None);
         assert_eq!(origin_of("https://"), None);
         assert_eq!(origin_of("https://example.com:notaport/"), None);
