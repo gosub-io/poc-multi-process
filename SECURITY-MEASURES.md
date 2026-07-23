@@ -524,6 +524,24 @@ Others:
   broker Landlock). A per-arch seccomp baseline tested across libc/kernel versions
   is also still wanted (the startup canary verifies the libc-sensitive filter, but
   CI does not yet exercise every target).
+- **cgroup refinements — considered, not pursued.** Three polish items on the
+  cgroup memory bound (§2.5) were each found not worth it:
+  - A **cgroup namespace** (`CLONE_NEWCGROUP`) would only hide the host cgroup
+    layout in `/proc/self/cgroup` — which a renderer cannot read anyway (`openat`
+    is off its allowlist) — and its namespace root, fixed at `unshare` time in
+    `pre_exec`, would be stale against the *post-spawn* cgroup placement. No gain,
+    a cosmetic wart.
+  - **`oom_score_adj`** (biasing the global OOM killer toward renderers) is a write
+    to `/proc/<pid>/oom_score_adj`; the **broker Landlock** confines writes to the
+    temp dir + the cgroup subtree, so it is denied — for the child (which inherits
+    that Landlock in `pre_exec`) and for the broker alike. Widening Landlock to
+    `/proc` to allow it would be a real regression for what is only a *hint* the
+    cgroup `memory.max` already subsumes where it is available.
+  - **Race-free `clone3(CLONE_INTO_CGROUP)`** placement does not fit: `Command`
+    cannot pass clone flags (services), and the fork server's `clone3`→`ENOSYS`
+    hardening plus fork-without-exec make atomic-into-cgroup incompatible. The
+    current post-spawn placement's race is microseconds — a child cannot balloon
+    its memory before it is moved into its bounded cgroup.
 - **A real JS JIT needs executable memory**, so it would carve out a dedicated
   JIT exception rather than deny `PROT_EXEC` outright (same on Windows for
   `ProhibitDynamicCode`).
