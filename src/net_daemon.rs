@@ -100,7 +100,7 @@ pub fn serve(mut ep: Endpoint) {
             #[cfg(all(feature = "multi-process", target_os = "linux"))]
             NetRequest::CookieGetVisible { request_id, zone, origin } => {
                 // The document.cookie view: the vault filters HttpOnly.
-                let cookies = vault_get(&mut vault, &mut vault_rid, zone, &origin, true);
+                let cookies = vault_get(&mut vault, &mut vault_rid, &mut ep, zone, &origin, true);
                 if ep.send(&FromNet::CookieVisible { request_id, cookies }).is_err() {
                     break;
                 }
@@ -124,7 +124,7 @@ pub fn serve(mut ep: Endpoint) {
                 // Single-process / off Linux the broker attached them in `cookies`.
                 #[cfg(all(feature = "multi-process", target_os = "linux"))]
                 let cookies = if vault.is_some() {
-                    let c = vault_get(&mut vault, &mut vault_rid, for_zone, &for_origin, false);
+                    let c = vault_get(&mut vault, &mut vault_rid, &mut ep, for_zone, &for_origin, false);
                     let names = c.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
                     if ep
                         .send(&FromNet::CookieAttached {
@@ -190,7 +190,7 @@ pub fn serve(mut ep: Endpoint) {
                 // else from the broker-attached `cookies` field.
                 #[cfg(all(feature = "multi-process", target_os = "linux"))]
                 let cookies = if vault.is_some() {
-                    let c = vault_get(&mut vault, &mut vault_rid, for_zone, &for_origin, false);
+                    let c = vault_get(&mut vault, &mut vault_rid, &mut ep, for_zone, &for_origin, false);
                     let names = c.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
                     if ep
                         .send(&FromNet::CookieAttached {
@@ -239,25 +239,39 @@ fn send_reply(ep: &mut Endpoint, request_id: u64, outcome: FetchOutcome) -> std:
 fn vault_get(
     vault: &mut Option<std::os::unix::net::UnixStream>,
     rid: &mut u64,
+    ep: &mut Endpoint,
     zone: u64,
     origin: &str,
     visible_only: bool,
 ) -> Vec<(String, String)> {
-    let Some(stream) = vault.as_ref() else {
+    if vault.is_none() {
         return Vec::new();
-    };
+    }
     let request_id = *rid;
     *rid = rid.wrapping_add(1);
     let req = VaultRequest::Get { request_id, zone, origin: origin.to_string(), visible_only };
-    // Read/write through a shared ref to the one stream — no dup.
-    let mut w: &std::os::unix::net::UnixStream = stream;
-    if crate::ipc::send_msg(&mut w, &req).is_err() {
-        return Vec::new();
-    }
-    let mut r: &std::os::unix::net::UnixStream = stream;
-    match crate::ipc::recv_msg::<VaultResponse>(&mut r) {
-        Ok(resp) => resp.cookies,
-        Err(_) => Vec::new(),
+    // Read/write through a shared ref to the one stream — no dup. Scoped so the
+    // borrow ends before we may drop the link on failure below.
+    let result: Result<Vec<(String, String)>, ()> = {
+        let stream = vault.as_ref().unwrap();
+        let mut w: &std::os::unix::net::UnixStream = stream;
+        if crate::ipc::send_msg(&mut w, &req).is_err() {
+            Err(())
+        } else {
+            let mut r: &std::os::unix::net::UnixStream = stream;
+            crate::ipc::recv_msg::<VaultResponse>(&mut r).map(|resp| resp.cookies).map_err(|_| ())
+        }
+    };
+    match result {
+        Ok(cookies) => cookies,
+        Err(()) => {
+            // The vault died: drop the link (subsequent queries fail fast to
+            // empty — fail open, never a leak) and tell the broker once, so it
+            // respawns the vault and re-binds us with a fresh link.
+            *vault = None;
+            let _ = ep.send(&FromNet::VaultGone);
+            Vec::new()
+        }
     }
 }
 

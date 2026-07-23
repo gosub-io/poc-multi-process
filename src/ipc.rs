@@ -223,6 +223,10 @@ pub enum FromNet {
     /// they were attached for, so the broker can emit the observe line without
     /// ever holding the values.
     CookieAttached { request_id: u64, zone: u64, origin: String, names: Vec<String> },
+    /// The vault link died (a query failed): net has dropped it and now attaches
+    /// no cookies. The broker respawns the vault (bounded) and re-binds net with a
+    /// fresh link. Sent once per death.
+    VaultGone,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

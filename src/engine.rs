@@ -167,6 +167,10 @@ enum LoopMsg {
     /// the values, only this report).
     #[cfg(all(feature = "multi-process", target_os = "linux"))]
     CookieAttached { zone: u64, origin: String, names: Vec<String> },
+    /// The net component reported that the vault link died. The broker respawns
+    /// the vault (bounded) and re-binds net.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    VaultGone,
 }
 
 /// A running child component, however it is hosted.
@@ -492,6 +496,11 @@ struct ServiceLink {
 enum ServiceKind {
     Storage,
     Font,
+    /// The cookie vault (Linux, multi-process). Respawned like the others but on
+    /// a different signal — its death is observed by the *net* component (its sole
+    /// client), which reports it, since the broker has no direct vault link.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    Vault,
 }
 
 impl ServiceKind {
@@ -499,6 +508,8 @@ impl ServiceKind {
         match self {
             ServiceKind::Storage => "storage",
             ServiceKind::Font => "font",
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            ServiceKind::Vault => "vault",
         }
     }
 }
@@ -588,6 +599,12 @@ impl EngineLoop {
                                 break;
                             }
                             if inbox.send(LoopMsg::CookieAttached { zone, origin, names }).is_err() {
+                                break;
+                            }
+                        }
+                        // A control signal, not a reply — no gate permit to take.
+                        FromNet::VaultGone => {
+                            if inbox.send(LoopMsg::VaultGone).is_err() {
                                 break;
                             }
                         }
@@ -837,6 +854,10 @@ impl EngineLoop {
                 LoopMsg::CookieAttached { zone, origin, names } => {
                     observe_cookie_names("fetch", ZoneId(zone), &origin, &names);
                     self.net_gate.release();
+                }
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                LoopMsg::VaultGone => {
+                    self.respawn_vault();
                 }
             }
         }
@@ -1507,6 +1528,10 @@ impl EngineLoop {
                 self.font_gate = gate;
                 std::mem::replace(&mut self.font, ServiceLink { tx, handle })
             }
+            // The vault is respawned by `respawn_vault` (net-reported death,
+            // different wiring), never through this path.
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            ServiceKind::Vault => unreachable!("vault respawns via respawn_vault"),
         };
         // Reap the dead process (kill-before-join so a not-yet-fully-exited one
         // can't hang the loop).
@@ -1514,6 +1539,56 @@ impl EngineLoop {
         kill_child(&mut old_handle);
         join(old_handle);
         eprintln!("[engine] respawned {} service after it died", service.role_name());
+    }
+
+    /// Respawn the cookie vault after net reported it died ([`LoopMsg::VaultGone`]),
+    /// and re-bind net's link to the fresh one — bounded, like the other services.
+    /// The vault's death is observed by *net* (its sole client), not by the broker
+    /// (which has no direct vault link), which is why this is a separate path.
+    ///
+    /// On the bound being hit, or any rewire failure, the vault stays down and net
+    /// keeps attaching no cookies — **fail-open**: degraded (unauthenticated
+    /// requests), never a leak. New requests meanwhile fail fast to empty. Linux,
+    /// multi-process only.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    fn respawn_vault(&mut self) {
+        // Reap the dead vault first (kill-before-join, harmless if already gone).
+        if let Some(mut old) = self.vault.take() {
+            kill_child(&mut old);
+            join(old);
+        }
+        if !self.service_restarts.allow(ServiceKind::Vault, Instant::now()) {
+            eprintln!(
+                "[engine] vault died {MAX_SERVICE_RESTARTS}+ times in {}s — not respawning; \
+                 cookies stay unavailable until restart",
+                SERVICE_RESTART_WINDOW.as_secs()
+            );
+            return;
+        }
+        // Re-wire exactly as at startup: a fresh net<->vault socketpair, the vault
+        // spawned with the vault end, net handed the net end via SCM_RIGHTS behind
+        // a `BindVault`. Any failure leaves the vault down (net fails open).
+        use std::os::fd::AsRawFd;
+        let Ok((net_end, vault_end)) = std::os::unix::net::UnixStream::pair() else {
+            eprintln!("[engine] could not respawn vault (socketpair)");
+            return;
+        };
+        let Some(child) = self.spawner.spawn_vault(vault_end) else {
+            eprintln!("[engine] could not respawn vault (spawn)");
+            return;
+        };
+        if self.net_tx.send(&NetRequest::BindVault).is_err()
+            || self.net_tx.send_fd(net_end.as_raw_fd()).is_err()
+        {
+            eprintln!("[engine] could not rebind net to the respawned vault");
+            let mut h = ChildHandle::Process(child);
+            kill_child(&mut h);
+            join(h);
+            return;
+        }
+        drop(net_end); // the broker keeps neither vault fd
+        self.vault = Some(ChildHandle::Process(child));
+        eprintln!("[engine] respawned the vault after it died");
     }
 
     /// Fail every request in flight to `service`, replying `None` to each waiting
@@ -1532,6 +1607,10 @@ impl EngineLoop {
                     self.send_to_tab(tab_id, &ToRenderer::FontResult(None));
                 }
             }
+            // The vault has no broker-side pending map (its client is net, which
+            // fails open); nothing to fail here.
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            ServiceKind::Vault => {}
         }
     }
 

@@ -22,7 +22,8 @@ is no boundary behind them (`--single-process` / `--no-default-features`).
 
 | Process | Extra capability over content baseline | OS parent | Confinement |
 |---|---|---|---|
-| engine (broker) | everything — spawns, sockets, cookie jar | — | Landlock (writes confined to temp) + seccomp **deny-list** (denies `ptrace`/`kexec`/`bpf`/`mount`/`setns`/…) + `deny_debugger_attach` |
+| engine (broker) | everything — spawns, sockets, policy/identity stamping | — | Landlock (writes confined to temp) + seccomp **deny-list** (denies `ptrace`/`kexec`/`bpf`/`mount`/`setns`/…) + `deny_debugger_attach`. On Linux the **cookie jar is no longer here** — it moved to the vault |
+| cookie vault (Linux, multi-process) | none — holds the jar in memory | engine | **tightest filter in the model**: bare content baseline (no network, `openat`, `ioctl`, or exec). Net's sole client (net-direct), so HttpOnly never touches the broker; respawn-with-bound |
 | fork server (zygote, Linux) | `fork`/`wait4`, `prctl`/`seccomp` for children | engine | seccomp superset of content baseline, empty net/IPC/UTS namespaces, non-dumpable; its forked renderers share a **PID** namespace (pinned PID-1 init) |
 | renderer (per `(zone, origin)`) | none | fork server | content baseline + inherited net/IPC/UTS/PID namespaces |
 | decoder (ephemeral, per image) | none | fork server | content baseline (renderer lockdown reused) |
@@ -523,16 +524,21 @@ reach, not the parser's reach into those secrets. What bounds it today is the
 dispatch, and a `cargo-fuzz` harness over the parsers — a narrow surface, not an
 open one.
 
-*The fix, for import — shrink the broker*, on the principle that no one process
-should hold both large secrets *and* a large hostile-input surface (the broker
-fails it; so does Chromium's network service, which holds cookies *and* parses
-HTTP/TLS). The **secrets** half is addressed: the **cookie jar** goes to a
-dedicated low-authority **`vault`** process (no network; narrow typed interface
-`get-attachable`/`get-visible`/`set`; keyed by broker-stamped `(zone, origin)`;
-structured-cookie hand-off so it parses nothing hostile; origin-scoping enforced
-inside it; optionally partitioned per zone so it does not itself become an
-aggregation point). Storage already follows this shape — its data lives in the
-service, not the broker — so cookies are the outlier to move.
+*Shrink the broker*, on the principle that no one process should hold both large
+secrets *and* a large hostile-input surface (the broker fails it; so does
+Chromium's network service, which holds cookies *and* parses HTTP/TLS). The
+**secrets** half is **done** (Linux, multi-process): the **cookie jar** now lives
+in a dedicated low-authority **`vault`** process (`src/vault.rs`) — the tightest
+filter in the model (bare baseline: no network, `openat`, `ioctl`, or exec). It is
+**net's sole client** (net-direct): net queries it for the cookies to attach,
+keyed by the broker-stamped `(zone, origin)`, so **HttpOnly never touches the
+broker** and a broker compromise no longer yields the jar. `document.cookie`/`set`
+route broker→net→vault; the broker keeps only identity-stamping. Wired into the
+service respawn-with-bound machinery (net reports the vault's death, the broker
+respawns it and re-binds net). Off Linux and in single-process mode the broker
+keeps the in-broker jar (no isolation to gain), so cookie *policy* is identical
+across modes (`cookies_in_vault()` selects at runtime). Storage already followed
+this shape.
 
 **The parsing half is a deliberately *accepted* risk — the deserialization stays
 in the broker.** Physically isolating the parser (Chromium's model) is skipped on

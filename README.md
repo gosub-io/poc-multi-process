@@ -53,15 +53,18 @@ same baseline plus the socket family, since it owns network access.
 
 The engine (parent) can't be capped to a renderer's *allowlist*: the privileges
 that would drop are exactly the ones it exists to exercise — it spawns
-processes, opens sockets, and holds the cookie jar. What it *does* carry is a
+processes, opens sockets, and stamps identity/policy. (It no longer holds the
+**cookie jar** on Linux: that moved to the out-of-process `vault` — see *shrink
+the broker* below.) What it *does* carry is a
 **deny-list** seccomp filter (see the broker paragraph below): the broad surface
 stays, but the escalation syscalls it never needs are a fatal `SIGSYS`. It is
 *not* exempt because it is safe from hostile input — it plainly is not. Every
 frame a renderer or the net component sends is `bincode::deserialize`d inside the
 engine (`rx.recv::<FromRenderer>()` in the loop's reader threads), so a
-compromised child's bytes are parsed by the one process holding every secret,
-with full ambient authority over that memory — the deny-list removes
-kernel-escalation reach, not the parser's reach into those secrets.
+compromised child's bytes are parsed in a process with full ambient authority —
+the deny-list removes kernel-escalation reach, not the parser's reach. The vault
+shrinks what that reach *yields* (the jar is no longer there); the parsing itself
+staying in the broker is a documented accepted risk (below).
 
 What bounds that today: frames are length-prefixed and capped at 16 MiB with
 the length checked *before* allocating, the wire types are closed enums, and
@@ -72,21 +75,30 @@ a narrow surface, not an open one. It is still the sharpest edge in the model,
 because the whole architecture rests on the broker being uncompromisable and
 this is the one place untrusted bytes reach it.
 
-The structural fix, for the real engine, is to **shrink the broker** — the
-principle being that no one process should hold both large secrets *and* a large
-hostile-input surface. The broker parses untrusted frames, so the secrets should
-leave it. The biggest secret is the **cookie jar**, which today lives in the
-engine; it should move into a separate low-authority **`vault`** process: no
-network, a narrow typed interface (`get-attachable` for the net component's
-outbound requests, `get-visible` for a renderer's `document.cookie`, `set`),
-keyed by the **broker-stamped `(zone, origin)`** (never a renderer claim), with
-structured-cookie hand-off so the vault itself parses nothing hostile and
-origin-scoping enforced inside it. Then a broker compromise no longer yields the
-jar, and the HttpOnly session tokens never touch the broker at all. Note the
-storage service already follows this shape (its data lives in the service, not
-the broker); cookies are the outlier still to move. This is import-time
-architecture, not implemented here — see *Shortcuts taken* and the
-`browser-architecture-comparison.md` notes.
+The structural fix is to **shrink the broker** — the principle being that no one
+process should hold both large secrets *and* a large hostile-input surface. The
+broker parses untrusted frames, so the secrets leave it. The biggest secret is
+the **cookie jar**, and on Linux (multi-process) it now lives in a separate
+low-authority **`vault`** process (`src/vault.rs`) — the tightest-confined role in
+the model: baseline-only filter (no network, no `openat`, no `ioctl`, no exec), so
+even if compromised it can only answer the narrow queries `get-attachable`,
+`get-visible`, `set`. The vault is **net's sole client** (net-direct): the net
+component queries it for the cookies to attach to an outbound request, keyed by
+the **broker-stamped `(zone, origin)`**, so **HttpOnly session tokens never touch
+the broker** at all, and a broker compromise no longer yields the jar. The broker
+keeps only its identity-stamping role, and `document.cookie`/`set` route through
+net to the vault. It is wired into the service respawn-with-bound machinery (net
+reports the vault's death; the broker respawns it and re-binds net's link). The
+storage service already followed this shape; cookies were the outlier.
+
+Off Linux, and in **single-process** mode on Linux (no vault — there is no
+address-space isolation to gain), the broker keeps the in-broker jar, so cookie
+*policy* (HttpOnly stripping, `(zone, origin)` partitioning) is identical in both
+modes; `cookies_in_vault()` selects at runtime. The remaining half of "shrink the
+broker" — the untrusted *parsing* — deliberately stays in the broker as an
+accepted risk (safe Rust; hardened by framing/fuzzing and the planned typestate
+contract, `IPC-TYPESTATE.md`) rather than an isolated subprocess; see *What a real
+renderer would force open* and `browser-architecture-comparison.md`.
 
 The *parsing* half of that principle is a **deliberately accepted risk**: the
 deserialization stays in the broker rather than moving to an isolated subprocess.
@@ -749,7 +761,8 @@ simplified is the surrounding browser. What each entry below still needs:
   **Platform status.** Linux is the reference implementation: seccomp, empty
   net/IPC/UTS/PID namespaces, rlimits, non-dumpable processes, broker Landlock + a
   seccomp deny-list, best-effort per-child cgroup v2 `memory.max`, self-captured
-  scrubbed crash reports, 23 probes.
+  scrubbed crash reports, an out-of-process **cookie vault** (the jar out of the
+  broker, net-direct), 23 probes.
   macOS runs a Seatbelt `(deny default)`
   profile with 13 probes — including **path-scoped file services** (storage/font
   get `subpath` read/write grants for their own directory plus a broad
