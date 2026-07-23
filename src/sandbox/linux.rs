@@ -1403,7 +1403,21 @@ pub fn apply_child_rlimits() -> std::io::Result<()> {
 /// allowlist too) and the **UTS** namespace (its own hostname/domainname —
 /// `sethostname` is off the allowlist too).
 ///
-/// Two namespaces are deliberately *not* here, each for a concrete reason worth
+/// A **PID** namespace is added too, but only meaningfully for the fork server:
+/// `unshare(CLONE_NEWPID)` places the caller's *future children* — not the caller
+/// — in a new PID namespace, so every renderer the fork server forks shares one
+/// (defense in depth for what `kill`/`ptrace`'s absence already gives: a renderer
+/// cannot see or signal the broker/host by pid even if the filter were bypassed).
+/// A shared namespace means its PID 1's death would `SIGKILL` the rest, so the
+/// fork server pins PID 1 open with a do-nothing placeholder and real renderers
+/// are PID 2+ (see [`crate::fork_server`]). Best-effort — a kernel that refuses
+/// `CLONE_NEWPID` falls back to the rest. *Per-renderer* PID namespaces (one each,
+/// each its own PID 1) are not done: they need the fork server to hold
+/// `CAP_SYS_ADMIN` over its PID namespace's owning user namespace, which its
+/// deliberately `uid_map`-less user namespace does not confer — the same root
+/// cause as the mount namespace below.
+///
+/// One namespace is deliberately *not* here, for a concrete reason worth
 /// recording rather than a shortcut:
 ///
 /// - **Mount** (an empty root, the filesystem analogue of the empty netns).
@@ -1419,16 +1433,6 @@ pub fn apply_child_rlimits() -> std::io::Result<()> {
 ///   So it is genuinely blocked by two other (deliberate) hardening choices, not
 ///   merely unimplemented. Seccomp's `openat`/`open` denial is the actual no-fs
 ///   guarantee regardless.
-/// - **PID**. Isolating the fork server's renderers cleanly needs the fork server
-///   to be its ns's PID 1 (init/reaper), which needs the *engine* to
-///   `clone(CLONE_NEWPID)` when spawning it — and `std::process::Command` cannot
-///   pass clone flags. Giving each renderer its *own* PID namespace instead needs
-///   the fork server to `clone(CLONE_NEWPID)` per renderer — which its own
-///   hardening now forbids (clone3 → `ENOSYS` plus the `CLONE_NEW*` mask). And a
-///   plain `unshare(CLONE_NEWPID)` in the fork server would make the *first*
-///   renderer PID 1, whose death `SIGKILL`s every other renderer, breaking the
-///   fault isolation a single crashed tab must not violate. It waits on a
-///   spawn-path rework; seccomp denies `kill`/`ptrace` in the meantime.
 ///
 /// `CLONE_NEWNET`/`NEWIPC`/`NEWUTS` on their own require `CAP_SYS_ADMIN`. Pairing
 /// them with `CLONE_NEWUSER` in the *same* `unshare` gets it unprivileged: the
@@ -1445,7 +1449,8 @@ pub fn apply_child_rlimits() -> std::io::Result<()> {
 /// no longer maps to this process's credentials.
 ///
 /// Called from the post-fork/pre-exec context, so it must stay
-/// async-signal-safe: a single `unshare` syscall, nothing else.
+/// async-signal-safe: one or two `unshare` syscalls (the second only if the
+/// PID-namespace attempt fell back), nothing else.
 #[cfg(feature = "multi-process")]
 pub fn isolate_network(enable: bool) -> std::io::Result<()> {
     if !enable {
@@ -1453,7 +1458,21 @@ pub fn isolate_network(enable: bool) -> std::io::Result<()> {
     }
     let flags =
         libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS;
+    // Also request a **PID** namespace. `unshare(CLONE_NEWPID)` does not move the
+    // caller — it places the caller's *future children* in a new PID namespace —
+    // so this only bites for the **fork server**: every renderer it forks lands
+    // in that namespace (the first becomes PID 1, which the fork server pins open
+    // with a placeholder — see `fork_server`). For the exec-only services it is
+    // inert (they never fork). Best-effort and tried *first* as one combined
+    // `unshare` (creating the PID namespace unprivileged requires pairing it with
+    // the user namespace in the same call); a kernel that refuses `CLONE_NEWPID`
+    // falls back to the network isolation alone rather than failing the spawn.
     // SAFETY: unshare with valid flags; affects only the calling process.
+    if unsafe { libc::unshare(flags | libc::CLONE_NEWPID) } == 0 {
+        return Ok(());
+    }
+    // Fallback: the load-bearing network isolation without the PID namespace.
+    // `unshare` is all-or-nothing, so the failed attempt above changed nothing.
     if unsafe { libc::unshare(flags) } < 0 {
         return Err(std::io::Error::last_os_error());
     }

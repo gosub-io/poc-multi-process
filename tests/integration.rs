@@ -549,6 +549,7 @@ mod probe_inventory {
         "fcntl-dupfd",
         "ring",
         "netns",
+        "pidns",
         "no-ptrace",
         "forkserver-can-fork",
         "forkserver-canary-gap",
@@ -674,6 +675,18 @@ mod sandbox_enforcement {
     fn renderer_network_namespace_is_empty() {
         let st = probe("netns");
         assert!(st.success(), "expected an empty netns, got {st:?}");
+    }
+
+    /// The fork server also puts every renderer it forks in a PID namespace, so a
+    /// renderer can't see or signal the broker/host by pid (defense in depth for
+    /// what `kill`/`ptrace`'s absence already gives). The probe proves a forked
+    /// child becomes PID 1 of a fresh namespace; it skips cleanly (exit 0) where
+    /// the kernel refuses `CLONE_NEWPID`, so this passes everywhere and verifies
+    /// where PID namespaces are available.
+    #[test]
+    fn renderer_gets_a_pid_namespace() {
+        let st = probe("pidns");
+        assert!(st.success(), "expected a fresh PID namespace (or a clean skip), got {st:?}");
     }
 
     /// The fork server's filter is inherited by every renderer it forks, so a

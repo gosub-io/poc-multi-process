@@ -50,6 +50,13 @@ pub fn run(control_fd: &str) {
     // forked below, covering the window before each reaches its own lockdown.
     crate::sandbox::lock_down_fork_server();
 
+    // Pin PID 1 of the renderers' shared PID namespace *before* forking anything
+    // else, so a renderer's death never tears the namespace down (see
+    // `fork_pinned_init`). Must come first: the first child forked into a fresh
+    // PID namespace becomes PID 1, and we want that to be the placeholder, not the
+    // verification canary below (which exits) or a renderer.
+    fork_pinned_init();
+
     // Then prove the filter is right for *this* host's C library before any
     // renderer stakes its life on it. The allowlist depends on how libc issues
     // fork and how it splits descriptors, which varies by glibc version and
@@ -82,8 +89,58 @@ pub fn run(control_fd: &str) {
         }
     }
 
-    // Reap every renderer we forked before exiting, so none is left orphaned.
-    while unsafe { libc::waitpid(-1, std::ptr::null_mut(), 0) } > 0 {}
+    // Reap any content processes that have already exited, without blocking:
+    // the pinned init (PID 1 of the renderers' namespace, where one exists) does
+    // not exit on its own — it dies with us via `PR_SET_PDEATHSIG`, and *that*
+    // tears the namespace down and `SIGKILL`s any renderer still in it, which the
+    // subreaper then collects. A blocking `waitpid(-1)` here would instead hang
+    // forever waiting on that pinned init.
+    while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
+}
+
+/// Fork the pinned "init" for the renderers' shared PID namespace.
+///
+/// When [`crate::sandbox::isolate_network`] created a PID namespace for the fork
+/// server, every child it forks lands in that namespace and the *first* becomes
+/// PID 1 — and a PID namespace is destroyed, `SIGKILL`ing all its members, the
+/// moment its PID 1 exits. If a renderer were PID 1, closing its tab would kill
+/// every other renderer. So we fork one placeholder first, as PID 1, that does
+/// nothing but stay alive; real renderers are then PID 2+, and any of them
+/// exiting leaves the namespace (and its siblings) intact. The placeholder dies
+/// with the fork server via `PR_SET_PDEATHSIG`, which tears the namespace down and
+/// takes any survivors with it.
+///
+/// A no-op where no PID namespace was created (best-effort `unshare` fell back, or
+/// the build lacks it): the placeholder sees a normal pid rather than 1 and exits
+/// immediately, so nothing is pinned and nothing leaks.
+fn fork_pinned_init() {
+    // SAFETY: the fork server is single-threaded, so the child may run normal
+    // code; it touches only allowlisted syscalls (getpid, prctl, nanosleep).
+    match unsafe { libc::fork() } {
+        -1 => eprintln!(
+            "[fork-server] could not fork the pid-ns init ({}); renderers share the namespace unpinned",
+            std::io::Error::last_os_error()
+        ),
+        0 => {
+            // Child. Ask the kernel via the raw syscall (not glibc's possibly
+            // cached `getpid`) whether we are PID 1 of a fresh namespace.
+            let pid = unsafe { libc::syscall(libc::SYS_getpid) };
+            if pid != 1 {
+                // No PID namespace here — nothing to pin.
+                unsafe { libc::_exit(0) };
+            }
+            // Die when the fork server dies (graceful exit or crash); that death
+            // is what tears the namespace down and reaps the renderers.
+            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+            // Stay alive as PID 1, doing nothing. Long sleeps in a loop; every
+            // wake (a stray signal, or the timer) just sleeps again.
+            loop {
+                let req = libc::timespec { tv_sec: 1 << 20, tv_nsec: 0 };
+                unsafe { libc::nanosleep(&req, std::ptr::null_mut()) };
+            }
+        }
+        _ => { /* fork server continues; the init is collected at teardown */ }
+    }
 }
 
 /// What a forked child becomes. Both are content processes forked the same
@@ -105,6 +162,13 @@ fn fork_child(control_fd: RawFd, comp_fd: OwnedFd, kind: Child) {
         0 => {
             // Child — this IS the content process now. It inherited the fork
             // server's warm runtime via copy-on-write; no exec, no re-init.
+            if std::env::var_os("GOSUB_DEBUG_PIDNS").is_some() {
+                // Raw getpid: a small pid (2+, since the pinned init is 1) means
+                // we are in the renderers' PID namespace; a large host pid means
+                // none was created (best-effort fell back).
+                let pid = unsafe { libc::syscall(libc::SYS_getpid) };
+                eprintln!("[fork-server child] ns-local pid = {pid}");
+            }
             unsafe { libc::close(control_fd) }; // never touch the engine's control channel
             let ch = crate::channel::Channel::from_stream(UnixStream::from(comp_fd));
             let ep = Endpoint::from_channel(ch).expect("fork-server child: wrap fd");

@@ -616,14 +616,23 @@ simplified is the surrounding browser. What each entry below still needs:
 - **Sandboxing**: the seccomp filter is production-shaped (fail-closed
   allowlist, SIGSYS-kill-on-violation with the blocked syscall reported, W^X via
   `PROT_EXEC` argument-filtering), and
-  renderers additionally run in an empty **network namespace** (plus **IPC** and
-  **UTS** namespaces) — unshared on the fork server at spawn and inherited by
-  every renderer it `fork()`s, so "a renderer cannot reach the network" no longer
-  rests on the syscall allowlist alone. The two layers fail independently: an
-  allowlist gap is survivable when the namespace has no interfaces to connect
-  through. The net component is the one role that keeps the host netns; the IPC
-  and UTS namespaces are defense in depth for properties seccomp also covers (no
-  shared System V IPC, its own hostname). Separately, every process
+  renderers additionally run in an empty **network namespace** (plus **IPC**,
+  **UTS**, and **PID** namespaces) — unshared on the fork server at spawn and
+  inherited by every renderer it `fork()`s, so "a renderer cannot reach the
+  network" no longer rests on the syscall allowlist alone. The two layers fail
+  independently: an allowlist gap is survivable when the namespace has no
+  interfaces to connect through. The net component is the one role that keeps the
+  host netns; the IPC and UTS namespaces are defense in depth for properties
+  seccomp also covers (no shared System V IPC, its own hostname). The **PID**
+  namespace is the same kind of belt-and-suspenders for `kill`/`ptrace`'s absence
+  — a renderer can't even *name* the broker or host processes by pid. Because
+  `unshare(CLONE_NEWPID)` places the caller's *children* (not the caller) in the
+  new namespace, the fork server's renderers share one, and the fork server pins
+  its PID 1 with a do-nothing placeholder so one renderer exiting can't tear the
+  namespace down and `SIGKILL` its siblings (fault isolation). Per-renderer PID
+  namespaces are blocked by the same `uid_map`-less-userns constraint as the mount
+  namespace; all of this is best-effort and falls back to the rest where a kernel
+  refuses `CLONE_NEWPID`. Separately, every process
   (engine included, in both modes) clears its **dumpable** flag, so other
   software running as the same user cannot `ptrace`-attach or read
   `/proc/<pid>/mem` — the engine's cookie jar is the obvious target, and this is
@@ -634,15 +643,17 @@ simplified is the surrounding browser. What each entry below still needs:
   **broker** gets a loose Landlock too (read/exec anywhere, write only the temp
   dir) plus a **deny-list seccomp filter** (allow by default, `SIGSYS` on the
   escalation syscalls it never uses — `ptrace`, kernel-module loading, `kexec`,
-  `bpf`, `mount`/`setns`). Two namespaces are deliberately *not* added, each blocked by a concrete
-  reason rather than merely unimplemented: an empty-root **mount** namespace
-  needs `pivot_root`, which needs mount capability that the deliberately-unmapped
-  (`uid_map`-less) user namespace does not confer — and writing a `uid_map` to
-  fix that is blocked *both* by AppArmor on modern hosts and by the broker
-  Landlock (`/proc/self/uid_map` is outside the temp dir); a **PID** namespace
-  collides with the fork server's own `clone` hardening and with fault isolation
-  (a shared-namespace PID 1's death would `SIGKILL` every other renderer). Both
-  are documented at `isolate_network` in `src/sandbox/linux.rs`, and seccomp's
+  `bpf`, `mount`/`setns`). Renderers also get a **PID** namespace now (shared
+  across the fork server's renderers, with a pinned PID-1 placeholder so one
+  renderer exiting can't `SIGKILL` its siblings) — so a renderer can't name the
+  broker or host by pid. *Per-renderer* PID namespaces and an empty-root **mount**
+  namespace remain deliberately *not* added, both blocked by the same concrete
+  reason rather than merely unimplemented: each needs capability over a namespace
+  owned by a user namespace the fork server does not control, and its
+  deliberately-unmapped (`uid_map`-less) user namespace confers none — while
+  writing a `uid_map` to fix that is blocked *both* by AppArmor on modern hosts
+  and by the broker Landlock (`/proc/self/uid_map` is outside the temp dir). It is
+  documented at `isolate_network` in `src/sandbox/linux.rs`, and seccomp's
   `open`/`openat` and `kill`/`ptrace` denials cover the properties regardless.
   Also still wanted: a per-arch seccomp baseline tested across libc/kernel
   versions. And several of the tightest limits here (W^X, no renderer threads,
@@ -651,8 +662,8 @@ simplified is the surrounding browser. What each entry below still needs:
   elsewhere; see *What a real renderer would force open* above.
 
   **Platform status.** Linux is the reference implementation: seccomp, empty
-  net/IPC/UTS namespaces, rlimits, non-dumpable processes, broker Landlock + a
-  seccomp deny-list, best-effort per-child cgroup v2 `memory.max`, 20 probes.
+  net/IPC/UTS/PID namespaces, rlimits, non-dumpable processes, broker Landlock + a
+  seccomp deny-list, best-effort per-child cgroup v2 `memory.max`, 21 probes.
   macOS runs a Seatbelt `(deny default)`
   profile with 12 probes — including **path-scoped file services** (storage/font
   get `subpath` read/write grants for their own directory plus a broad

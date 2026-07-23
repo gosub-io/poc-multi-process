@@ -84,6 +84,8 @@ pub const PROBES: &[&str] = &[
     #[cfg(target_os = "linux")]
     "netns",
     #[cfg(target_os = "linux")]
+    "pidns",
+    #[cfg(target_os = "linux")]
     "no-ptrace",
     #[cfg(target_os = "linux")]
     "forkserver-can-fork",
@@ -871,6 +873,51 @@ fn run_platform_probe(probe: &str) {
         assert_ne!(ipc0, ns_link("ipc"), "still in the host IPC namespace");
         assert_ne!(uts0, ns_link("uts"), "still in the host UTS namespace");
         std::process::exit(0);
+    }
+
+    if probe == "pidns" {
+        // `isolate_network` also requests a PID namespace, which (because
+        // `unshare(CLONE_NEWPID)` is lazy) places the caller's *children* — not
+        // the caller — in it. So prove it the way the fork server relies on:
+        // after the unshare, a forked child must be PID 1 of a fresh namespace.
+        // Best-effort like the real path — where the kernel refused CLONE_NEWPID
+        // and it fell back, the child is not PID 1, and we skip (exit 0) rather
+        // than fail a host that cannot make PID namespaces.
+        crate::sandbox::isolate_network(true).expect("unshare namespaces");
+        // SAFETY: single-threaded probe; child runs only getpid + _exit.
+        match unsafe { libc::fork() } {
+            -1 => {
+                eprintln!("[selftest] pidns: fork failed: {}", std::io::Error::last_os_error());
+                std::process::exit(1);
+            }
+            0 => {
+                // Raw getpid (not glibc's possibly-cached wrapper): 1 ⇒ we are
+                // init of a fresh PID namespace. Carry the answer in the code.
+                let pid = unsafe { libc::syscall(libc::SYS_getpid) };
+                unsafe { libc::_exit(if pid == 1 { 0 } else { 40 }) };
+            }
+            child => {
+                let mut st = 0;
+                if unsafe { libc::waitpid(child, &mut st, 0) } != child {
+                    eprintln!("[selftest] pidns: could not reap the child");
+                    std::process::exit(1);
+                }
+                match libc::WEXITSTATUS(st) {
+                    0 => {
+                        eprintln!("[selftest] pidns: child is PID 1 of a fresh namespace (ok)");
+                        std::process::exit(0);
+                    }
+                    40 => {
+                        eprintln!("[selftest] pidns: CLONE_NEWPID unavailable (fell back) — skipping");
+                        std::process::exit(0);
+                    }
+                    other => {
+                        eprintln!("[selftest] pidns: unexpected child exit {other}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
     }
 
     // Also pre-lockdown, for the same reason: `prctl` is not on the allowlist,
