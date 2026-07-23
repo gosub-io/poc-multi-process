@@ -1053,6 +1053,7 @@ impl EngineLoop {
                     // zone's cookies. These values go to the network process,
                     // never back to the renderer.
                     let cookies = attachable_cookies(&self.cookies, tab.zone, &tab.origin);
+                    observe_cookies("fetch", tab.zone, &tab.origin, &cookies);
                     self.pending_fetches.insert(request_id, tab_id);
                     tab.inflight_fetches += 1;
                     let req = NetRequest::Fetch {
@@ -1082,11 +1083,9 @@ impl EngineLoop {
                     // *non-HttpOnly* cookies — the `document.cookie` view — so an
                     // exploited renderer never sees its origin's session token.
                     let reply = if requested == tab.origin {
-                        ToRenderer::Cookies(Some(visible_cookies(
-                            &self.cookies,
-                            tab.zone,
-                            &requested,
-                        )))
+                        let visible = visible_cookies(&self.cookies, tab.zone, &requested);
+                        observe_cookies("document.cookie", tab.zone, &requested, &visible);
+                        ToRenderer::Cookies(Some(visible))
                     } else {
                         ToRenderer::Cookies(None)
                     };
@@ -1739,6 +1738,20 @@ fn may_fetch(tab_origin: &str, url: &str) -> bool {
 /// cookies never travel on another zone's request. Safe to attach by
 /// `tab.origin` only because [`may_fetch`] has already confirmed the request's
 /// destination *is* `tab.origin`.
+/// Test/debug observability of the cookie flow, gated by `GOSUB_OBSERVE_COOKIES`
+/// so it is silent in normal operation. Prints to the broker's **stdout** — a
+/// single process, distinct from the child processes' *shared* stderr — so an
+/// integration test can assert the HttpOnly property deterministically, without
+/// the mid-line interleaving that makes combined child stderr unreliable. `kind`
+/// is `"document.cookie"` (the visible set sent to a renderer) or `"fetch"` (the
+/// full set attached to an outbound request).
+fn observe_cookies(kind: &str, zone: ZoneId, origin: &str, cookies: &[(String, String)]) {
+    if std::env::var_os("GOSUB_OBSERVE_COOKIES").is_some() {
+        let names = cookies.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(",");
+        println!("[observe] zone {} {kind} {origin} = [{names}]", zone.0);
+    }
+}
+
 fn attachable_cookies(
     jar: &HashMap<(ZoneId, String), Vec<Cookie>>,
     zone: ZoneId,

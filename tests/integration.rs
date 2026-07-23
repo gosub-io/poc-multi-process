@@ -85,6 +85,52 @@ fn default_run_renders_and_shuts_down() {
     assert!(after_swap.contains("frame ready"), "swapped renderer produced no frame:\n{stdout}");
 }
 
+/// End-to-end cookie flow — the HttpOnly and `(zone, origin)`-partition
+/// properties — asserted on the broker's **stdout**. The broker is a single
+/// process, so its stdout can be matched deterministically; the child processes
+/// share one stderr fd and their lines interleave mid-token, so combined stderr
+/// is not reliable for assertions. `GOSUB_OBSERVE_COOKIES` makes the engine print
+/// the visible set it hands a renderer (`document.cookie`) and the full set it
+/// attaches to an outbound fetch. The demo sets an HttpOnly `session` + a visible
+/// `theme` in the work zone (0), and only an HttpOnly `session` in the personal
+/// zone (1).
+///
+/// This is the regression net the vault cutover must keep green: whatever moves
+/// the cookie jar out of the broker, these properties must still hold.
+#[test]
+fn cookie_flow_hides_httponly_and_partitions_by_zone() {
+    let out = run_env(&[], &[("GOSUB_OBSERVE_COOKIES", "1")]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exit {:?}\nstdout: {stdout}", out.status);
+
+    // document.cookie exposes the non-HttpOnly cookie…
+    assert!(
+        stdout.contains("zone 0 document.cookie https://example.com = [theme]"),
+        "work document.cookie should expose only the non-HttpOnly `theme`:\n{stdout}"
+    );
+    // …and NEVER the HttpOnly session, in any document.cookie line. This is the
+    // load-bearing property: a session token must not enter a renderer.
+    for line in stdout.lines().filter(|l| l.contains("document.cookie")) {
+        assert!(!line.contains("session"), "HttpOnly `session` leaked into document.cookie:\n{line}");
+    }
+    // Partition: the personal zone's document.cookie is empty — it never sees the
+    // work zone's `theme`, and its own cookie is HttpOnly so also hidden.
+    assert!(
+        stdout.contains("zone 1 document.cookie https://example.com = []"),
+        "personal document.cookie should be empty (partition + HttpOnly):\n{stdout}"
+    );
+    // The HttpOnly session DOES reach the network — attached to the outbound
+    // fetch — having skipped the renderer's address space entirely.
+    assert!(
+        stdout.contains("zone 0 fetch https://example.com = [session,theme]"),
+        "work fetch should attach both cookies incl. the HttpOnly session:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("zone 1 fetch https://example.com = [session]"),
+        "personal fetch should attach its own session:\n{stdout}"
+    );
+}
+
 /// Every rendered page decodes an image in a throwaway process; the renderer
 /// byte-compares the result and reports on stderr. Seeing this proves the whole
 /// broker → fork → decode → return path works across the process boundary.
