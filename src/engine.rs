@@ -150,6 +150,11 @@ enum LoopMsg {
     StorageReply { request_id: u64, value: Option<Vec<u8>> },
     /// The font service answered a metrics request.
     FontReply { request_id: u64, metrics: Option<crate::ipc::FontMetrics> },
+    /// A brokered filesystem service (storage/font) died without a shutdown. The
+    /// loop fails its in-flight requests and respawns it, bounded by
+    /// [`MAX_SERVICE_RESTARTS`]. Sent by the service reader thread on EOF when its
+    /// gate is still open (an intentional shutdown closes the gate first).
+    ServiceGone { service: ServiceKind },
 }
 
 /// A running child component, however it is hosted.
@@ -182,6 +187,12 @@ const MAX_INFLIGHT_DECODES: usize = 8;
 /// never reaped. Generous relative to real decode time; mirrors the ring's
 /// [`crate::ring`] stall timeout in spirit.
 const DECODE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Respawn bound for the brokered filesystem services (see [`ServiceRestartTracker`]).
+/// A service that dies more than this many times within the window is not brought
+/// back — its requests then fail fast instead of the engine spin-respawning it.
+const MAX_SERVICE_RESTARTS: usize = 5;
+const SERVICE_RESTART_WINDOW: Duration = Duration::from_secs(60);
 
 /// How long the engine will block handing a reply to a renderer before giving up
 /// on it. A well-behaved renderer always drains its replies promptly (it asked
@@ -412,6 +423,10 @@ struct EngineLoop {
     devices: Vec<ServiceLink>,
     /// Renderer-crash history for the crash-loop guard (see [`CrashTracker`]).
     crashes: CrashTracker,
+    /// Per-service respawn history for the respawn bound (see [`respawn_service`]).
+    ///
+    /// [`respawn_service`]: EngineLoop::respawn_service
+    service_restarts: ServiceRestartTracker,
     next_tab_id: u64,
     next_request_id: u64,
     /// Monotonic renderer-generation counter. Every renderer (an `open_tab` or a
@@ -426,6 +441,53 @@ struct EngineLoop {
 struct ServiceLink {
     tx: EndpointTx,
     handle: ChildHandle,
+}
+
+/// Which brokered filesystem service a [`LoopMsg::ServiceGone`] / respawn refers
+/// to. Only these two are respawnable: each has its own reader thread and pending
+/// map, so its death is observable and its in-flight work can be failed cleanly.
+/// The device stubs are never messaged (nothing to respawn *for*), and the net
+/// component and fork server are deliberately excluded — respawning them is more
+/// invasive (net owns two pending maps + streaming and every tab depends on it;
+/// the fork server owns the warm zygote and the shared PID namespace) and is left
+/// as follow-up work.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum ServiceKind {
+    Storage,
+    Font,
+}
+
+impl ServiceKind {
+    fn role_name(self) -> &'static str {
+        match self {
+            ServiceKind::Storage => "storage",
+            ServiceKind::Font => "font",
+        }
+    }
+}
+
+/// The respawn bound: a service that keeps dying (a poisoned input, or a
+/// deliberate kill loop) must not make the engine spin-respawn forever. The
+/// service analogue of the renderer [`CrashTracker`] — stale entries pruned on
+/// each touch, so it stays bounded.
+#[derive(Default)]
+struct ServiceRestartTracker {
+    history: HashMap<ServiceKind, Vec<Instant>>,
+}
+
+impl ServiceRestartTracker {
+    /// Record a restart attempt for `service` at `now`; returns `false` once it
+    /// has restarted `MAX_SERVICE_RESTARTS` times within `SERVICE_RESTART_WINDOW`
+    /// (the bound is reached — stop respawning).
+    fn allow(&mut self, service: ServiceKind, now: Instant) -> bool {
+        let hist = self.history.entry(service).or_default();
+        hist.retain(|t| now.duration_since(*t) < SERVICE_RESTART_WINDOW);
+        if hist.len() >= MAX_SERVICE_RESTARTS {
+            return false;
+        }
+        hist.push(now);
+        true
+    }
 }
 
 impl EngineLoop {
@@ -473,56 +535,22 @@ impl EngineLoop {
         crate::storage::ensure_dir();
         crate::font::ensure_font_file();
 
-        // The storage service: reader thread forwards `StorageResponse`s into
-        // the inbox, gated like the net component.
+        // The brokered filesystem services: each gets a reader thread that
+        // forwards its responses into the inbox (gated like the net component)
+        // and, on an *unexpected* death, asks the loop to respawn it. Extracted
+        // to helpers so the respawn path wires an identical reader (see
+        // `respawn_service`).
         let (storage_handle, ep) =
             spawner.spawn(Role::Service("storage")).expect("spawn storage service at startup");
-        let (storage_tx, mut storage_rx) = ep.split();
+        let (storage_tx, storage_rx) = ep.split();
         let storage_gate = Gate::new(MAX_QUEUED_PER_SOURCE);
-        {
-            let inbox = inbox.clone();
-            let gate = Arc::clone(&storage_gate);
-            std::thread::spawn(move || {
-                crate::sandbox::install_thread_crash_altstack();
-                while let Ok(resp) = storage_rx.recv::<StorageResponse>() {
-                    if !gate.acquire() {
-                        break;
-                    }
-                    let msg = LoopMsg::StorageReply {
-                        request_id: resp.request_id,
-                        value: resp.value,
-                    };
-                    if inbox.send(msg).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+        Self::spawn_storage_reader(inbox.clone(), storage_rx, Arc::clone(&storage_gate));
 
-        // The font service: same shape, forwarding `FontResponse`s.
         let (font_handle, ep) =
             spawner.spawn(Role::Service("font")).expect("spawn font service at startup");
-        let (font_tx, mut font_rx) = ep.split();
+        let (font_tx, font_rx) = ep.split();
         let font_gate = Gate::new(MAX_QUEUED_PER_SOURCE);
-        {
-            let inbox = inbox.clone();
-            let gate = Arc::clone(&font_gate);
-            std::thread::spawn(move || {
-                crate::sandbox::install_thread_crash_altstack();
-                while let Ok(resp) = font_rx.recv::<FontResponse>() {
-                    if !gate.acquire() {
-                        break;
-                    }
-                    let msg = LoopMsg::FontReply {
-                        request_id: resp.request_id,
-                        metrics: resp.metrics,
-                    };
-                    if inbox.send(msg).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+        Self::spawn_font_reader(inbox.clone(), font_rx, Arc::clone(&font_gate));
 
         // The device stubs: spawned and confined, then left idle. No reader
         // thread — they are never messaged; the engine only holds their links
@@ -557,6 +585,7 @@ impl EngineLoop {
             pending_font: HashMap::new(),
             devices,
             crashes: CrashTracker::default(),
+            service_restarts: ServiceRestartTracker::default(),
             next_tab_id: 0,
             next_request_id: 0,
             next_epoch: 0,
@@ -677,6 +706,9 @@ impl EngineLoop {
                 LoopMsg::FontReply { request_id, metrics } => {
                     self.font_reply(request_id, metrics);
                     self.font_gate.release();
+                }
+                LoopMsg::ServiceGone { service } => {
+                    self.respawn_service(service);
                 }
             }
         }
@@ -1178,6 +1210,117 @@ impl EngineLoop {
             return;
         };
         self.send_to_tab(tab_id, &ToRenderer::FontResult(metrics));
+    }
+
+    /// Reader thread for the storage service: forward each response into the
+    /// inbox (taking a gate permit first, for backpressure), and on an
+    /// *unexpected* death — recv EOF with the gate still open — ask the loop to
+    /// respawn it. An intentional teardown closes the gate first (as at
+    /// shutdown), so `is_closed()` suppresses the respawn request, exactly like
+    /// the tab reader distinguishes a swap from a crash.
+    fn spawn_storage_reader(inbox: Sender<LoopMsg>, mut rx: crate::ipc::EndpointRx, gate: Arc<Gate>) {
+        std::thread::spawn(move || {
+            crate::sandbox::install_thread_crash_altstack();
+            while let Ok(resp) = rx.recv::<StorageResponse>() {
+                if !gate.acquire() {
+                    break;
+                }
+                let msg = LoopMsg::StorageReply { request_id: resp.request_id, value: resp.value };
+                if inbox.send(msg).is_err() {
+                    break;
+                }
+            }
+            if !gate.is_closed() {
+                let _ = inbox.send(LoopMsg::ServiceGone { service: ServiceKind::Storage });
+            }
+        });
+    }
+
+    /// Reader thread for the font service — same shape as [`spawn_storage_reader`].
+    fn spawn_font_reader(inbox: Sender<LoopMsg>, mut rx: crate::ipc::EndpointRx, gate: Arc<Gate>) {
+        std::thread::spawn(move || {
+            crate::sandbox::install_thread_crash_altstack();
+            while let Ok(resp) = rx.recv::<FontResponse>() {
+                if !gate.acquire() {
+                    break;
+                }
+                let msg = LoopMsg::FontReply { request_id: resp.request_id, metrics: resp.metrics };
+                if inbox.send(msg).is_err() {
+                    break;
+                }
+            }
+            if !gate.is_closed() {
+                let _ = inbox.send(LoopMsg::ServiceGone { service: ServiceKind::Font });
+            }
+        });
+    }
+
+    /// A brokered service died without a shutdown: fail everything that was
+    /// in flight to it (those replies will never come, so the waiting renderers
+    /// must hear a failure rather than hang), then respawn it — bounded, so a
+    /// service that keeps dying is eventually left down and its requests fail fast
+    /// rather than the engine spin-respawning forever.
+    ///
+    /// A respawned service self-confines with the same filter + Landlock as at
+    /// startup, so there is no privilege regression. New requests that arrive
+    /// while it is down (or given-up) fail fast at the send site in `tab_request`
+    /// (a failed `tx.send` already replies `None`), so no request is left hanging.
+    fn respawn_service(&mut self, service: ServiceKind) {
+        // Fail the requests lost with the dead process first.
+        self.fail_pending_for(service);
+
+        if !self.service_restarts.allow(service, Instant::now()) {
+            eprintln!(
+                "[engine] {} service died {MAX_SERVICE_RESTARTS}+ times in {}s — not respawning; its requests will fail",
+                service.role_name(),
+                SERVICE_RESTART_WINDOW.as_secs()
+            );
+            return;
+        }
+
+        let Some((handle, ep)) = self.spawner.spawn(Role::Service(service.role_name())) else {
+            eprintln!("[engine] could not respawn {} service", service.role_name());
+            return;
+        };
+        let (tx, rx) = ep.split();
+        let gate = Gate::new(MAX_QUEUED_PER_SOURCE);
+        let old = match service {
+            ServiceKind::Storage => {
+                Self::spawn_storage_reader(self.inbox.clone(), rx, Arc::clone(&gate));
+                self.storage_gate = gate;
+                std::mem::replace(&mut self.storage, ServiceLink { tx, handle })
+            }
+            ServiceKind::Font => {
+                Self::spawn_font_reader(self.inbox.clone(), rx, Arc::clone(&gate));
+                self.font_gate = gate;
+                std::mem::replace(&mut self.font, ServiceLink { tx, handle })
+            }
+        };
+        // Reap the dead process (kill-before-join so a not-yet-fully-exited one
+        // can't hang the loop).
+        let mut old_handle = old.handle;
+        kill_child(&mut old_handle);
+        join(old_handle);
+        eprintln!("[engine] respawned {} service after it died", service.role_name());
+    }
+
+    /// Fail every request in flight to `service`, replying `None` to each waiting
+    /// tab (via [`send_to_tab`], which drops a tab whose own send then fails).
+    ///
+    /// [`send_to_tab`]: EngineLoop::send_to_tab
+    fn fail_pending_for(&mut self, service: ServiceKind) {
+        match service {
+            ServiceKind::Storage => {
+                for (_id, tab_id) in std::mem::take(&mut self.pending_storage) {
+                    self.send_to_tab(tab_id, &ToRenderer::StorageResult(None));
+                }
+            }
+            ServiceKind::Font => {
+                for (_id, tab_id) in std::mem::take(&mut self.pending_font) {
+                    self.send_to_tab(tab_id, &ToRenderer::FontResult(None));
+                }
+            }
+        }
     }
 
     /// Fork a throwaway decoder for one image, hand it the bytes, and arrange
@@ -1836,6 +1979,29 @@ mod tests {
         // is a *recent*-crash backoff, not a permanent ban.
         let later = t0 + CRASH_LOOP_WINDOW + Duration::from_secs(1);
         assert!(!t.is_looping(z, "https://x", later), "stale crashes prune away");
+    }
+
+    #[test]
+    fn service_respawn_bound_trips_then_recovers() {
+        let mut t = ServiceRestartTracker::default();
+        let t0 = Instant::now();
+
+        // Up to the limit, respawns are allowed.
+        for i in 0..MAX_SERVICE_RESTARTS {
+            let at = t0 + Duration::from_secs(i as u64);
+            assert!(t.allow(ServiceKind::Font, at), "restart {i} should be allowed");
+        }
+        // The next restart within the window is refused — stop respawning.
+        let at = t0 + Duration::from_secs(MAX_SERVICE_RESTARTS as u64);
+        assert!(!t.allow(ServiceKind::Font, at), "past the limit, no more respawns");
+
+        // The bound is per service: storage is unaffected by font's deaths.
+        assert!(t.allow(ServiceKind::Storage, t0), "a different service is independent");
+
+        // Once the deaths age out of the window, the service may respawn again —
+        // a recent-death backoff, not a permanent ban.
+        let later = t0 + SERVICE_RESTART_WINDOW + Duration::from_secs(5);
+        assert!(t.allow(ServiceKind::Font, later), "stale deaths prune away");
     }
 
     fn pair(a: &str, b: &str) -> (String, String) {
