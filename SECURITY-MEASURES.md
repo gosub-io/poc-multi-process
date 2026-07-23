@@ -51,7 +51,7 @@ fork+exec from the engine instead, with its own wider filter.
 | **Site isolation**: one renderer per `(zone, origin)`; the same origin in two zones is two processes with independent partitions | `engine.rs` | Applied |
 | **Ephemeral image decoder** — one process decodes exactly one image and exits, so a decoder can never see a second origin's data | `decoder.rs` (`serve_one`) | Applied |
 | Renderers hold **no secrets** — no cookies, no network handle; they can only send IPC messages | `renderer.rs` | Applied |
-| **Cross-origin navigation swaps renderers** — a cross-origin navigation tears down the tab's renderer and brings up a fresh process bound to the new origin (Chromium's `RenderFrameHost` change), so two origins never share a process | `engine.rs` | Applied |
+| **Cross-origin navigation swaps renderers** — a cross-origin navigation tears down the tab's renderer and brings up a fresh process bound to the new origin (Chromium's `RenderFrameHost` change), so two origins never share a process. The swap reuses the `tab_id`, so each renderer generation carries a monotonic **epoch**: a message the old renderer already queued is dropped rather than processed against the new origin (which would be a cross-origin storage write) | `engine.rs` | Applied |
 | Crash containment — a dead renderer surfaces as `TabCrashed` for that tab only; engine and other tabs continue | `engine.rs` | Applied |
 | **Crash-loop guard** — an origin that crashes its renderer `CRASH_LOOP_THRESHOLD`+ times within a window is refused a fresh one (`OpenTabFailed`/`NavigationFailed`) instead of being respawned into a loop; the backoff is scoped to `(zone, origin)` and expires with the window | `engine.rs` (`CrashTracker`) | Applied |
 | Fork server is **minimal, single-threaded and secret-free**, and is started *before* the engine loads any cookies | `fork_server.rs` | Applied |
@@ -160,8 +160,14 @@ discipline, per transport role:
 inspect, so no attacker-controlled bytes ever reach a path: the
 `(zone, origin, key)` tuple is composed **with length prefixes** (so distinct
 tuples cannot alias) and hashed; the filename is pure `[0-9a-f]` hex. A key of
-`../../../../etc/passwd` cannot escape the directory. Landlock is the second,
-kernel-level guard.
+`../../../../etc/passwd` cannot escape the directory. The hash is **keyed with a
+per-run random secret** (`RandomState`/SipHash), *not* a fixed-key hash: the
+`key` is renderer-controlled, so an unkeyed invertible hash (FNV and friends)
+would let a compromised renderer *construct* a key whose filename collides with
+another origin's slot — a cross-origin read/write that defeats the partition. A
+keyed PRF the renderer cannot observe makes that collision unconstructible; the
+secret need not survive a restart (filenames are per-service-lifetime, the same
+scope as the in-memory quota). Landlock is the second, kernel-level guard.
 
 **Font service (`font.rs`)** — returns only *derived* data (metrics), never the
 font bytes, so a renderer never handles the file.

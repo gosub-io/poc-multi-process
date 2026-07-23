@@ -233,7 +233,12 @@ capability the zygote gave up cannot be its child.
   read-only file. Storage is additionally keyed by the `(zone, origin)` the
   *engine* stamps (never a message claim), and the renderer's key is hashed into
   the filename rather than spliced into a path — so path traversal is guarded at
-  the application level *and* by the kernel. It is also **byte-bounded**: each
+  the application level *and* by the kernel. That filename hash is **keyed with a
+  per-run random secret** (SipHash), because the key is renderer-controlled: an
+  unkeyed invertible hash would let a compromised renderer craft a key whose
+  filename collides with another origin's slot (a cross-origin read/write), while
+  a keyed PRF it cannot observe makes the collision unconstructible. It is also
+  **byte-bounded**: each
   value is capped (`MAX_VALUE_BYTES`) and the store is held to a lifetime budget
   (`MAX_STORE_BYTES`) tracked with an in-memory running counter — accounting an
   overwrite as a delta, and needing no directory-enumeration syscall — so a
@@ -265,7 +270,11 @@ capability the zygote gave up cannot be its child.
   a fresh process bound to the new `(zone, origin)`, the way Chromium changes
   `RenderFrameHost`, rather than letting one process serve two origins. The
   teardown is distinguished from a crash (the tab's gate is closed first) so the
-  reused tab id never surfaces a spurious `TabCrashed`.
+  reused tab id never surfaces a spurious `TabCrashed`. Because the swap reuses
+  the tab id, each renderer generation carries a monotonic **epoch**: a message
+  the old renderer had already queued is dropped rather than processed against
+  the new origin — otherwise it would be stamped with the new `(zone, origin)`
+  and, for a storage write, land in the new origin's partition.
 - **HttpOnly cookies never reach a renderer.** Cookies carry an `http_only`
   flag; the net component receives all of a request's cookies to attach to the
   outbound fetch (it must — that's how authenticated requests work), but a
@@ -616,7 +625,7 @@ explore far more.
 | `src/ip_utils.rs` | SSRF policy: URL host extraction, IP-literal parsing (incl. `inet_aton` encodings), blocked-range classification |
 | `src/renderer.rs` | Per-`(zone,origin)` renderer: `serve` loop, placeholder render pipeline |
 | `src/decoder.rs` | Ephemeral image decoder: bounds-checked `GIMG` parser, decodes one image and exits |
-| `src/storage.rs` | Storage service: per-`(zone,origin)` key/value store, keys hashed into filenames |
+| `src/storage.rs` | Storage service: per-`(zone,origin)` key/value store, keys hashed (per-run keyed SipHash) into filenames |
 | `src/font.rs` | Font service: opens a font file, returns only metrics |
 | `src/device_service.rs` | Audio + GPU stubs: confined with a device filter, no real work |
 | `src/fork_server.rs` | Fork server (Linux): `fork()`s renderers without exec |
