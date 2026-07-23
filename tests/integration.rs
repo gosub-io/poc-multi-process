@@ -561,6 +561,7 @@ mod probe_inventory {
         "service-landlock",
         "broker-landlock",
         "broker-seccomp",
+        "cgroup-memory-limit",
     ];
 
     /// The Seatbelt profile's enforcement. `PT_DENY_ATTACH` and the rlimits
@@ -775,6 +776,18 @@ mod sandbox_enforcement {
         let st = probe("broker-seccomp");
         assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (ptrace denied), got {st:?}");
         assert!(st.code().is_none(), "should be killed, not exit");
+    }
+
+    /// The cgroup v2 memory bound — the physical-RSS limit rlimits can't give,
+    /// with a scoped OOM kill. The probe places itself in a `memory.max`-limited
+    /// child cgroup and reads the ceiling back. Best-effort: where cgroup v2
+    /// memory delegation isn't available (a shared scope, no `Delegate=yes`) it
+    /// skips cleanly (exit 0), so this passes everywhere and *verifies* under a
+    /// delegated scope. Either way a non-zero exit means the limit misbound.
+    #[test]
+    fn cgroup_memory_limit_binds_or_skips() {
+        let st = probe("cgroup-memory-limit");
+        assert!(st.success(), "cgroup memory.max should bind (or skip cleanly), got {st:?}");
     }
 
     #[test]

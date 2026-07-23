@@ -113,10 +113,13 @@ what Chromium and Firefox do. Naming them keeps the honest ones honest and stops
   JIT-less: V8's pointer-compression cage reserves ~4 GiB up front, so that cap
   would kill it at init. The PoC now bounds the *heap* instead — `RLIMIT_DATA`,
   which since Linux 4.7 ignores `PROT_NONE` reservations — with a generous 16 GiB
-  `RLIMIT_AS` kept only as a virtual sanity ceiling. The step a real browser adds
-  on top is a true *physical* bound whose OOM kill is scoped to the offending
-  renderer (cgroup `memory.max`); the rlimit is the cheap, self-applied
-  approximation. Chromium likewise does not `RLIMIT_AS` its renderers.
+  `RLIMIT_AS` kept only as a virtual sanity ceiling. On top of that, the engine
+  now places each spawned child in its own **cgroup v2 `memory.max`** (best-effort
+  — the real *physical* bound, whose OOM kill is scoped to the offending child
+  rather than the global killer reaching the broker); the rlimit is the
+  self-applied approximation that still applies where cgroup delegation is absent.
+  Chromium likewise does not `RLIMIT_AS` its renderers. (Per-*renderer* cgroups
+  are a further step — see the cgroup note in `src/sandbox/linux.rs`.)
 - **Zero file opens** — a real renderer still needs runtime `openat` for
   ICU/locale data, fonts, the GPU shader cache, `dlopen`'d libraries, and
   `/proc/self/maps`; "no `openat` ever" is tighter than reality. It moves to a
@@ -313,9 +316,13 @@ capability the zygote gave up cannot be its child.
   `RLIMIT_AS` sanity ceiling, plus `RLIMIT_NOFILE` and `RLIMIT_CORE=0`. seccomp
   caps *what* a child may do; these cap *how much*, so a compromised renderer
   can't exhaust host memory/fds — an over-allocation aborts that process, not the
-  machine — and a crash won't dump a core full of secrets. (A production browser
-  bounds true RSS with a cgroup `memory.max`; see *What a real renderer would
-  force open*.)
+  machine — and a crash won't dump a core full of secrets. On top of the rlimits,
+  the engine places each spawned child in its own **cgroup v2 `memory.max`** where
+  the platform allows it (a systemd scope with `Delegate=yes`, or root) — a true
+  RSS bound whose OOM kill is scoped to the offending child rather than the global
+  killer reaching the broker; it degrades to rlimits-only in a shared scope. This
+  is the parent-side `confine_spawned_child` seam, the Linux analogue of the
+  Windows job-object memory cap.
 - On the IPC side, the shared event-loop inbox is **bounded per source**. Every
   component (each renderer, the net process) may have at most
   `MAX_QUEUED_PER_SOURCE` messages queued-but-unprocessed: its reader thread
@@ -645,7 +652,8 @@ simplified is the surrounding browser. What each entry below still needs:
 
   **Platform status.** Linux is the reference implementation: seccomp, empty
   net/IPC/UTS namespaces, rlimits, non-dumpable processes, broker Landlock + a
-  seccomp deny-list, 19 probes. macOS runs a Seatbelt `(deny default)`
+  seccomp deny-list, best-effort per-child cgroup v2 `memory.max`, 20 probes.
+  macOS runs a Seatbelt `(deny default)`
   profile with 12 probes — including **path-scoped file services** (storage/font
   get `subpath` read/write grants for their own directory plus a broad
   `file-read-metadata` so path lookup resolves, while contents outside the scope

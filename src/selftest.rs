@@ -107,6 +107,8 @@ pub const PROBES: &[&str] = &[
     "broker-landlock",
     #[cfg(target_os = "linux")]
     "broker-seccomp",
+    #[cfg(target_os = "linux")]
+    "cgroup-memory-limit",
     #[cfg(target_os = "macos")]
     "seatbelt-file",
     #[cfg(target_os = "macos")]
@@ -944,6 +946,34 @@ fn run_platform_probe(probe: &str) {
         unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) };
         eprintln!("[selftest] broker-seccomp: ptrace was NOT denied — deny-list did not bind");
         std::process::exit(1);
+    }
+
+    // cgroup v2 per-child memory bound: place this process in a child cgroup with
+    // a known `memory.max` and read it back, proving the limit actually binds.
+    // Best-effort like the Landlock probes — where cgroup v2 memory delegation is
+    // unavailable (a shared login/tmux scope, no `Delegate=yes`), it skips (exit
+    // 0) rather than failing an untestable host. Run under a delegated scope
+    // (`systemd-run --user -p Delegate=yes --scope …`) to exercise the real path.
+    if probe == "cgroup-memory-limit" {
+        const WANT: u64 = 64 * 1024 * 1024;
+        match crate::sandbox::cgroup_confine_self(WANT) {
+            None => {
+                eprintln!("[selftest] cgroup v2 memory delegation unavailable — skipping");
+                std::process::exit(0);
+            }
+            Some(Ok(got)) if got == WANT => {
+                eprintln!("[selftest] cgroup-memory-limit: memory.max read back {got} (ok)");
+                std::process::exit(0);
+            }
+            Some(Ok(got)) => {
+                eprintln!("[selftest] cgroup-memory-limit: memory.max was {got}, wanted {WANT}");
+                std::process::exit(1);
+            }
+            Some(Err(e)) => {
+                eprintln!("[selftest] cgroup-memory-limit: could not apply the limit ({e})");
+                std::process::exit(1);
+            }
+        }
     }
 
     // Fork-server probes: this role's filter is not the renderer's, and it is

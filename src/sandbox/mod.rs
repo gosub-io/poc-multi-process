@@ -43,7 +43,7 @@
 //! | [`lock_down_renderer`]   | after the IPC link is connected | renderer |
 //! | [`lock_down_net`]        | after the IPC link is connected | net component |
 //!
-//! | [`confine_spawned_child`] | immediately after spawn, **by the parent** | children (Windows only in effect) |
+//! | [`confine_spawned_child`] | immediately after spawn, **by the parent** | children (Windows job object; Linux cgroup memory bound) |
 //!
 //! Linux additionally has [`lock_down_fork_server`], which is not part of the
 //! cross-platform contract: no other backend has a zygote to confine.
@@ -194,21 +194,39 @@ pub fn lock_down_service(name: &str, caps: ServiceCaps, fs_allow: &[(&std::path:
 /// does this *to* the child. Windows needs it because its access controls
 /// (here a job object; later a restricted token and an AppContainer) can only
 /// be attached from outside — see the note below on why the contract assumed
-/// otherwise. On Linux and macOS confinement is entirely self-applied, so this
-/// is a no-op there and the platforms stay symmetric at the call site.
+/// otherwise. **Linux** uses it too, for the one bound a process cannot set on
+/// itself usefully: a cgroup v2 `memory.max` places the child in its own
+/// memory-limited cgroup (the RSS analogue of the Windows job-object memory cap),
+/// best-effort. macOS confinement is entirely self-applied, so this stays a no-op
+/// there and the platforms keep a symmetric call site.
 ///
-/// Called immediately after spawn, before the child has done any work.
+/// Called immediately after spawn, before the child has done any work. The
+/// Windows path is fail-closed; the Linux cgroup bound is best-effort (never
+/// fatal — a child that can't be cgroup-limited still runs, rlimit-bounded).
 #[cfg(feature = "multi-process")]
 pub fn confine_spawned_child(child: &crate::spawn::Child) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
         return imp::confine_spawned_child(child.raw_handle());
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        // Best-effort cgroup memory bound (never fatal); see the backend.
+        return imp::confine_spawned_child(child.id());
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = child;
         Ok(())
     }
+}
+
+/// Test hook for the `cgroup-memory-limit` probe: bound this process's memory via
+/// cgroup v2 `memory.max` and read the ceiling back, or `None` where cgroup v2
+/// memory delegation is unavailable (the probe then skips). Linux only.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn cgroup_confine_self(limit: u64) -> Option<std::io::Result<u64>> {
+    imp::cgroup_confine_self(limit)
 }
 
 /// Build a restricted primary token for a Windows child, or `None` if the host

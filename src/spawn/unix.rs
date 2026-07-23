@@ -16,6 +16,12 @@ impl Child {
     pub fn wait(&mut self) -> io::Result<()> {
         self.0.wait().map(|_| ())
     }
+
+    /// The child's process id — needed so the parent can place it in its own
+    /// cgroup (the Linux half of `confine_spawned_child`).
+    pub fn id(&self) -> u32 {
+        self.0.id()
+    }
 }
 
 /// Spawn `exe` with `args`, handing `child_end` over as an inherited channel.

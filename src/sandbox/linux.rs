@@ -622,7 +622,7 @@ mod landlock {
     /// by every engine thread and every fork+exec'd child, so nothing in the
     /// process tree can write outside `temp` either; each child then further
     /// restricts itself.
-    pub fn restrict_broker(temp: &Path) -> std::io::Result<bool> {
+    pub fn restrict_broker(temp: &Path, cgroup: Option<&Path>) -> std::io::Result<bool> {
         // Read + traverse + execute everything, so the loader can `execve` the
         // child binary and mmap its shared libraries PROT_EXEC wherever they are.
         let root = READ_FILE | READ_DIR | EXECUTE;
@@ -636,7 +636,16 @@ mod landlock {
             | MAKE_DIR
             | REMOVE_FILE
             | REMOVE_DIR;
-        apply(&[(Path::new("/"), root), (temp, temp_rw)])
+        let mut rules: Vec<(&Path, u64)> = vec![(Path::new("/"), root), (temp, temp_rw)];
+        // When cgroup memory bounding is active, the broker must keep writing
+        // under its `workers` subtree to place each child: make per-child cgroup
+        // dirs and write their `memory.*` / `cgroup.procs` interface files. No
+        // `MAKE_REG` — the kernel materialises those files when the dir is made.
+        if let Some(cg) = cgroup {
+            let cg_rw = READ_FILE | READ_DIR | WRITE_FILE | MAKE_DIR | REMOVE_DIR;
+            rules.push((cg, cg_rw));
+        }
+        apply(&rules)
     }
 }
 
@@ -644,6 +653,168 @@ mod landlock {
 #[cfg(feature = "multi-process")]
 pub fn landlock_available() -> bool {
     landlock::available()
+}
+
+/// cgroup v2 per-child **memory** bounding — the physical-memory limit
+/// `RLIMIT_AS`/`RLIMIT_DATA` cannot give.
+///
+/// An rlimit bounds a process's *own* virtual or committed memory and is
+/// self-relative; a cgroup `memory.max` bounds true **RSS** from *outside* the
+/// process, and — the property that matters — its OOM kill is **scoped to the
+/// cgroup**, so a renderer's memory storm kills only that renderer, never the
+/// broker or a sibling. This is the Linux analogue of the Windows job-object
+/// memory cap already applied in [`confine_spawned_child`].
+///
+/// **Best-effort, like Landlock.** cgroup v2's *no-internal-processes* rule means
+/// a cgroup can only delegate a controller to its children once it holds no
+/// processes of its own. So the broker moves itself into a `…/leader` leaf,
+/// freeing its own cgroup to enable `+memory` and hand a limited `…/workers`
+/// subtree to the children. That only works where the process owns (or was
+/// delegated) its cgroup and is its sole occupant — a systemd scope with
+/// `Delegate=yes`, or root. In a shared login/tmux scope the `+memory` enable
+/// fails `EBUSY`; we then undo the move and report unavailable, and children run
+/// bounded only by their rlimits (exactly the prior behaviour).
+///
+/// Placement is by the broker (which has `openat`/`mkdir` — its seccomp is a
+/// deny-list, not the renderers' allowlist), and its writes land under `workers`,
+/// which [`landlock::restrict_broker`] is told to keep writable. Per-*renderer*
+/// cgroups are a further step: renderers are `fork()`ed by the fork server, which
+/// owns and reaps them, so the engine never sees their pids — they inherit the
+/// fork server's cgroup instead (an aggregate content-process bound).
+#[cfg(feature = "multi-process")]
+mod cgroup {
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    /// The `…/workers` cgroup per-child limits live under, set once by
+    /// [`prepare`]. `Some(None)` ⇒ tried and unavailable; unset ⇒ never prepared.
+    /// Either way [`place_child`] degrades to a no-op.
+    static WORKERS: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+    /// Graceful-reclaim threshold (`memory.high`) and the hard ceiling
+    /// (`memory.max`, 25% headroom above it, where the scoped OOM kill fires).
+    /// Illustrative for the PoC's tiny processes — the mechanism, not the number,
+    /// is the point.
+    const HIGH_BYTES: u64 = 1024 * 1024 * 1024;
+    const MAX_BYTES: u64 = HIGH_BYTES + HIGH_BYTES / 4;
+
+    /// This process's cgroup-v2 directory, from the sole `0::<path>` line of
+    /// `/proc/self/cgroup`. `None` if the host is cgroup v1 / hybrid.
+    fn my_dir() -> Option<PathBuf> {
+        let content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let rel = content.lines().find_map(|l| l.strip_prefix("0::"))?;
+        Some(Path::new("/sys/fs/cgroup").join(rel.trim().trim_start_matches('/')))
+    }
+
+    fn write_file(path: &Path, val: &str) -> std::io::Result<()> {
+        std::fs::OpenOptions::new().write(true).open(path)?.write_all(val.as_bytes())
+    }
+
+    /// Best-effort leader-pattern setup, run on the broker's main thread before
+    /// its Landlock/seccomp go on. Returns the `workers` dir if the memory
+    /// controller could be delegated to our own subtree, else `None`. Also
+    /// records the result for [`place_child`].
+    pub fn prepare() -> Option<PathBuf> {
+        let workers = try_prepare();
+        let _ = WORKERS.set(workers.clone());
+        workers
+    }
+
+    fn try_prepare() -> Option<PathBuf> {
+        let base = my_dir()?;
+        // The memory controller must have been delegated down to our leaf.
+        let controllers = std::fs::read_to_string(base.join("cgroup.controllers")).ok()?;
+        if !controllers.split_whitespace().any(|c| c == "memory") {
+            return None;
+        }
+        // Unique per broker pid, so parallel binaries in a shared scope don't
+        // collide on the same directory names.
+        let pid = std::process::id();
+        let leader = base.join(format!("gosub.{pid}.leader"));
+        let workers = base.join(format!("gosub.{pid}.workers"));
+        let _ = std::fs::create_dir(&leader);
+        let _ = std::fs::create_dir(&workers);
+        // Move the whole thread group into the leader leaf, emptying our own
+        // cgroup so it may delegate controllers.
+        if write_file(&leader.join("cgroup.procs"), &pid.to_string()).is_err() {
+            undo(&base, &leader, &workers, pid);
+            return None;
+        }
+        // Delegate memory down to `workers`. The first write fails `EBUSY` if our
+        // leaf still has other processes (a shared scope) — the fallback trigger.
+        if write_file(&base.join("cgroup.subtree_control"), "+memory").is_err()
+            || write_file(&workers.join("cgroup.subtree_control"), "+memory").is_err()
+        {
+            undo(&base, &leader, &workers, pid);
+            return None;
+        }
+        Some(workers)
+    }
+
+    /// Move back to our original cgroup and remove the (empty) leaves, so a
+    /// fallback leaves no trace in a shared scope.
+    fn undo(base: &Path, leader: &Path, workers: &Path, pid: u32) {
+        let _ = write_file(&base.join("cgroup.procs"), &pid.to_string());
+        let _ = std::fs::remove_dir(workers);
+        let _ = std::fs::remove_dir(leader);
+    }
+
+    /// Place a freshly-spawned child into its own memory-limited cgroup. A no-op
+    /// where the subtree was never set up, and only logged (never fatal) on error
+    /// — the child still runs, just rlimit-bounded, exactly as before cgroups.
+    pub fn place_child(pid: u32) {
+        let Some(Some(workers)) = WORKERS.get() else { return };
+        let dir = workers.join(format!("c-{pid}"));
+        if let Err(e) = (|| -> std::io::Result<()> {
+            let _ = std::fs::create_dir(&dir);
+            write_file(&dir.join("memory.max"), &MAX_BYTES.to_string())?;
+            // Graceful reclaim before the hard cap; best-effort (old kernels).
+            let _ = write_file(&dir.join("memory.high"), &HIGH_BYTES.to_string());
+            // Writing the pid moves the child out of the inherited leader cgroup
+            // into its own bounded one.
+            write_file(&dir.join("cgroup.procs"), &pid.to_string())
+        })() {
+            eprintln!("[broker] cgroup: could not confine child {pid} ({e}); it runs rlimit-bounded only");
+        } else if std::env::var_os("GOSUB_DEBUG_CGROUP").is_some() {
+            eprintln!("[broker] cgroup: child {pid} confined to {} (memory.max={MAX_BYTES})", dir.display());
+        }
+    }
+
+    /// Test hook: set up the subtree (best-effort) and place *this* process in a
+    /// child cgroup limited to `limit`, returning the value read back from
+    /// `memory.max` — or `None` if cgroup v2 memory delegation is unavailable, so
+    /// the probe skips cleanly like the Landlock one.
+    pub fn confine_self(limit: u64) -> Option<std::io::Result<u64>> {
+        let workers = prepare()?;
+        Some((|| {
+            let dir = workers.join("probe");
+            let _ = std::fs::create_dir(&dir);
+            write_file(&dir.join("memory.max"), &limit.to_string())?;
+            write_file(&dir.join("cgroup.procs"), &std::process::id().to_string())?;
+            std::fs::read_to_string(dir.join("memory.max"))?
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })())
+    }
+}
+
+/// Place a just-spawned child into its own cgroup memory limit (best-effort; see
+/// [`cgroup`]). The Linux half of the parent-side [`crate::sandbox::confine_spawned_child`]
+/// seam — the analogue of the Windows job-object memory cap.
+#[cfg(feature = "multi-process")]
+pub fn confine_spawned_child(pid: u32) -> std::io::Result<()> {
+    cgroup::place_child(pid);
+    Ok(())
+}
+
+/// Test hook for the `cgroup-memory-limit` probe: bound this process's memory via
+/// cgroup v2 and read the ceiling back, or `None` where delegation is
+/// unavailable. See [`cgroup::confine_self`].
+#[cfg(feature = "multi-process")]
+pub fn cgroup_confine_self(limit: u64) -> Option<std::io::Result<u64>> {
+    cgroup::confine_self(limit)
 }
 
 /// The dangerous syscalls the broker (engine) is denied, even though it keeps
@@ -715,8 +886,22 @@ const BROKER_DENY: &[libc::c_long] = &[
 /// the children's fail-closed allowlists are what actually contain a compromise.
 #[cfg(feature = "multi-process")]
 pub fn lock_down_broker() {
+    // cgroup memory bounding first (best-effort): it moves the broker into a
+    // leader cgroup and writes to `/sys/fs/cgroup`, so it must run *before*
+    // Landlock/seccomp go on. The `workers` path it returns, if any, is handed to
+    // Landlock so the later per-child placement writes stay allowed.
+    let workers = cgroup::prepare();
+    match &workers {
+        Some(w) => {
+            eprintln!("[broker] cgroup memory limits active (children capped under {})", w.display())
+        }
+        None => {
+            eprintln!("[broker] cgroup v2 memory delegation unavailable; children fall back to rlimits")
+        }
+    }
+
     let temp = std::env::temp_dir();
-    match landlock::restrict_broker(&temp) {
+    match landlock::restrict_broker(&temp, workers.as_deref()) {
         Ok(true) => {
             eprintln!("[broker] landlock active (writes confined to {})", temp.display())
         }
