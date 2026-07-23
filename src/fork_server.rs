@@ -65,6 +65,19 @@ pub fn run(control_fd: &str) {
     // one fork; failing later looks like every tab crashing on open.
     crate::sandbox::verify_fork_server_filter();
 
+    // From here on, let the kernel auto-reap our children. The fork server is the
+    // direct parent of every renderer and decoder (it `fork()`s them without
+    // exec), and its serve loop blocks in `recv_msg` between requests — so without
+    // this, every decoder that exits after one image and every renderer that
+    // crashes would sit as a zombie until teardown, and a long session decoding
+    // thousands of images would climb toward `pid_max` and starve new forks. We
+    // never need a child's exit status (the engine detects a dead renderer via
+    // socket EOF, not `wait`), so `SA_NOCLDWAIT` — discard the status, leave no
+    // zombie — is the right tool, and unlike a `SIGCHLD` handler it does not
+    // interrupt the blocking `recv_msg` with `EINTR`. Set *after* the canary,
+    // which must still `waitpid` its own probe child to read the verdict.
+    reap_children_automatically();
+
     // Loop ends when `recv_msg` errors (engine went away) or on `Shutdown`.
     while let Ok(req) = ipc::recv_msg::<ForkRequest>(&mut control) {
         match req {
@@ -89,13 +102,34 @@ pub fn run(control_fd: &str) {
         }
     }
 
-    // Reap any content processes that have already exited, without blocking:
-    // the pinned init (PID 1 of the renderers' namespace, where one exists) does
-    // not exit on its own — it dies with us via `PR_SET_PDEATHSIG`, and *that*
-    // tears the namespace down and `SIGKILL`s any renderer still in it, which the
-    // subreaper then collects. A blocking `waitpid(-1)` here would instead hang
-    // forever waiting on that pinned init.
+    // Children auto-reap via `SA_NOCLDWAIT` (set above), so there are normally no
+    // zombies left to collect here. This non-blocking sweep is a fallback for the
+    // case where that `sigaction` failed to install: mop up any content process
+    // that has already exited, `WNOHANG` so we never block on the pinned init
+    // (PID 1 of the renderers' namespace, which does not exit on its own — it dies
+    // with us via `PR_SET_PDEATHSIG`).
     while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
+}
+
+/// Ask the kernel to auto-reap our children: with `SA_NOCLDWAIT` a terminated
+/// child is discarded immediately rather than left a zombie for us to `wait` on.
+/// The disposition stays `SIG_DFL` (we install no `SIGCHLD` handler), so the
+/// blocking `recv_msg` in the serve loop is never interrupted. `rt_sigaction` is
+/// on the fork server's seccomp allowlist.
+fn reap_children_automatically() {
+    // SAFETY: a zeroed `sigaction` is a valid `SIG_DFL` disposition with an empty
+    // mask; we only add the `SA_NOCLDWAIT` flag.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        sa.sa_flags = libc::SA_NOCLDWAIT;
+        if libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut()) != 0 {
+            eprintln!(
+                "[fork-server] could not set SA_NOCLDWAIT ({}); exited children may linger as zombies",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 /// Fork the pinned "init" for the renderers' shared PID namespace.
