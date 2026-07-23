@@ -740,8 +740,11 @@ simplified is the surrounding browser. What each entry below still needs:
   would share one implementation).
 - **Fork server**: it is `exec`'d fresh (one exec) rather than forked from the
   engine early to inherit the *engine's* warm libraries; the modeled behavior
-  is renderers fork-without-exec from a warm process. It is unsandboxed
-  (minimal, trusted, holds no secrets) and reaps its renderers on shutdown; a
-  real one would also seccomp-confine itself around the `fork()`/fd-passing
-  path. Linux only — `fork()`-without-exec + the Rust runtime relies on
-  `fork()` semantics. Elsewhere renderers fall back to direct fork+exec.
+  is renderers fork-without-exec from a warm process. It confines *itself* like
+  any other role — its own seccomp filter (a superset of the content baseline:
+  `fork`/`clone`/`wait4`/`prctl`/`seccomp`), the `clone3`→`ENOSYS` + plain-fork
+  `clone` hardening so it cannot unshare a namespace or thread/VM-share via
+  `clone`, empty net/IPC/UTS namespaces, and non-dumpable — all inherited by the
+  renderers it forks — and it is minimal and secret-free besides. Linux only —
+  `fork()`-without-exec + the Rust runtime relies on `fork()` semantics.
+  Elsewhere renderers fall back to direct fork+exec.
