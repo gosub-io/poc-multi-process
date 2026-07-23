@@ -169,6 +169,15 @@ const MAX_INFLIGHT_FETCHES: usize = 32;
 /// bound turns that into a flat refusal once the tab has too many in flight.
 const MAX_INFLIGHT_DECODES: usize = 8;
 
+/// How long the engine waits for a decoder's single reply before abandoning it.
+/// A decode is trivial work (the parser is bounded and total), so a decoder that
+/// has not answered within this window is wedged — most likely a decoder
+/// compromised through the image it parsed. Without a bound its one-shot reader
+/// thread blocks forever, the tab's decode slot never frees, and the process is
+/// never reaped. Generous relative to real decode time; mirrors the ring's
+/// [`crate::ring`] stall timeout in spirit.
+const DECODE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Per-source cap on messages queued-but-unprocessed in the shared inbox. All
 /// sources funnel into one inbox, so without this a single renderer flooding
 /// *any* message type would grow it without bound. See [`Gate`].
@@ -1085,19 +1094,45 @@ impl EngineLoop {
         // died mid-decode — synthesize a `Failed` so the renderer always hears
         // an outcome. This is the fault-isolation guarantee: a decoder crash is
         // a decode failure, never a lost request or a broken engine.
+        //
+        // The wait is *bounded* (`DECODE_TIMEOUT`): a wedged decoder that neither
+        // answers nor exits must not pin this thread and the tab's decode slot
+        // forever. On timeout we synthesize a failure (so the slot frees and the
+        // renderer hears an outcome), drop our socket end so a merely-slow decoder
+        // sees EOF, and kill the child where we parent it (the non-fork-served
+        // path) so the join below cannot block.
         let inbox = self.inbox.clone();
         std::thread::spawn(move || {
+            let mut handle = handle;
             let mut dec_rx = dec_rx;
+            let _ = dec_rx.set_read_timeout(Some(DECODE_TIMEOUT));
+            let mut timed_out = false;
             let outcome = match dec_rx.recv::<FromDecoder>() {
                 Ok(FromDecoder::Decoded { width, height, pixels }) => {
                     DecodeOutcome::Ok { width, height, pixels }
                 }
                 Ok(FromDecoder::Failed { reason }) => DecodeOutcome::Failed { reason },
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    timed_out = true;
+                    DecodeOutcome::Failed { reason: "decoder timed out".into() }
+                }
                 Err(_) => DecodeOutcome::Failed { reason: "decoder died before answering".into() },
             };
             let _ = inbox.send(LoopMsg::DecodeReply { request_id, outcome });
-            // The decoder has answered and is exiting; reap it (a no-op for a
-            // fork-served child, which the fork server reaps).
+            // Drop our socket end first: a cooperative decoder still finishing up
+            // sees EOF and exits, then is reaped (by the fork server on Linux).
+            drop(dec_rx);
+            // A wedged decoder never exits, so kill it before joining or the join
+            // blocks forever — a no-op for a fork-served child (killed with its
+            // PID namespace at shutdown) or a thread.
+            if timed_out {
+                kill_child(&mut handle);
+            }
             join(handle);
         });
     }
@@ -1255,6 +1290,19 @@ fn join(handle: ChildHandle) {
         #[cfg(all(feature = "multi-process", target_os = "linux"))]
         ChildHandle::ForkServed => {}
     }
+}
+
+/// Best-effort kill of a child we still parent, so a later [`join`] does not
+/// block on one that has wedged. Only the directly-spawned `Process` variant is
+/// killable: a fork-served child is parented by the fork server (the engine has
+/// no pid for it — it dies with the fork server / its PID namespace at
+/// shutdown), and a thread cannot be killed. A no-op for those.
+fn kill_child(handle: &mut ChildHandle) {
+    #[cfg(feature = "multi-process")]
+    if let ChildHandle::Process(child) = handle {
+        let _ = child.kill();
+    }
+    let _ = handle;
 }
 
 /// Canonical origin of a URL: `scheme://host[:port]`, with the scheme's

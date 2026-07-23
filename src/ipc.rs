@@ -349,6 +349,21 @@ impl EndpointRx {
         }
     }
 
+    /// Bound how long a subsequent `recv` will block waiting for bytes:
+    /// `Some(dur)` arms a per-read timeout on the underlying socket so a peer
+    /// that stops sending is abandoned (recv returns `WouldBlock`/`TimedOut`)
+    /// rather than blocking the caller forever; `None` clears it. A no-op on
+    /// local (in-process) channels, which are the same address space and not a
+    /// security boundary.
+    #[cfg_attr(not(feature = "multi-process"), allow(unused_variables))]
+    pub fn set_read_timeout(&mut self, dur: Option<std::time::Duration>) -> io::Result<()> {
+        match self {
+            #[cfg(feature = "multi-process")]
+            EndpointRx::Socket(stream) => stream.set_read_timeout(dur),
+            EndpointRx::Local(_) => Ok(()),
+        }
+    }
+
     pub fn recv<T: DeserializeOwned>(&mut self) -> io::Result<T> {
         match self {
             #[cfg(feature = "multi-process")]
@@ -631,6 +646,32 @@ mod tests {
         let (mut a, b) = UnixStream::pair().unwrap();
         a.write_all(&[0u8]).unwrap(); // plain byte, no SCM_RIGHTS attached
         assert!(unsafe { recv_fd(b.as_raw_fd()) }.is_err());
+    }
+
+    #[cfg(all(feature = "multi-process", unix))]
+    #[test]
+    fn recv_returns_a_timeout_error_when_the_peer_is_silent() {
+        // The primitive behind the decode stall timeout: with a read timeout
+        // armed, recv on a socket whose peer sends nothing must return a
+        // WouldBlock/TimedOut error near the deadline — never block forever.
+        use std::time::{Duration, Instant};
+        // Keep `_peer` bound so the socket is not closed (a closed peer gives EOF,
+        // not a timeout — a different, already-handled case).
+        let (mine, _peer) = UnixStream::pair().unwrap();
+        let ep = Endpoint::from_channel(channel::Channel::from_stream(mine)).unwrap();
+        let (_tx, mut rx) = ep.split();
+        rx.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+
+        let start = Instant::now();
+        let err = rx.recv::<u32>().expect_err("silent peer must not yield a value");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+            "expected a timeout error, got {:?}",
+            err.kind()
+        );
+        assert!(elapsed < Duration::from_secs(2), "recv should return near the deadline, took {elapsed:?}");
     }
 
     #[cfg(feature = "multi-process")]

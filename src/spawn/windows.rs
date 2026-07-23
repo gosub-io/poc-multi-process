@@ -29,8 +29,8 @@ use windows_sys::Win32::Security::{SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES};
 use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList,
-    InitializeProcThreadAttributeList, UpdateProcThreadAttribute, WaitForSingleObject,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
+    InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW,
 };
 
@@ -59,6 +59,16 @@ impl Child {
     /// The raw process handle, for the parent-side confinement hook.
     pub fn raw_handle(&self) -> HANDLE {
         self.process
+    }
+
+    /// Best-effort terminate — used to abandon a child that has wedged (e.g. a
+    /// decoder that stopped answering), so `wait` does not block forever.
+    pub fn kill(&mut self) -> io::Result<()> {
+        // SAFETY: `process` is a valid handle owned by this struct.
+        if unsafe { TerminateProcess(self.process, 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 

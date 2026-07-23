@@ -22,6 +22,12 @@ impl Child {
     pub fn id(&self) -> u32 {
         self.0.id()
     }
+
+    /// Best-effort SIGKILL — used to abandon a child that has wedged (e.g. a
+    /// decoder that stopped answering), so `wait` does not block forever.
+    pub fn kill(&mut self) -> io::Result<()> {
+        self.0.kill()
+    }
 }
 
 /// Spawn `exe` with `args`, handing `child_end` over as an inherited channel.
