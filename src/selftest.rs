@@ -111,6 +111,8 @@ pub const PROBES: &[&str] = &[
     "broker-seccomp",
     #[cfg(target_os = "linux")]
     "cgroup-memory-limit",
+    #[cfg(target_os = "linux")]
+    "crash-report",
     #[cfg(target_os = "macos")]
     "seatbelt-file",
     #[cfg(target_os = "macos")]
@@ -1064,6 +1066,24 @@ fn run_platform_probe(probe: &str) {
     // unavailable (a shared login/tmux scope, no `Delegate=yes`), it skips (exit
     // 0) rather than failing an untestable host. Run under a delegated scope
     // (`systemd-run --user -p Delegate=yes --scope …`) to exercise the real path.
+    // The self-capturing crash reporter must fire *and* still let the process
+    // die with the original signal. Under the renderer lockdown (so this also
+    // proves the handler works within the seccomp filter — it uses only `write`
+    // + `sigaction`, and re-dies by restoring `SIG_DFL` and returning rather than
+    // a filter-blocked `tgkill`), dereference a null pointer to raise SIGSEGV.
+    // The handler writes a `[crash]` line, restores the default, and returns; the
+    // faulting instruction re-executes and the process dies with SIGSEGV, which
+    // the parent observes. Reaching the line below would mean the fault was
+    // swallowed — a bug.
+    if probe == "crash-report" {
+        crate::sandbox::lock_down_renderer();
+        // SAFETY: an intentional wild read of address 0 to trigger SIGSEGV;
+        // `read_volatile` is not optimized away.
+        let _ = unsafe { std::ptr::read_volatile(std::ptr::null::<u8>()) };
+        eprintln!("[selftest] crash-report: SIGSEGV did not terminate the process");
+        std::process::exit(1);
+    }
+
     if probe == "cgroup-memory-limit" {
         const WANT: u64 = 64 * 1024 * 1024;
         match crate::sandbox::cgroup_confine_self(WANT) {

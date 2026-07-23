@@ -574,6 +574,7 @@ mod probe_inventory {
         "broker-landlock",
         "broker-seccomp",
         "cgroup-memory-limit",
+        "crash-report",
     ];
 
     /// The Seatbelt profile's enforcement. `PT_DENY_ATTACH` and the rlimits
@@ -643,6 +644,8 @@ mod sandbox_enforcement {
 
     /// `SIGSYS` — the signal seccomp `KillProcess` terminates with.
     const SIGSYS: i32 = 31;
+    /// `SIGSEGV` — a segmentation fault (the crash-report probe's wild read).
+    const SIGSEGV: i32 = 11;
 
     fn probe(name: &str) -> std::process::ExitStatus {
         Command::new(bin()).args(["selftest", name]).status().expect("spawn selftest")
@@ -801,6 +804,29 @@ mod sandbox_enforcement {
         let st = probe("broker-seccomp");
         assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (ptrace denied), got {st:?}");
         assert!(st.code().is_none(), "should be killed, not exit");
+    }
+
+    /// Crash reporting without a core dump or `ptrace`: a crashing content
+    /// process self-captures a scrubbed report from its own signal handler, then
+    /// still dies with the original signal (so the engine's crash detection is
+    /// unaffected). The report carries a faulting *address*, never memory
+    /// contents — leak-free even for the secret-holding broker. Checks both: the
+    /// `[crash]` record on stderr, and death by `SIGSEGV`.
+    #[test]
+    fn a_crashing_process_self_reports_then_dies() {
+        let out = Command::new(bin())
+            .args(["selftest", "crash-report"])
+            .output()
+            .expect("spawn selftest");
+        assert_eq!(
+            out.status.signal(),
+            Some(SIGSEGV),
+            "expected death by SIGSEGV, got {:?}",
+            out.status
+        );
+        assert!(out.status.code().is_none(), "should be killed by the signal, not exit");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("[crash] SIGSEGV"), "expected a self-captured crash record, got: {err}");
     }
 
     /// The cgroup v2 memory bound — the physical-RSS limit rlimits can't give,

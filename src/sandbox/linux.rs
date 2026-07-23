@@ -950,6 +950,9 @@ fn install_broker_seccomp() -> Result<(), Box<dyn std::error::Error>> {
     // allowlist path does — "broker tried ptrace (#101), killed" rather than a
     // bare SIGSYS. Its own syscalls are all on the default-allow side here.
     install_sigsys_reporter();
+    // …and the crash reporter: on SIGSEGV/ABRT/BUS/ILL/FPE, self-capture a
+    // scrubbed, core-less crash report (see `install_crash_reporter`).
+    install_crash_reporter();
 
     let filter = SeccompFilter::new(
         rules,
@@ -1185,6 +1188,9 @@ fn install_with(
     // the renderer starts issuing syscalls we did not anticipate: "renderer
     // died" becomes "renderer tried openat (#257), killed".
     install_sigsys_reporter();
+    // …and the crash reporter: on SIGSEGV/ABRT/BUS/ILL/FPE, self-capture a
+    // scrubbed, core-less crash report (see `install_crash_reporter`).
+    install_crash_reporter();
 
     let filter = SeccompFilter::new(
         rules,
@@ -1315,6 +1321,153 @@ extern "C" fn sigsys_handler(
         // a belt-and-braces exit in case a future change masks it.
         libc::_exit(159);
     }
+}
+
+/// Crash reporting **without a core dump and without `ptrace`** — the resolution
+/// of the tension that makes crash reporting hard under this sandbox.
+///
+/// A crash report normally needs *some* process to read the crashed process's
+/// registers and memory. But a renderer is `PR_SET_DUMPABLE = 0` (nothing may
+/// read its `/proc/<pid>/mem`), the broker's seccomp deny-list forbids
+/// `ptrace`/`process_vm_readv`, and `RLIMIT_CORE = 0` stops core dumps — so no
+/// *other* process can capture it. The way out (the same one Crashpad takes on
+/// Linux) is **self-capture**: the crashing process reports its *own* state from
+/// its signal handler, before it dies. It reads no other process, needs no new
+/// privilege, and touches only `write` + `sigaction` — both already on every
+/// filter.
+///
+/// The report is a single structured line — signal + faulting address — and
+/// deliberately **no memory contents**: no stack dump, no heap, no register
+/// values. That is the *secret scrubbing*. It matters most for the broker, whose
+/// address space holds the cookie jar: a faulting *address* is not a secret, so
+/// even the secret-holding process produces a leak-free report. (A production
+/// minidump would add a register set and a stack walk — a self-capturing handler
+/// can do both async-signal-safely via frame-pointer walking — with the
+/// stack/heap redacted; out of scope here.)
+///
+/// Re-death is by restoring `SIG_DFL` and **returning**: these are synchronous
+/// faults, so the offending instruction re-executes and the default action kills
+/// the process with the same signal (`SA_NODEFER` keeps it unmasked; `abort()`
+/// re-raises `SIGABRT` itself). We deliberately do *not* `tgkill` to re-raise —
+/// the seccomp `tgkill` rule permits only SIGSYS-to-self, so a re-raise here would
+/// itself trap.
+#[cfg(feature = "multi-process")]
+fn install_crash_reporter() {
+    // Alternate signal stack, so a stack-overflow SIGSEGV can still run the
+    // handler (the faulting stack is unusable). Per-thread; installed on the
+    // thread that locks down — every content process is single-threaded here.
+    static mut ALTSTACK: [u8; 16384] = [0; 16384];
+    // SAFETY: a zeroed sigaction with the handler set; registered for the
+    // synchronous crash signals only. `addr_of_mut!` avoids a reference to the
+    // static. sigaltstack/sigaction are async-signal-safe and on every filter.
+    unsafe {
+        let ss = libc::stack_t {
+            ss_sp: std::ptr::addr_of_mut!(ALTSTACK).cast(),
+            ss_flags: 0,
+            ss_size: 16384,
+        };
+        libc::sigaltstack(&ss, std::ptr::null_mut());
+
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = crash_handler as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGSEGV, libc::SIGABRT, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Signal handler for the crash signals: emit a scrubbed one-line report, then
+/// restore the default disposition and return so the fault re-triggers and kills
+/// us with the original signal. Async-signal-safe: a stack buffer, hand-rolled
+/// integer formatting, one `write`, one `sigaction`. No allocation, no locks.
+#[cfg(feature = "multi-process")]
+extern "C" fn crash_handler(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+    // The faulting address sits at byte offset 16 of `siginfo_t` on LP64 Linux
+    // (`_sigfault.si_addr`, after {si_signo, si_errno, si_code, pad}). Same layout
+    // on x86_64 and aarch64. Zero if the kernel gave us no siginfo.
+    let addr: usize = if info.is_null() {
+        0
+    } else {
+        // SAFETY: kernel-filled siginfo is at least 24 bytes; unaligned-safe read.
+        unsafe { std::ptr::read_unaligned((info as *const u8).add(16).cast::<usize>()) }
+    };
+
+    let mut buf = [0u8; 128];
+    let mut len = 0usize;
+    // Inline byte copies (no closure, so the slice borrows below stay free), the
+    // same shape as the SIGSYS reporter.
+    for chunk in [
+        b"[crash] ".as_slice(),
+        signal_name(sig),
+        b" (#".as_slice(),
+    ] {
+        for &b in chunk {
+            buf[len] = b;
+            len += 1;
+        }
+    }
+    len += write_i32(&mut buf[len..], sig);
+    for &b in b") at fault address " {
+        buf[len] = b;
+        len += 1;
+    }
+    len += write_hex_usize(&mut buf[len..], addr);
+    // em-dash matches the SIGSYS reporter's style
+    for &b in b" \xe2\x80\x94 terminating (no core, self-captured)\n" {
+        buf[len] = b;
+        len += 1;
+    }
+
+    // SAFETY: fd 2 is open; buf/len describe an initialized slice. Then restore
+    // SIG_DFL and return — the fault re-executes and the default action kills us.
+    unsafe {
+        libc::write(2, buf.as_ptr().cast(), len);
+        let mut dfl: libc::sigaction = std::mem::zeroed();
+        dfl.sa_sigaction = libc::SIG_DFL;
+        libc::sigaction(sig, &dfl, std::ptr::null_mut());
+    }
+}
+
+/// The crash signals' names as static bytes (async-signal-safe: no formatting).
+#[cfg(feature = "multi-process")]
+fn signal_name(sig: libc::c_int) -> &'static [u8] {
+    match sig {
+        libc::SIGSEGV => b"SIGSEGV",
+        libc::SIGABRT => b"SIGABRT",
+        libc::SIGBUS => b"SIGBUS",
+        libc::SIGILL => b"SIGILL",
+        libc::SIGFPE => b"SIGFPE",
+        _ => b"signal",
+    }
+}
+
+/// Async-signal-safe `0x`-prefixed hex formatter for a pointer-sized value.
+/// Writes into `out` and returns the byte count. No allocation.
+#[cfg(feature = "multi-process")]
+fn write_hex_usize(out: &mut [u8], mut v: usize) -> usize {
+    out[0] = b'0';
+    out[1] = b'x';
+    let mut len = 2usize;
+    if v == 0 {
+        out[len] = b'0';
+        return len + 1;
+    }
+    let mut digits = [0u8; 16];
+    let mut d = 0usize;
+    while v > 0 {
+        let nybble = (v & 0xf) as u8;
+        digits[d] = if nybble < 10 { b'0' + nybble } else { b'a' + (nybble - 10) };
+        v >>= 4;
+        d += 1;
+    }
+    while d > 0 {
+        d -= 1;
+        out[len] = digits[d];
+        len += 1;
+    }
+    len
 }
 
 /// Async-signal-safe decimal formatter for the SIGSYS reporter: writes `v`

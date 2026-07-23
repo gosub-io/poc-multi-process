@@ -36,6 +36,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -174,6 +175,46 @@ const MAX_QUEUED_PER_SOURCE: usize = 64;
 /// has the same ceiling (its process limit); the number here is arbitrary but
 /// finite, which is the point.
 const MAX_RENDERERS: usize = 128;
+
+/// Crash-loop guard. If a renderer for one `(zone, origin)` dies this many times
+/// within [`CRASH_LOOP_WINDOW`], the engine stops bringing it back — further
+/// opens and cross-origin navigations to that origin are refused (a bounded
+/// failure) instead of spawning a process that will just crash again. A page that
+/// reliably kills its renderer (a decompression bomb, a targeted exploit-probe, a
+/// miscompiled asset) therefore cannot burn the host respawning forever. This is
+/// Chromium's "sad tab" crash backoff in miniature.
+const CRASH_LOOP_THRESHOLD: usize = 3;
+const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(30);
+
+/// Per-`(zone, origin)` renderer-crash history behind the crash-loop guard.
+/// Extracted from the engine loop so the policy is unit-testable without spawning
+/// processes; `now` is passed in for the same reason. Stale entries are pruned on
+/// every touch, so the map never grows without bound for a flaky-then-fine origin.
+#[derive(Default)]
+struct CrashTracker {
+    history: HashMap<(ZoneId, String), Vec<Instant>>,
+}
+
+impl CrashTracker {
+    /// Record a crash for `(zone, origin)` at `now`.
+    fn record(&mut self, zone: ZoneId, origin: &str, now: Instant) {
+        let hist = self.history.entry((zone, origin.to_string())).or_default();
+        hist.retain(|t| now.duration_since(*t) < CRASH_LOOP_WINDOW);
+        hist.push(now);
+    }
+
+    /// Whether `(zone, origin)` has crashed [`CRASH_LOOP_THRESHOLD`]+ times within
+    /// the window ending at `now`.
+    fn is_looping(&mut self, zone: ZoneId, origin: &str, now: Instant) -> bool {
+        match self.history.get_mut(&(zone, origin.to_string())) {
+            Some(hist) => {
+                hist.retain(|t| now.duration_since(*t) < CRASH_LOOP_WINDOW);
+                hist.len() >= CRASH_LOOP_THRESHOLD
+            }
+            None => false,
+        }
+    }
+}
 
 /// A tiny counting semaphore with a terminal `close`, giving each message
 /// source (a renderer, or the net component) its own bounded slice of the
@@ -321,6 +362,8 @@ struct EngineLoop {
     /// shutdown. Kept only so their links can be dropped and their processes
     /// reaped.
     devices: Vec<ServiceLink>,
+    /// Renderer-crash history for the crash-loop guard (see [`CrashTracker`]).
+    crashes: CrashTracker,
     next_tab_id: u64,
     next_request_id: u64,
 }
@@ -455,6 +498,7 @@ impl EngineLoop {
             font_gate,
             pending_font: HashMap::new(),
             devices,
+            crashes: CrashTracker::default(),
             next_tab_id: 0,
             next_request_id: 0,
         }
@@ -518,6 +562,10 @@ impl EngineLoop {
                         self.pending_decodes.retain(|_, t| *t != tab_id);
                         self.pending_storage.retain(|_, t| *t != tab_id);
                         self.pending_font.retain(|_, t| *t != tab_id);
+                        // Count this against the crash-loop guard, so an origin
+                        // that keeps killing its renderer is eventually refused a
+                        // fresh one rather than respawned into a loop.
+                        self.crashes.record(tab.zone, &tab.origin, Instant::now());
                         self.emit(EngineEvent::TabCrashed { tab_id });
                     }
                 }
@@ -560,6 +608,19 @@ impl EngineLoop {
             self.emit(EngineEvent::OpenTabFailed {
                 url: url.to_string(),
                 reason: format!("renderer limit reached ({MAX_RENDERERS} live)"),
+            });
+            return;
+        }
+
+        // Crash-loop guard: an origin that has repeatedly crashed its renderer is
+        // refused a fresh one rather than respawned into a loop.
+        if self.crashes.is_looping(zone, &origin, Instant::now()) {
+            self.emit(EngineEvent::OpenTabFailed {
+                url: url.to_string(),
+                reason: format!(
+                    "crash loop: {origin} crashed its renderer {CRASH_LOOP_THRESHOLD}+ times in {}s",
+                    CRASH_LOOP_WINDOW.as_secs()
+                ),
             });
             return;
         }
@@ -710,10 +771,23 @@ impl EngineLoop {
     ///
     /// [`spawn_tab_reader`]: Self::spawn_tab_reader
     fn swap_renderer(&mut self, tab_id: TabId, new_origin: String, url: String) {
+        // Crash-loop guard first, *before* tearing anything down: if the new
+        // origin keeps crashing, refuse the navigation and keep the current
+        // renderer rather than swapping into one that will just crash again.
+        let Some(zone) = self.tabs.get(&tab_id).map(|t| t.zone) else {
+            return;
+        };
+        if self.crashes.is_looping(zone, &new_origin, Instant::now()) {
+            self.emit(EngineEvent::NavigationFailed {
+                tab_id,
+                reason: format!("crash loop: {new_origin} keeps crashing its renderer"),
+            });
+            return;
+        }
+
         let Some(mut old) = self.tabs.remove(&tab_id) else {
             return;
         };
-        let zone = old.zone;
 
         // Tear down the old renderer. Closing the gate before ending the link is
         // what makes this a *swap* and not a *crash*: the reader sees the gate
@@ -1417,6 +1491,33 @@ mod tests {
 
     fn cookie(name: &str, value: &str, http_only: bool) -> Cookie {
         Cookie { name: name.into(), value: value.into(), http_only }
+    }
+
+    #[test]
+    fn crash_loop_guard_trips_at_threshold_then_recovers() {
+        let mut t = CrashTracker::default();
+        let z = ZoneId(0);
+        let t0 = Instant::now();
+
+        // Below the threshold, an origin is not looping.
+        assert!(!t.is_looping(z, "https://x", t0), "no crashes yet");
+        t.record(z, "https://x", t0);
+        t.record(z, "https://x", t0);
+        assert!(!t.is_looping(z, "https://x", t0), "{CRASH_LOOP_THRESHOLD}> 2 crashes is not a loop");
+
+        // The threshold-th crash within the window trips it.
+        t.record(z, "https://x", t0);
+        assert!(t.is_looping(z, "https://x", t0), "threshold crashes in the window is a loop");
+
+        // The guard is scoped to `(zone, origin)`: a different origin, and the
+        // same origin in another zone, are unaffected.
+        assert!(!t.is_looping(z, "https://y", t0), "a different origin is independent");
+        assert!(!t.is_looping(ZoneId(1), "https://x", t0), "the same origin in another zone is independent");
+
+        // Once the crashes age past the window, the origin recovers — the guard
+        // is a *recent*-crash backoff, not a permanent ban.
+        let later = t0 + CRASH_LOOP_WINDOW + Duration::from_secs(1);
+        assert!(!t.is_looping(z, "https://x", later), "stale crashes prune away");
     }
 
     fn pair(a: &str, b: &str) -> (String, String) {

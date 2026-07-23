@@ -127,11 +127,14 @@ what Chromium and Firefox do. Naming them keeps the honest ones honest and stops
 - **Net component is outbound-only** — no `bind`/`listen`, which is right for a
   fetcher, but WebRTC's ICE/STUN/TURN binds local UDP sockets. Real-time media
   reopens `bind` (QUIC is fine — it is connected UDP).
-- **Inbound-debug lockdown + the broker deny-list vs. crash reporting** —
-  `PR_SET_DUMPABLE=0` plus the broker's `ptrace`/`process_vm_readv` denial is
-  exactly what a crash reporter (Crashpad) must *do* to read a crashed renderer
-  and build a minidump. Real crash reporting means threading that needle with a
-  dedicated, more-privileged handler process.
+- **Crash reporting vs. the inbound-debug lockdown** (*resolved by self-capture*)
+  — `PR_SET_DUMPABLE=0` plus the broker's `ptrace`/`process_vm_readv` denial and
+  `RLIMIT_CORE=0` mean no *other* process can read a crashed one to build a report.
+  Rather than threading that needle with a privileged handler, the PoC does what
+  Crashpad does on Linux: the crashing process **self-captures** a scrubbed report
+  (signal + faulting address, no memory contents) from its own signal handler
+  before dying — no `ptrace`, no dumpable relaxation, no core. See "Crash
+  reporting" below.
 
 For calibration, what *survives* contact with a real browser and stays as-is: no
 raw sockets in the renderer and its empty network namespace, no `execve`
@@ -327,6 +330,20 @@ capability the zygote gave up cannot be its child.
   killer reaching the broker; it degrades to rlimits-only in a shared scope. This
   is the parent-side `confine_spawned_child` seam, the Linux analogue of the
   Windows job-object memory cap.
+- **Crash reporting** without a core dump or `ptrace`: `RLIMIT_CORE=0` stops
+  cores, `PR_SET_DUMPABLE=0` and the broker deny-list stop any *other* process
+  reading a crashed one — so, like Crashpad on Linux, the crashing process
+  **self-captures**. A handler for `SIGSEGV`/`SIGABRT`/`SIGBUS`/`SIGILL`/`SIGFPE`
+  (on an alternate stack, so a stack overflow can still run it) writes a one-line
+  report — signal + faulting *address*, **no memory contents**, so it can't leak
+  the cookie jar even from the broker — then restores `SIG_DFL` and returns, so
+  the fault re-executes and the process still dies with its signal (the engine's
+  crash detection is unchanged). Uses only `write` + `sigaction`, both already on
+  every filter.
+- **Crash-loop guard**: an origin that crashes its renderer 3+ times in 30 s
+  (per `(zone, origin)`) is refused a fresh one — `OpenTabFailed`/`NavigationFailed`
+  instead of respawning into a loop — with the backoff expiring as the crashes age
+  out. Bounds respawn *churn*, the complement to the live-renderer cap.
 - On the IPC side, the shared event-loop inbox is **bounded per source**. Every
   component (each renderer, the net process) may have at most
   `MAX_QUEUED_PER_SOURCE` messages queued-but-unprocessed: its reader thread
@@ -667,7 +684,8 @@ simplified is the surrounding browser. What each entry below still needs:
 
   **Platform status.** Linux is the reference implementation: seccomp, empty
   net/IPC/UTS/PID namespaces, rlimits, non-dumpable processes, broker Landlock + a
-  seccomp deny-list, best-effort per-child cgroup v2 `memory.max`, 21 probes.
+  seccomp deny-list, best-effort per-child cgroup v2 `memory.max`, self-captured
+  scrubbed crash reports, 22 probes.
   macOS runs a Seatbelt `(deny default)`
   profile with 13 probes — including **path-scoped file services** (storage/font
   get `subpath` read/write grants for their own directory plus a broad

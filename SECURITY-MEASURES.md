@@ -53,6 +53,7 @@ fork+exec from the engine instead, with its own wider filter.
 | Renderers hold **no secrets** — no cookies, no network handle; they can only send IPC messages | `renderer.rs` | Applied |
 | **Cross-origin navigation swaps renderers** — a cross-origin navigation tears down the tab's renderer and brings up a fresh process bound to the new origin (Chromium's `RenderFrameHost` change), so two origins never share a process | `engine.rs` | Applied |
 | Crash containment — a dead renderer surfaces as `TabCrashed` for that tab only; engine and other tabs continue | `engine.rs` | Applied |
+| **Crash-loop guard** — an origin that crashes its renderer `CRASH_LOOP_THRESHOLD`+ times within a window is refused a fresh one (`OpenTabFailed`/`NavigationFailed`) instead of being respawned into a loop; the backoff is scoped to `(zone, origin)` and expires with the window | `engine.rs` (`CrashTracker`) | Applied |
 | Fork server is **minimal, single-threaded and secret-free**, and is started *before* the engine loads any cookies | `fork_server.rs` | Applied |
 
 ### 1.2 Broker policy (the engine event loop *is* the boundary)
@@ -108,6 +109,7 @@ on the local netmask. Hostname resolution and DNS-rebinding pinning are
 |---|---|---|
 | `MAX_QUEUED_PER_SOURCE` | 64 messages | Per-source inbox gate: a reader thread takes a permit before forwarding and the loop returns one after handling. Out of permits ⇒ the reader stops draining that socket ⇒ the OS backpressures the component. Because it is **per source**, one flooding renderer pins a fixed slice of engine memory (measured: engine RSS flat vs ~90 MB/s growth to OOM without it) |
 | **global renderer-process cap** | ceiling on live renderers | a page looping `window.open`, or an embedder bug, cannot fork renderers without bound (the per-tab caps bound *work per tab*, not tab count) |
+| **crash-loop backoff** | `CRASH_LOOP_THRESHOLD` = 3 crashes / 30 s per `(zone,origin)` | an origin that reliably kills its renderer (a decompression bomb, an exploit-probe) is refused a fresh one instead of respawned forever — bounds respawn churn, not just live count |
 | **per-`(zone,origin)` storage byte quota** | budget enforced in `storage.rs` | a renderer cannot fill the disk via `Set` |
 | `MAX_INFLIGHT_FETCHES` | 32 per tab | A renderer cannot pile up fetches |
 | `MAX_INFLIGHT_DECODES` | 8 per tab | A renderer spamming `NeedDecode` cannot fork processes without limit |
@@ -328,6 +330,36 @@ transport bug. The `forkserver-canary-gap` probe runs the canary against a
 deliberately crippled filter, so the *detection* is tested, not just the happy
 path.
 
+### 2.8 Crash reporting — self-captured, scrubbed, no core, no `ptrace`
+
+A crash report normally needs *some* process to read the crashed one's registers
+and memory. Every mechanism for that is deliberately closed here: a renderer is
+`PR_SET_DUMPABLE = 0` (nothing may read its `/proc/<pid>/mem`), the broker's
+seccomp deny-list forbids `ptrace`/`process_vm_readv`, and `RLIMIT_CORE = 0` stops
+core dumps. The resolution — the same one Crashpad uses on Linux — is
+**self-capture**: each process installs a handler for the synchronous crash
+signals (`SIGSEGV`/`SIGABRT`/`SIGBUS`/`SIGILL`/`SIGFPE`, on an alternate signal
+stack so a stack overflow can still run it) that reports its *own* state before
+dying. It reads no other process, needs no new privilege, and touches only
+`write` + `sigaction` — both already on every filter.
+
+- **Scrubbed by construction.** The report is one line — signal + faulting
+  *address* — and carries **no memory contents**: no stack, no heap, no register
+  values. A faulting address is not a secret, so even the broker (whose address
+  space holds the cookie jar) produces a leak-free report. This is the secret
+  scrubbing; it complements `RLIMIT_CORE = 0` (which would otherwise spill those
+  pages to disk). A production minidump would add a register set and a
+  frame-pointer stack walk with the stack/heap redacted — out of scope here.
+- **Still dies with the signal.** The handler restores `SIG_DFL` and *returns*;
+  the synchronous fault re-executes and the default action kills the process with
+  the original signal (`SA_NODEFER` keeps it unmasked). It deliberately does not
+  `tgkill` to re-raise — the seccomp `tgkill` rule permits only SIGSYS-to-self, so
+  a re-raise would itself trap. So the engine's crash detection (§1.1) is
+  unaffected: it still sees the child die with its signal.
+- Verified by the `crash-report` probe: under the renderer lockdown, a wild read
+  raises `SIGSEGV`, the `[crash]` record appears on stderr, and the process dies
+  with `SIGSEGV`.
+
 ---
 
 ## 3. Windows
@@ -432,12 +464,12 @@ be a backend-shaped piece of work.
 
 - **Probe suite** (`selftest.rs`), asserted against a per-platform expectation
   so a probe that silently disappears behind a `cfg` fails the build:
-  - **Linux (21)**: `baseline`, `mprotect-exec`, `socket`, `memfd-seal`,
+  - **Linux (22)**: `baseline`, `mprotect-exec`, `socket`, `memfd-seal`,
     `fcntl-dupfd`, `ring`, `netns`, `pidns`, `no-ptrace`, `forkserver-can-fork`,
     `forkserver-canary-gap`, `forkserver-no-exec`, `forkserver-no-socket`,
     `forkserver-no-newuser-clone`, `service-fs-openat`, `service-fs-no-socket`,
     `service-device-ioctl`, `service-landlock`, `broker-landlock`,
-    `broker-seccomp`, `cgroup-memory-limit`.
+    `broker-seccomp`, `cgroup-memory-limit`, `crash-report`.
   - **macOS (13)**: `seatbelt-file`, `seatbelt-network`, `seatbelt-exec`,
     `seatbelt-net-role-keeps-network`, `seatbelt-baseline`,
     `seatbelt-file-write`, `seatbelt-fork`, `seatbelt-signal-other`,
