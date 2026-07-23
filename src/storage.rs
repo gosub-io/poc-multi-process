@@ -19,9 +19,22 @@
 //!   hashed and the *hash* is the filename — no attacker-controlled bytes ever
 //!   appear in a path. (Landlock would confine `openat` to the directory at the
 //!   syscall level; until then this application-level scoping is the guard.)
+//!
+//! The filename hash is **keyed** with a per-run random secret ([`RandomState`],
+//! i.e. SipHash) rather than a bare fixed-key hash. That matters because the
+//! `key` is fully renderer-controlled: with an unkeyed, invertible hash (FNV,
+//! and friends) a compromised renderer could *construct* a key whose filename
+//! collides with another origin's slot — the origin string is public and the
+//! hash state after a known prefix is solvable — turning "different tuple →
+//! different file" into a cross-origin read/write. A keyed PRF the renderer
+//! cannot observe makes such a collision unconstructible. The key need not
+//! survive a restart: filenames are only meaningful for one service lifetime,
+//! the same scope as the in-memory quota (see [`MAX_STORE_BYTES`]).
 
 use crate::ipc::{Endpoint, StorageOp, StorageRequest, StorageResponse};
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 
 /// Largest single value the store will persist. Values already ride the 16 MiB
@@ -57,28 +70,21 @@ pub fn ensure_dir() {
     let _ = std::fs::create_dir_all(storage_dir());
 }
 
-/// FNV-1a. Not for security — for turning an arbitrary `(zone, origin, key)`
-/// into a fixed hex filename so no caller-controlled bytes reach the path.
-fn hash(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
-/// The path a value is stored at. Composed with length prefixes so distinct
-/// tuples cannot alias (e.g. origin `"a"`+key `"b"` vs origin `"ab"`+key `""`),
-/// then hashed to a hex name — the filename is pure `[0-9a-f]`, so a hostile
-/// key cannot escape the directory.
-fn path_for(zone: u64, origin: &str, key: &str) -> PathBuf {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&zone.to_le_bytes());
-    buf.extend_from_slice(&(origin.len() as u64).to_le_bytes());
-    buf.extend_from_slice(origin.as_bytes());
-    buf.extend_from_slice(key.as_bytes());
-    storage_dir().join(format!("{:016x}.val", hash(&buf)))
+/// The path a value is stored at, under a keyed hash of the `(zone, origin, key)`
+/// tuple. `keys` is a per-run [`RandomState`] (SipHash) whose secret the renderer
+/// cannot see, so a hostile `key` cannot be crafted to collide its filename with
+/// another origin's slot. Every field is length-prefixed before hashing so
+/// distinct tuples cannot alias even by accident (origin `"a"`+key `"b"` vs
+/// origin `"ab"`+key `""`), and the digest is rendered as pure `[0-9a-f]`, so a
+/// hostile key cannot escape the directory either.
+fn path_for(keys: &RandomState, zone: u64, origin: &str, key: &str) -> PathBuf {
+    let mut h = keys.build_hasher();
+    h.write_u64(zone);
+    h.write_u64(origin.len() as u64);
+    h.write(origin.as_bytes());
+    h.write_u64(key.len() as u64);
+    h.write(key.as_bytes());
+    storage_dir().join(format!("{:016x}.val", h.finish()))
 }
 
 /// Decide whether writing `new_len` bytes to a slot currently holding `old`
@@ -97,17 +103,21 @@ fn admit_write(used: u64, old: u64, new_len: u64, cap: u64) -> Option<u64> {
 struct Quota {
     used: u64,
     sizes: HashMap<PathBuf, u64>,
+    /// Per-run secret for the filename hash — see [`path_for`]. Created once when
+    /// the service starts and reused for every request, so a given tuple maps to
+    /// a stable file for this service lifetime while staying unforgeable.
+    keys: RandomState,
 }
 
 impl Quota {
     fn new() -> Quota {
-        Quota { used: 0, sizes: HashMap::new() }
+        Quota { used: 0, sizes: HashMap::new(), keys: RandomState::new() }
     }
 }
 
 fn handle(zone: u64, origin: &str, op: StorageOp, quota: &mut Quota) -> Option<Vec<u8>> {
     match op {
-        StorageOp::Get { key } => std::fs::read(path_for(zone, origin, &key)).ok(),
+        StorageOp::Get { key } => std::fs::read(path_for(&quota.keys, zone, origin, &key)).ok(),
         StorageOp::Set { key, value } => {
             if value.len() > MAX_VALUE_BYTES {
                 eprintln!(
@@ -116,7 +126,7 @@ fn handle(zone: u64, origin: &str, op: StorageOp, quota: &mut Quota) -> Option<V
                 );
                 return None;
             }
-            let path = path_for(zone, origin, &key);
+            let path = path_for(&quota.keys, zone, origin, &key);
             let old = quota.sizes.get(&path).copied().unwrap_or(0);
             let Some(projected) =
                 admit_write(quota.used, old, value.len() as u64, MAX_STORE_BYTES)
@@ -171,11 +181,27 @@ mod tests {
 
     #[test]
     fn distinct_tuples_do_not_collide() {
-        let a = path_for(0, "a", "b");
-        let b = path_for(0, "ab", "");
-        let c = path_for(1, "a", "b");
+        // One shared key, as the running service uses: distinct tuples — including
+        // the length-prefix aliasing pair (origin "a"+key "b" vs "ab"+"") — land
+        // on distinct files, and the same tuple is stable within a run.
+        let keys = RandomState::new();
+        let a = path_for(&keys, 0, "a", "b");
+        let b = path_for(&keys, 0, "ab", "");
+        let c = path_for(&keys, 1, "a", "b");
+        let d = path_for(&keys, 0, "a", "bc"); // key-length prefix disambiguates
         assert_ne!(a, b);
         assert_ne!(a, c);
+        assert_ne!(a, d);
+        assert_eq!(a, path_for(&keys, 0, "a", "b"));
+    }
+
+    #[test]
+    fn the_filename_key_is_per_run_not_fixed() {
+        // Two independent service lifetimes hash the same tuple under different
+        // secrets, so the filename is not a fixed function of the tuple a renderer
+        // could invert to construct a cross-origin collision.
+        let (k1, k2) = (RandomState::new(), RandomState::new());
+        assert_ne!(path_for(&k1, 0, "https://a.example", "k"), path_for(&k2, 0, "https://a.example", "k"));
     }
 
     #[test]
@@ -205,7 +231,8 @@ mod tests {
 
     #[test]
     fn a_hostile_key_cannot_escape_the_directory() {
-        let p = path_for(0, "https://example.com", "../../../../etc/passwd");
+        let keys = RandomState::new();
+        let p = path_for(&keys, 0, "https://example.com", "../../../../etc/passwd");
         // The filename is a pure hex hash; the only parent is the storage dir.
         assert_eq!(p.parent().unwrap(), storage_dir());
         let name = p.file_name().unwrap().to_str().unwrap();

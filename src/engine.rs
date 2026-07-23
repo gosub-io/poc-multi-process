@@ -113,15 +113,22 @@ pub fn start(mode: Mode) -> (EngineHandle, Receiver<EngineEvent>) {
 enum LoopMsg {
     /// A command from an [`EngineHandle`].
     Command(EngineCommand),
-    /// A renderer sent a message (forwarded by its reader thread).
-    FromTab { tab_id: TabId, msg: FromRenderer },
+    /// A renderer sent a message (forwarded by its reader thread). `epoch`
+    /// identifies the renderer *generation* so a message the pre-swap renderer
+    /// queued is not processed against the post-swap tab (which reuses the
+    /// `tab_id`); `gate` is the exact gate the reader took a permit on, so the
+    /// loop returns it to that gate rather than to whatever tab currently holds
+    /// the id.
+    FromTab { tab_id: TabId, epoch: u64, gate: Arc<Gate>, msg: FromRenderer },
     /// A renderer delivered a tile via shared memory; its reader thread
     /// already received the fd, validated it (seals + real size) and mapped
     /// it, so what reaches the loop is a ready, immutable tile.
     #[cfg(all(feature = "multi-process", target_os = "linux"))]
-    ShmTile { tab_id: TabId, tile: Tile },
-    /// A renderer's link died without a shutdown — crash, most likely.
-    TabGone { tab_id: TabId },
+    ShmTile { tab_id: TabId, epoch: u64, gate: Arc<Gate>, tile: Tile },
+    /// A renderer's link died without a shutdown — crash, most likely. `epoch`
+    /// pins it to the renderer generation that died, so a stale death from a
+    /// swapped-out renderer cannot tear down the tab's new renderer.
+    TabGone { tab_id: TabId, epoch: u64 },
     /// The net component answered a fetch.
     NetReply(NetResponse),
     /// The net component answered a fetch with a *streamed* body: the header
@@ -293,6 +300,11 @@ struct Tab {
     /// origin selects same-origin access within it.
     zone: ZoneId,
     origin: String,
+    /// The renderer *generation* behind this tab. A cross-origin swap replaces
+    /// the process but keeps the `tab_id`, bumping this so late messages from the
+    /// old renderer (tagged with the old epoch) are recognised as stale and
+    /// dropped instead of being attributed to the new origin.
+    epoch: u64,
     tx: EndpointTx,
     handle: ChildHandle,
     /// Number of this tab's fetches awaiting a reply from the net component.
@@ -366,6 +378,10 @@ struct EngineLoop {
     crashes: CrashTracker,
     next_tab_id: u64,
     next_request_id: u64,
+    /// Monotonic renderer-generation counter. Every renderer (an `open_tab` or a
+    /// `swap_renderer`) gets a fresh value, so no two renderer generations — even
+    /// on the same reused `tab_id` — ever share an epoch.
+    next_epoch: u64,
 }
 
 /// A long-lived engine-spawned service: the write half plus the handle to reap
@@ -501,6 +517,7 @@ impl EngineLoop {
             crashes: CrashTracker::default(),
             next_tab_id: 0,
             next_request_id: 0,
+            next_epoch: 0,
         }
     }
 
@@ -528,32 +545,37 @@ impl EngineLoop {
                     self.shutdown();
                     return;
                 }
-                LoopMsg::FromTab { tab_id, msg } => {
-                    // Release the permit this message consumed *after* handling
-                    // it, so the source can queue one more (grab the gate up
-                    // front in case handling ends up touching the tab).
-                    let gate = self.tabs.get(&tab_id).map(|t| Arc::clone(&t.gate));
-                    self.tab_request(tab_id, msg);
-                    if let Some(gate) = gate {
-                        gate.release();
+                LoopMsg::FromTab { tab_id, epoch, gate, msg } => {
+                    // Process only if this message belongs to the tab's *current*
+                    // renderer generation. A message the pre-swap renderer queued
+                    // carries the old epoch; handling it would stamp it with the
+                    // new origin's identity (a cross-origin storage write), so it
+                    // is dropped. The permit is always returned — to the gate the
+                    // reader actually took it on, never to whatever tab now holds
+                    // the reused id.
+                    if self.tabs.get(&tab_id).is_some_and(|t| t.epoch == epoch) {
+                        self.tab_request(tab_id, msg);
                     }
+                    gate.release();
                 }
                 #[cfg(all(feature = "multi-process", target_os = "linux"))]
-                LoopMsg::ShmTile { tab_id, tile } => {
-                    let gate = self.tabs.get(&tab_id).map(|t| Arc::clone(&t.gate));
-                    if gate.is_some() {
+                LoopMsg::ShmTile { tab_id, epoch, gate, tile } => {
+                    if self.tabs.get(&tab_id).is_some_and(|t| t.epoch == epoch) {
                         // Zero-copy hand-off: the event carries the mapping
                         // itself, and the mapping (+ pages) is freed when the
                         // consumer drops the Tile.
                         self.emit(EngineEvent::FrameReady { tab_id, tile });
                     }
-                    if let Some(gate) = gate {
-                        gate.release();
-                    }
+                    gate.release();
                 }
-                LoopMsg::TabGone { tab_id } => {
+                LoopMsg::TabGone { tab_id, epoch } => {
                     // Only a crash if we didn't remove the tab ourselves
-                    // (close/shutdown also end the link, after removal).
+                    // (close/shutdown also end the link, after removal) *and* the
+                    // death is the tab's current generation — a stale death from a
+                    // swapped-out renderer must not tear down its replacement.
+                    if self.tabs.get(&tab_id).is_none_or(|t| t.epoch != epoch) {
+                        continue;
+                    }
                     if let Some(tab) = self.tabs.remove(&tab_id) {
                         tab.gate.close();
                         join(tab.handle);
@@ -634,13 +656,16 @@ impl EngineLoop {
         let (handle, ep) = self.spawner.spawn(Role::Renderer(&origin));
         let (tx, rx) = ep.split();
         let gate = Gate::new(MAX_QUEUED_PER_SOURCE);
-        self.spawn_tab_reader(tab_id, rx, Arc::clone(&gate));
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
+        self.spawn_tab_reader(tab_id, epoch, rx, Arc::clone(&gate));
 
         self.tabs.insert(
             tab_id,
             Tab {
                 zone,
                 origin: origin.clone(),
+                epoch,
                 tx,
                 handle,
                 inflight_fetches: 0,
@@ -662,7 +687,13 @@ impl EngineLoop {
     /// suppresses the `TabGone`. Without that, a swap (which reuses the tab id)
     /// would race a spurious `TabCrashed` from the old renderer's reader against
     /// the freshly installed one. A real crash leaves the gate open → `TabGone`.
-    fn spawn_tab_reader(&self, tab_id: TabId, mut rx: crate::ipc::EndpointRx, gate: Arc<Gate>) {
+    fn spawn_tab_reader(
+        &self,
+        tab_id: TabId,
+        epoch: u64,
+        mut rx: crate::ipc::EndpointRx,
+        gate: Arc<Gate>,
+    ) {
         let inbox = self.inbox.clone();
         std::thread::spawn(move || {
             // Loop ends when `recv` errors (renderer gone) or a shm tile fails
@@ -687,7 +718,13 @@ impl EngineLoop {
                                 }
                                 let tile =
                                     Tile { width, height, pixels: TilePixels::Shared(mapping) };
-                                if inbox.send(LoopMsg::ShmTile { tab_id, tile }).is_err() {
+                                let m = LoopMsg::ShmTile {
+                                    tab_id,
+                                    epoch,
+                                    gate: Arc::clone(&gate),
+                                    tile,
+                                };
+                                if inbox.send(m).is_err() {
                                     return;
                                 }
                             }
@@ -701,7 +738,8 @@ impl EngineLoop {
                         if !gate.acquire() {
                             return;
                         }
-                        if inbox.send(LoopMsg::FromTab { tab_id, msg }).is_err() {
+                        let m = LoopMsg::FromTab { tab_id, epoch, gate: Arc::clone(&gate), msg };
+                        if inbox.send(m).is_err() {
                             return;
                         }
                     }
@@ -710,7 +748,7 @@ impl EngineLoop {
             // Intentional teardown closes the gate first; only an *unexpected*
             // death (gate still open) is a crash worth reporting.
             if !gate.is_closed() {
-                let _ = inbox.send(LoopMsg::TabGone { tab_id });
+                let _ = inbox.send(LoopMsg::TabGone { tab_id, epoch });
             }
         });
     }
@@ -806,12 +844,18 @@ impl EngineLoop {
         let (handle, ep) = self.spawner.spawn(Role::Renderer(&new_origin));
         let (tx, rx) = ep.split();
         let gate = Gate::new(MAX_QUEUED_PER_SOURCE);
-        self.spawn_tab_reader(tab_id, rx, Arc::clone(&gate));
+        // A fresh epoch for the new generation: any message still in flight from
+        // the old renderer carries the old epoch and is dropped by the loop
+        // rather than being attributed to `new_origin`.
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
+        self.spawn_tab_reader(tab_id, epoch, rx, Arc::clone(&gate));
         self.tabs.insert(
             tab_id,
             Tab {
                 zone,
                 origin: new_origin.clone(),
+                epoch,
                 tx,
                 handle,
                 inflight_fetches: 0,
