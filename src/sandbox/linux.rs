@@ -760,6 +760,45 @@ mod cgroup {
         let _ = std::fs::remove_dir(leader);
     }
 
+    /// Tear the subtree down at broker shutdown, symmetric to [`prepare`]. Called
+    /// once the broker has reaped every child, so the per-child cgroups are empty
+    /// and removable.
+    ///
+    /// The per-child `c-*` leaves are removed unconditionally: the broker's
+    /// Landlock grants `REMOVE_DIR` under `workers` (it needs `MAKE_DIR` there to
+    /// place children), so this always works and stops a session's placements —
+    /// and any service that crashed and was respawned mid-session — from
+    /// lingering. Removing `workers`/`leader` and moving back to `base` needs
+    /// rights on the *parent* cgroup that the broker's Landlock deliberately does
+    /// not grant; those steps are attempted best-effort (they succeed in an
+    /// unconfined/root run) and simply no-op under Landlock, where the leftover
+    /// two-dir stub is reclaimed by systemd when the `Delegate=yes` scope empties
+    /// on exit. Widening Landlock over the parent cgroup just to unlink two empty
+    /// directories ourselves would be a worse trade than letting the scope do it.
+    pub fn cleanup() {
+        let Some(Some(workers)) = WORKERS.get() else { return };
+        // Per-child leaves (and any self-test `probe` leaf) — Landlock-permitted.
+        let mut removed = 0usize;
+        if let Ok(entries) = std::fs::read_dir(workers) {
+            for entry in entries.flatten() {
+                if std::fs::remove_dir(entry.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        if std::env::var_os("GOSUB_DEBUG_CGROUP").is_some() {
+            eprintln!("[broker] cgroup: cleanup removed {removed} per-child leaf cgroup(s)");
+        }
+        // Best-effort full teardown; the parent-cgroup steps no-op under Landlock.
+        if let Some(base) = workers.parent() {
+            let pid = std::process::id();
+            let leader = base.join(format!("gosub.{pid}.leader"));
+            let _ = write_file(&base.join("cgroup.procs"), &pid.to_string());
+            let _ = std::fs::remove_dir(workers);
+            let _ = std::fs::remove_dir(&leader);
+        }
+    }
+
     /// Place a freshly-spawned child into its own memory-limited cgroup. A no-op
     /// where the subtree was never set up, and only logged (never fatal) on error
     /// — the child still runs, just rlimit-bounded, exactly as before cgroups.
@@ -807,6 +846,14 @@ mod cgroup {
 pub fn confine_spawned_child(pid: u32) -> std::io::Result<()> {
     cgroup::place_child(pid);
     Ok(())
+}
+
+/// Tear down the broker's cgroup subtree at shutdown (best-effort), symmetric to
+/// the per-child placement in [`confine_spawned_child`]. Call once every child
+/// has been reaped. See [`cgroup::cleanup`].
+#[cfg(feature = "multi-process")]
+pub fn cleanup_spawned_cgroups() {
+    cgroup::cleanup();
 }
 
 /// Test hook for the `cgroup-memory-limit` probe: bound this process's memory via

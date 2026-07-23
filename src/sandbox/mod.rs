@@ -223,6 +223,16 @@ pub fn confine_spawned_child(child: &crate::spawn::Child) -> std::io::Result<()>
     }
 }
 
+/// Tear down the broker's cgroup subtree at shutdown, symmetric to
+/// [`confine_spawned_child`]. Best-effort and safe to call unconditionally: a
+/// no-op where no subtree was set up, and outside Linux. Call once every child
+/// has been reaped, so the per-child cgroups are empty and removable.
+#[cfg(feature = "multi-process")]
+pub fn cleanup_spawned_cgroups() {
+    #[cfg(target_os = "linux")]
+    imp::cleanup_spawned_cgroups();
+}
+
 /// Test hook for the `cgroup-memory-limit` probe: bound this process's memory via
 /// cgroup v2 `memory.max` and read the ceiling back, or `None` where cgroup v2
 /// memory delegation is unavailable (the probe then skips). Linux only.

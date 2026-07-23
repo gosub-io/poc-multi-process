@@ -1213,6 +1213,14 @@ impl EngineLoop {
         }
 
         self.spawner.shutdown_forkserver();
+
+        // Every child is now reaped, so the per-child cgroups are empty: tear the
+        // broker's cgroup subtree down (best-effort) rather than orphaning it
+        // under /sys/fs/cgroup. A no-op in single-process mode and where no
+        // subtree was set up.
+        #[cfg(feature = "multi-process")]
+        crate::sandbox::cleanup_spawned_cgroups();
+
         self.emit(EngineEvent::EngineShutdown);
     }
 }
