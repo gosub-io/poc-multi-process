@@ -237,10 +237,14 @@ capability the zygote gave up cannot be its child.
   renderer can't fill the host disk one bounded `Set` at a time. Landlock is
   best-effort: a kernel without it degrades to seccomp + the hashing, rather
   than refusing to start.
-  **Audio and GPU are honest stubs**: real processes with the correct device
-  filter (`baseline + openat + ioctl`) and empty netns, but no real work — a PoC
-  has no hardware to drive, and `ioctl` is a large surface seccomp constrains
-  poorly, so the isolation they show is the process boundary, not a tight filter.
+  **GPU and audio are intentional stubs, by scope**: real processes with the
+  correct device filter (`baseline + openat + ioctl`) and empty net/IPC/UTS
+  namespaces, which proves the security-relevant thing — GPU/audio can run *out of
+  process and confined*. The actual graphics work is deliberately out of scope: a
+  PoC has no hardware to drive, and compositing is not a security demonstration.
+  The honest caveat (inherent to real GPU work, not a gap to close) is that
+  `ioctl` is a large surface seccomp constrains poorly, so the isolation shown is
+  the process boundary, not a tight filter.
 
 - Renderers hold no secrets: cookies and network access live in the engine
   and net component. A renderer can only send IPC messages, and every message
@@ -741,5 +745,3 @@ simplified is the surrounding browser. What each entry below still needs:
   real one would also seccomp-confine itself around the `fork()`/fd-passing
   path. Linux only — `fork()`-without-exec + the Rust runtime relies on
   `fork()` semantics. Elsewhere renderers fall back to direct fork+exec.
-- **Phase 3 (GPU process)** is not modeled — structurally it's the same pattern
-  as the net component.

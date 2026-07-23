@@ -494,10 +494,15 @@ Others:
 - **A real JS JIT needs executable memory**, so it would carve out a dedicated
   JIT exception rather than deny `PROT_EXEC` outright (same on Windows for
   `ProhibitDynamicCode`).
-- **Audio and GPU are honest stubs** — real processes with the correct filter
-  and empty netns, but no real work. `ioctl` is a large, driver-defined surface
-  seccomp constrains poorly, so the isolation they demonstrate is the process
-  boundary, not a tight filter.
+- **GPU and audio are intentional stubs** (a PoC *scope boundary*, not a
+  shortcut) — real processes with the correct device filter (`openat` + `ioctl`)
+  and empty net/IPC/UTS namespaces, proving GPU/audio can run *out of process and
+  confined*, which is the security point. The actual graphics work (compositing:
+  buffer pools, damage rects, swapchain — the WebGL/canvas attack surface) is not
+  a security demonstration and is deliberately out of scope. The one honest caveat
+  that remains is inherent to real GPU work, not a gap the PoC needs to close:
+  `ioctl` is a large, driver-defined surface seccomp constrains poorly, so the
+  isolation shown is the process boundary, not a tight filter.
 - **No per-process memory cap on macOS** (a platform gap, not a shortcut): no
   hard cap a third-party app can self-impose exists — `RLIMIT_AS` rejected,
   `RLIMIT_DATA` ineffective, the kernel ledger limits root/Apple-private-entitlement
@@ -519,7 +524,3 @@ Others:
   are absent. And `origin_of` is not a real URL parser (no IDNA, no userinfo;
   `host_of` in the SSRF filter remains the deliberately-hostile one — a real
   engine shares one implementation).
-- **Real GPU/compositor** is not modeled: the GPU/audio processes are confined
-  stubs (correct filter + empty netns, no hardware work), structurally the same
-  pattern as the net component. A real GPU process would composite (buffer pool,
-  damage rects, swapchain) — a major attack surface WebGL/canvas live behind.
