@@ -15,6 +15,8 @@
 
 use crate::ip_utils::{resolve_and_pin, Resolver};
 use crate::ipc::{Endpoint, FetchMode, FetchOutcome, NetRequest, NetResponse};
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+use crate::ipc::{FromNet, VaultRequest, VaultResponse};
 use crate::orb::{orb_decide, MimeKind, OrbDecision};
 
 /// Multi-process entry point: adopt the inherited IPC link, sandbox, serve.
@@ -59,11 +61,87 @@ impl Resolver for SyntheticResolver {
 }
 
 pub fn serve(mut ep: Endpoint) {
+    // The vault link (Linux): net is the vault's sole client. Bound on the
+    // `BindVault` control message that arrives once at startup, before any
+    // cookie op. Held as a raw stream, not an `Endpoint`: the fd arrives *after*
+    // `lock_down_net`, and splitting it into halves would `dup` via `fcntl`,
+    // which the net filter denies (its own link is split pre-lockdown for the
+    // same reason). Net uses the vault link from this one thread, synchronously,
+    // so a single stream — read and written through a shared ref — suffices.
+    // `vault_rid` correlates net's own request/reply on that link.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    let mut vault: Option<std::os::unix::net::UnixStream> = None;
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    let mut vault_rid: u64 = 0;
+
     // Loop ends when `recv` errors (engine went away) or on `Shutdown`.
     while let Ok(req) = ep.recv::<NetRequest>() {
         match req {
             NetRequest::Shutdown => break,
-            NetRequest::Fetch { request_id, for_zone, for_origin, url, cookies } => {
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            NetRequest::BindVault => {
+                // The vault-facing socket fd follows via SCM_RIGHTS. Adopt it as
+                // a raw stream (no split → no fcntl dup, which the filter denies).
+                match ep.rx.recv_fd() {
+                    Ok(fd) => vault = Some(std::os::unix::net::UnixStream::from(fd)),
+                    Err(e) => eprintln!("[net] BindVault without a vault fd: {e}"),
+                }
+            }
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            NetRequest::CookieSet { zone, origin, name, value, http_only } => {
+                // Fire-and-forget to the vault; if it is absent (shouldn't
+                // happen — BindVault comes first) the cookie is simply dropped.
+                if let Some(stream) = vault.as_ref() {
+                    let req = VaultRequest::Set { zone, origin, name, value, http_only };
+                    let mut w: &std::os::unix::net::UnixStream = stream;
+                    let _ = crate::ipc::send_msg(&mut w, &req);
+                }
+            }
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            NetRequest::CookieGetVisible { request_id, zone, origin } => {
+                // The document.cookie view: the vault filters HttpOnly.
+                let cookies = vault_get(&mut vault, &mut vault_rid, zone, &origin, true);
+                if ep.send(&FromNet::CookieVisible { request_id, cookies }).is_err() {
+                    break;
+                }
+            }
+            NetRequest::Fetch {
+                request_id,
+                for_zone,
+                for_origin,
+                url,
+                cookies,
+            } => {
+                // The request id travels with the reply so the engine can
+                // route it back to the tab that asked, even with many
+                // fetches in flight.
+                let requester = format!("zone-{for_zone}/{for_origin}");
+                // The origin's cookies to attach — *including HttpOnly*. In
+                // multi-process on Linux net sources them from the vault (keyed by
+                // the broker-stamped identity) and reports the attached names for
+                // the observe line — sent *before* the streaming decision, so a
+                // streamed (blob) body is observed exactly like an in-band one.
+                // Single-process / off Linux the broker attached them in `cookies`.
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                let cookies = if vault.is_some() {
+                    let c = vault_get(&mut vault, &mut vault_rid, for_zone, &for_origin, false);
+                    let names = c.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+                    if ep
+                        .send(&FromNet::CookieAttached {
+                            request_id,
+                            zone: for_zone,
+                            origin: for_origin.clone(),
+                            names,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    c
+                } else {
+                    cookies
+                };
+
                 // Large bodies stream through a shared-memory ring when the
                 // transport can carry the fd (SSRF policy still applies
                 // first). `GOSUB_BODY_TRANSPORT=socket` forces the in-band
@@ -81,35 +159,105 @@ pub fn serve(mut ep: Endpoint) {
                     }
                 }
 
-                // The request id travels with the reply so the engine can
-                // route it back to the tab that asked, even with many
-                // fetches in flight.
-                let requester = format!("zone-{for_zone}/{for_origin}");
                 // Report the cookies attached to the outbound request, so the
-                // end-to-end property is observable (and asserted): the *full*
-                // set — including HttpOnly — reaches the network here, having
-                // skipped the renderer entirely.
+                // end-to-end property is observable: the *full* set — including
+                // HttpOnly — reaches the network here, having skipped the
+                // renderer entirely.
                 let names =
                     cookies.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(",");
                 eprintln!("[net] fetch for {requester} attaches cookies: [{names}]");
                 let outcome = handle_fetch(&requester, &url, &cookies, &SyntheticResolver);
-                let resp = NetResponse { request_id, outcome };
-                if ep.send(&resp).is_err() {
+                if send_reply(&mut ep, request_id, outcome).is_err() {
                     break;
                 }
             }
-            NetRequest::Subresource { request_id, url, mode, same_origin, cookies } => {
+            NetRequest::Subresource {
+                request_id,
+                url,
+                mode,
+                same_origin,
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                for_zone,
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                for_origin,
+                cookies,
+            } => {
                 // Subresources may be cross-origin: same SSRF + redirect handling
                 // as a fetch, then Opaque Response Blocking decides what — if
                 // anything — reaches the renderer. No streaming path; a
-                // subresource rides the ordinary reply.
+                // subresource rides the ordinary reply. Cookies come from the
+                // vault in multi-process on Linux (with an attached-names report),
+                // else from the broker-attached `cookies` field.
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                let cookies = if vault.is_some() {
+                    let c = vault_get(&mut vault, &mut vault_rid, for_zone, &for_origin, false);
+                    let names = c.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+                    if ep
+                        .send(&FromNet::CookieAttached {
+                            request_id,
+                            zone: for_zone,
+                            origin: for_origin.clone(),
+                            names,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    c
+                } else {
+                    cookies
+                };
                 let outcome =
                     handle_subresource(&url, mode, same_origin, &cookies, &SyntheticResolver);
-                if ep.send(&NetResponse { request_id, outcome }).is_err() {
+                if send_reply(&mut ep, request_id, outcome).is_err() {
                     break;
                 }
             }
         }
+    }
+}
+
+/// Send a fetch/subresource reply to the engine. On Linux it is wrapped in
+/// [`FromNet::Reply`] (the engine reads a `FromNet` there); elsewhere it is a
+/// bare [`NetResponse`].
+fn send_reply(ep: &mut Endpoint, request_id: u64, outcome: FetchOutcome) -> std::io::Result<()> {
+    let resp = NetResponse { request_id, outcome };
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    {
+        ep.send(&FromNet::Reply(resp))
+    }
+    #[cfg(not(all(feature = "multi-process", target_os = "linux")))]
+    {
+        ep.send(&resp)
+    }
+}
+
+/// Query the vault synchronously on net's dedicated link. Net blocking itself
+/// here is fine — the vault answers a narrow, bounded query. An absent or broken
+/// vault link yields no cookies (fail closed), never a hang.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+fn vault_get(
+    vault: &mut Option<std::os::unix::net::UnixStream>,
+    rid: &mut u64,
+    zone: u64,
+    origin: &str,
+    visible_only: bool,
+) -> Vec<(String, String)> {
+    let Some(stream) = vault.as_ref() else {
+        return Vec::new();
+    };
+    let request_id = *rid;
+    *rid = rid.wrapping_add(1);
+    let req = VaultRequest::Get { request_id, zone, origin: origin.to_string(), visible_only };
+    // Read/write through a shared ref to the one stream — no dup.
+    let mut w: &std::os::unix::net::UnixStream = stream;
+    if crate::ipc::send_msg(&mut w, &req).is_err() {
+        return Vec::new();
+    }
+    let mut r: &std::os::unix::net::UnixStream = stream;
+    match crate::ipc::recv_msg::<VaultResponse>(&mut r) {
+        Ok(resp) => resp.cookies,
+        Err(_) => Vec::new(),
     }
 }
 
@@ -150,11 +298,11 @@ fn stream_blob(ep: &mut Endpoint, request_id: u64, body_len: u64) -> std::io::Re
         Err(e) => {
             eprintln!("[net] ring setup failed ({e}); denying stream");
             let outcome = FetchOutcome::Denied { reason: "body stream setup failed".into() };
-            return ep.send(&NetResponse { request_id, outcome });
+            return send_reply(ep, request_id, outcome);
         }
     };
     let outcome = FetchOutcome::OkStreaming { status: 200, body_len };
-    ep.send(&NetResponse { request_id, outcome })?;
+    send_reply(ep, request_id, outcome)?;
     ep.tx.send_fd(fd.as_raw_fd())?;
     drop(fd); // the consumer got its duplicate; our mapping needs no fd
 

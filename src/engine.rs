@@ -31,6 +31,8 @@ use crate::ipc::{
     FromRenderer, NetRequest, NetResponse, ServiceControl, StorageRequest, StorageResponse,
     SubresourceOutcome, ToDecoder, ToRenderer,
 };
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+use crate::ipc::FromNet;
 use crate::{net_daemon, renderer};
 use std::collections::HashMap;
 use std::io;
@@ -155,6 +157,16 @@ enum LoopMsg {
     /// [`MAX_SERVICE_RESTARTS`]. Sent by the service reader thread on EOF when its
     /// gate is still open (an intentional shutdown closes the gate first).
     ServiceGone { service: ServiceKind },
+    /// The net component answered a `CookieGetVisible` with the vault's
+    /// `document.cookie` view (Linux — cookies live in the vault, reached via
+    /// net). Routed back to the tab that asked.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    CookieVisible { request_id: u64, cookies: Vec<(String, String)> },
+    /// The net component reported which cookies it attached to an outbound
+    /// fetch/subresource, for the observe line (Linux — the broker never holds
+    /// the values, only this report).
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    CookieAttached { zone: u64, origin: String, names: Vec<String> },
 }
 
 /// A running child component, however it is hosted.
@@ -377,6 +389,12 @@ enum Role<'a> {
 /// A cookie in the engine's jar. `http_only` cookies are attached to network
 /// requests by the net component but withheld from renderers — the browser
 /// property that keeps session tokens out of a compromised renderer.
+///
+/// The broker holds the jar off Linux, and in **single-process** mode on Linux —
+/// where there is no address-space isolation, so an out-of-process vault would
+/// buy nothing, and cookie *policy* must stay identical across modes. In
+/// multi-process on Linux the jar lives in the out-of-process vault (via net) and
+/// this jar stays empty.
 struct Cookie {
     name: String,
     value: String,
@@ -398,7 +416,26 @@ struct EngineLoop {
     /// partition). Renderers reach it only through the broker — in
     /// multi-process mode it never lives in their address space, and HttpOnly
     /// cookies never reach them at all.
+    ///
+    /// The in-broker jar. Used off Linux and in single-process mode on Linux;
+    /// **empty** in multi-process on Linux, where the jar is the out-of-process
+    /// vault (reached via the net component) and only [`pending_cookies`] routes
+    /// `document.cookie` replies back to the requesting tab. [`cookies_in_vault`]
+    /// selects between them at runtime.
+    ///
+    /// [`pending_cookies`]: EngineLoop::pending_cookies
+    /// [`cookies_in_vault`]: EngineLoop::cookies_in_vault
     cookies: HashMap<(ZoneId, String), Vec<Cookie>>,
+    /// In-flight `document.cookie` reads (Linux vault path): request id -> the
+    /// tab that asked plus the `(zone, origin)` to label the observe line with,
+    /// since the reply from net carries only the request id and the cookies.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    pending_cookies: HashMap<u64, (TabId, ZoneId, String)>,
+    /// The cookie vault process (Linux, multi-process only): spawned at startup
+    /// with its single link handed to the net component. Kept only to reap it at
+    /// shutdown; `None` in single-process mode, where no vault is spawned.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    vault: Option<ChildHandle>,
     /// In-flight fetches: request id -> the tab awaiting the reply.
     pending_fetches: HashMap<u64, TabId>,
     /// In-flight subresource loads: request id -> the tab awaiting the reply.
@@ -497,28 +534,67 @@ impl EngineLoop {
         // Bring up the net component and a reader thread that forwards its
         // replies into the inbox, bounded by the net component's gate.
         let (net_handle, ep) = spawner.spawn(Role::Net).expect("spawn net component at startup");
-        let (net_tx, mut net_rx) = ep.split();
+        // `net_tx` is used mutably only on Linux, to send the vault-bind control
+        // message + fd below; elsewhere it is just moved into the struct.
+        #[cfg_attr(
+            not(all(feature = "multi-process", target_os = "linux")),
+            allow(unused_mut)
+        )]
+        let (mut net_tx, mut net_rx) = ep.split();
         let net_gate = Gate::new(MAX_QUEUED_PER_SOURCE);
         {
             let inbox = inbox.clone();
             let net_gate = Arc::clone(&net_gate);
             std::thread::spawn(move || {
                 crate::sandbox::install_thread_crash_altstack();
-                while let Ok(resp) = net_rx.recv::<NetResponse>() {
-                    // A streaming response's ring fd follows on the same
-                    // socket; this thread is its only reader, so take the
-                    // fd here and route both together.
-                    #[cfg(all(feature = "multi-process", target_os = "linux"))]
-                    if matches!(resp.outcome, FetchOutcome::OkStreaming { .. }) {
-                        let Ok(fd) = net_rx.recv_fd() else { break };
-                        if !net_gate.acquire() {
-                            break;
+                // On Linux net multiplexes fetch replies with the cookie-flow
+                // messages (it now routes cookies through the vault), so the
+                // reader decodes a `FromNet`; elsewhere it is a bare
+                // `NetResponse` and the broker keeps the jar.
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                while let Ok(from) = net_rx.recv::<FromNet>() {
+                    match from {
+                        FromNet::Reply(resp) => {
+                            // A streaming response's ring fd follows on the same
+                            // socket; this thread is its only reader, so take the
+                            // fd here and route both together.
+                            if matches!(resp.outcome, FetchOutcome::OkStreaming { .. }) {
+                                let Ok(fd) = net_rx.recv_fd() else { break };
+                                if !net_gate.acquire() {
+                                    break;
+                                }
+                                if inbox.send(LoopMsg::NetStream { resp, fd }).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            if !net_gate.acquire() {
+                                break;
+                            }
+                            if inbox.send(LoopMsg::NetReply(resp)).is_err() {
+                                break;
+                            }
                         }
-                        if inbox.send(LoopMsg::NetStream { resp, fd }).is_err() {
-                            break;
+                        FromNet::CookieVisible { request_id, cookies } => {
+                            if !net_gate.acquire() {
+                                break;
+                            }
+                            if inbox.send(LoopMsg::CookieVisible { request_id, cookies }).is_err() {
+                                break;
+                            }
                         }
-                        continue;
+                        FromNet::CookieAttached { request_id: _, zone, origin, names } => {
+                            if !net_gate.acquire() {
+                                break;
+                            }
+                            if inbox.send(LoopMsg::CookieAttached { zone, origin, names }).is_err() {
+                                break;
+                            }
+                        }
                     }
+                }
+                #[cfg(not(all(feature = "multi-process", target_os = "linux")))]
+                while let Ok(resp) = net_rx.recv::<NetResponse>() {
                     if !net_gate.acquire() {
                         break;
                     }
@@ -528,6 +604,29 @@ impl EngineLoop {
                 }
             });
         }
+
+        // Bring up the cookie vault (Linux, multi-process only) and hand its
+        // single link to the net component, which is its sole client. The broker
+        // creates the net<->vault socketpair, spawns the vault with the vault
+        // end as its one inherited link, then passes the net end to the net
+        // component via SCM_RIGHTS behind a `BindVault` control message — and
+        // keeps neither fd. In single-process mode no vault is spawned (net's
+        // vault link stays absent, so it attaches no cookies).
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        let vault: Option<ChildHandle> = if matches!(spawner, Spawner::Multi { .. }) {
+            use std::os::fd::AsRawFd;
+            let (net_end, vault_end) =
+                std::os::unix::net::UnixStream::pair().expect("net<->vault socketpair");
+            let child = spawner.spawn_vault(vault_end).expect("spawn vault process");
+            net_tx.send(&NetRequest::BindVault).expect("announce vault to net");
+            // SAFETY: `net_end` is a live socket this process owns; SCM_RIGHTS
+            // duplicates it into the net component.
+            net_tx.send_fd(net_end.as_raw_fd()).expect("pass vault fd to net");
+            drop(net_end); // the broker keeps neither vault fd
+            Some(ChildHandle::Process(child))
+        } else {
+            None
+        };
 
         // Prepare the on-disk state the filesystem services expect *before*
         // spawning them: the engine is unconfined and can create directories,
@@ -574,6 +673,10 @@ impl EngineLoop {
             net_gate,
             tabs: HashMap::new(),
             cookies: HashMap::new(),
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            pending_cookies: HashMap::new(),
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            vault,
             pending_fetches: HashMap::new(),
             pending_subresources: HashMap::new(),
             pending_decodes: HashMap::new(),
@@ -642,10 +745,25 @@ impl EngineLoop {
                     self.tab_command(tab_id, cmd)
                 }
                 LoopMsg::Command(EngineCommand::SetCookie { zone, origin, name, value, http_only }) => {
-                    self.cookies
-                        .entry((zone, origin))
-                        .or_default()
-                        .push(Cookie { name, value, http_only });
+                    // Multi-process on Linux: the jar lives in the vault, reached
+                    // via net. Single-process and off Linux: the broker holds it.
+                    if self.cookies_in_vault() {
+                        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                        {
+                            let _ = self.net_tx.send(&NetRequest::CookieSet {
+                                zone: zone.0,
+                                origin,
+                                name,
+                                value,
+                                http_only,
+                            });
+                        }
+                    } else {
+                        self.cookies
+                            .entry((zone, origin))
+                            .or_default()
+                            .push(Cookie { name, value, http_only });
+                    }
                 }
                 LoopMsg::Command(EngineCommand::Shutdown) => {
                     self.shutdown();
@@ -709,6 +827,16 @@ impl EngineLoop {
                 }
                 LoopMsg::ServiceGone { service } => {
                     self.respawn_service(service);
+                }
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                LoopMsg::CookieVisible { request_id, cookies } => {
+                    self.cookie_visible(request_id, cookies);
+                    self.net_gate.release();
+                }
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                LoopMsg::CookieAttached { zone, origin, names } => {
+                    observe_cookie_names("fetch", ZoneId(zone), &origin, &names);
+                    self.net_gate.release();
                 }
             }
         }
@@ -1002,12 +1130,32 @@ impl EngineLoop {
 
     /// A renderer asked for something privileged. This dispatch *is* the
     /// security boundary — and it is the same code in both modes.
+    /// Whether the cookie jar lives in the out-of-process vault (multi-process on
+    /// Linux) rather than in the broker's own [`cookies`] map. `false` in
+    /// single-process mode (no vault is spawned) and off Linux — there the broker
+    /// keeps the jar, so cookie *policy* is identical across modes.
+    ///
+    /// [`cookies`]: EngineLoop::cookies
+    fn cookies_in_vault(&self) -> bool {
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        {
+            self.vault.is_some()
+        }
+        #[cfg(not(all(feature = "multi-process", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
     fn tab_request(&mut self, tab_id: TabId, msg: FromRenderer) {
         // A renderer-facing send that fails (a write timeout on a renderer that
         // floods and never reads, or a broken pipe) sets this; the tab is then
         // torn down *after* the `tab` borrow ends — `drop_tab_crashed` needs
         // `&mut self`, which the borrow would conflict with mid-body.
         let mut send_failed = false;
+        // Computed before the `tab` borrow (the method needs `&self`): whether
+        // cookies live in the vault (multi-process) or the in-broker jar.
+        let in_vault = self.cookies_in_vault();
         'req: {
             let Some(tab) = self.tabs.get_mut(&tab_id) else {
                 return; // late message from a tab we already closed
@@ -1050,10 +1198,20 @@ impl EngineLoop {
                     // Attach this (zone, origin)'s cookies — *including HttpOnly* —
                     // for the net component to put on the request. The zone selects
                     // the partition, so a fetch in one zone never carries another
-                    // zone's cookies. These values go to the network process,
-                    // never back to the renderer.
-                    let cookies = attachable_cookies(&self.cookies, tab.zone, &tab.origin);
-                    observe_cookies("fetch", tab.zone, &tab.origin, &cookies);
+                    // zone's cookies. These values go to the network process, never
+                    // back to the renderer. In multi-process on Linux the net
+                    // component sources them from the vault (keyed by the identity
+                    // below) and reports the attached names back for the observe
+                    // line, so send an **empty** set here — no HttpOnly cookie
+                    // rides the wire. Single-process / off Linux: attach from the
+                    // in-broker jar and observe here.
+                    let cookies: Vec<(String, String)> = if in_vault {
+                        Vec::new()
+                    } else {
+                        let cookies = attachable_cookies(&self.cookies, tab.zone, &tab.origin);
+                        observe_cookies("fetch", tab.zone, &tab.origin, &cookies);
+                        cookies
+                    };
                     self.pending_fetches.insert(request_id, tab_id);
                     tab.inflight_fetches += 1;
                     let req = NetRequest::Fetch {
@@ -1082,15 +1240,46 @@ impl EngineLoop {
                     // not the message contents. The renderer receives only the
                     // *non-HttpOnly* cookies — the `document.cookie` view — so an
                     // exploited renderer never sees its origin's session token.
-                    let reply = if requested == tab.origin {
-                        let visible = visible_cookies(&self.cookies, tab.zone, &requested);
-                        observe_cookies("document.cookie", tab.zone, &requested, &visible);
-                        ToRenderer::Cookies(Some(visible))
+                    //
+                    // Multi-process on Linux: the visible set lives in the vault —
+                    // ask net for it (recording who to answer + the identity for
+                    // the observe line), and the reply arrives as
+                    // `LoopMsg::CookieVisible`. Single-process / off Linux: the
+                    // broker reads its own jar and answers inline.
+                    if in_vault {
+                        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                        {
+                            if requested == tab.origin {
+                                let request_id = self.next_request_id;
+                                self.next_request_id += 1;
+                                self.pending_cookies
+                                    .insert(request_id, (tab_id, tab.zone, requested.clone()));
+                                let req = NetRequest::CookieGetVisible {
+                                    request_id,
+                                    zone: tab.zone.0,
+                                    origin: requested,
+                                };
+                                if self.net_tx.send(&req).is_err() {
+                                    self.pending_cookies.remove(&request_id);
+                                    if tab.tx.send(&ToRenderer::Cookies(None)).is_err() {
+                                        send_failed = true;
+                                    }
+                                }
+                            } else if tab.tx.send(&ToRenderer::Cookies(None)).is_err() {
+                                send_failed = true;
+                            }
+                        }
                     } else {
-                        ToRenderer::Cookies(None)
-                    };
-                    if tab.tx.send(&reply).is_err() {
-                        send_failed = true;
+                        let reply = if requested == tab.origin {
+                            let visible = visible_cookies(&self.cookies, tab.zone, &requested);
+                            observe_cookies("document.cookie", tab.zone, &requested, &visible);
+                            ToRenderer::Cookies(Some(visible))
+                        } else {
+                            ToRenderer::Cookies(None)
+                        };
+                        if tab.tx.send(&reply).is_err() {
+                            send_failed = true;
+                        }
                     }
                 }
                 FromRenderer::Tile { width, height, pixels } => {
@@ -1170,14 +1359,30 @@ impl EngineLoop {
                     let same_origin = dest_origin == tab.origin;
                     // Destination-origin cookies in this tab's zone (HttpOnly
                     // included — they reach the net component, never the renderer;
-                    // the response is ORB-filtered regardless).
-                    let cookies = attachable_cookies(&self.cookies, tab.zone, &dest_origin);
+                    // the response is ORB-filtered regardless). In multi-process on
+                    // Linux net sources them from the vault (keyed by the
+                    // destination identity below), so send an empty set;
+                    // single-process / off Linux the broker attaches from its jar.
+                    let cookies: Vec<(String, String)> = if in_vault {
+                        Vec::new()
+                    } else {
+                        attachable_cookies(&self.cookies, tab.zone, &dest_origin)
+                    };
                     let request_id = self.next_request_id;
                     self.next_request_id += 1;
                     self.pending_subresources.insert(request_id, tab_id);
                     tab.inflight_fetches += 1;
-                    let req =
-                        NetRequest::Subresource { request_id, url, mode, same_origin, cookies };
+                    let req = NetRequest::Subresource {
+                        request_id,
+                        url,
+                        mode,
+                        same_origin,
+                        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                        for_zone: tab.zone.0,
+                        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                        for_origin: dest_origin,
+                        cookies,
+                    };
                     if self.net_tx.send(&req).is_err() {
                         self.pending_subresources.remove(&request_id);
                         tab.inflight_fetches -= 1;
@@ -1465,6 +1670,19 @@ impl EngineLoop {
         self.send_to_tab(tab_id, &ToRenderer::DecodeResult(outcome));
     }
 
+    /// Deliver the vault's `document.cookie` view (via net) to the tab that
+    /// asked. The observe line is emitted here — the only place the broker sees
+    /// the visible set on Linux — labelled with the identity recorded when the
+    /// request went out, so it matches the pre-vault format.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    fn cookie_visible(&mut self, request_id: u64, cookies: Vec<(String, String)>) {
+        let Some((tab_id, zone, origin)) = self.pending_cookies.remove(&request_id) else {
+            return; // requester gone while the read was in flight
+        };
+        observe_cookies("document.cookie", zone, &origin, &cookies);
+        self.send_to_tab(tab_id, &ToRenderer::Cookies(Some(cookies)));
+    }
+
     fn net_reply(&mut self, resp: NetResponse) {
         // A reply is for either a document fetch or a subresource load; its
         // request id is in exactly one of the two pending maps, which is how the
@@ -1587,6 +1805,14 @@ impl EngineLoop {
         let mut net_handle = std::mem::replace(&mut self.net_handle, ChildHandle::Thread(dummy_thread()));
         kill_child(&mut net_handle);
         join(net_handle);
+
+        // The vault (Linux) exits on its own once net drops its link, but reap it
+        // so it never lingers. Kill-before-join, like every other child.
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        if let Some(mut vault) = self.vault.take() {
+            kill_child(&mut vault);
+            join(vault);
+        }
 
         // End the services. Each gets its shutdown message, then is killed and
         // reaped; the device stubs only need their links dropped (they exit on
@@ -1746,12 +1972,24 @@ fn may_fetch(tab_origin: &str, url: &str) -> bool {
 /// is `"document.cookie"` (the visible set sent to a renderer) or `"fetch"` (the
 /// full set attached to an outbound request).
 fn observe_cookies(kind: &str, zone: ZoneId, origin: &str, cookies: &[(String, String)]) {
+    let names = cookies.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>();
+    observe_cookie_names(kind, zone, origin, &names);
+}
+
+/// The same observe line, from cookie *names* alone — what the Linux vault path
+/// has for an attached-cookie report (the broker never holds the values). `N`
+/// lets a `&[&str]` and a `&[String]` caller share one function.
+fn observe_cookie_names<N: AsRef<str>>(kind: &str, zone: ZoneId, origin: &str, names: &[N]) {
     if std::env::var_os("GOSUB_OBSERVE_COOKIES").is_some() {
-        let names = cookies.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(",");
+        let names = names.iter().map(|n| n.as_ref()).collect::<Vec<_>>().join(",");
         println!("[observe] zone {} {kind} {origin} = [{names}]", zone.0);
     }
 }
 
+/// The `(zone, origin)` partition's cookies (name, value) to attach to an
+/// outbound request — **including HttpOnly**. Used where the broker holds the
+/// jar (off Linux / single-process); in multi-process on Linux the vault answers
+/// this instead.
 fn attachable_cookies(
     jar: &HashMap<(ZoneId, String), Vec<Cookie>>,
     zone: ZoneId,
@@ -1763,7 +2001,9 @@ fn attachable_cookies(
 }
 
 /// The `document.cookie` view of a partition: its **non-HttpOnly** cookies
-/// only, so an exploited renderer never sees its origin's session token.
+/// only, so an exploited renderer never sees its origin's session token. Used
+/// where the broker holds the jar (off Linux / single-process); in multi-process
+/// on Linux the vault applies this filter.
 fn visible_cookies(
     jar: &HashMap<(ZoneId, String), Vec<Cookie>>,
     zone: ZoneId,
@@ -1937,6 +2177,27 @@ impl Spawner {
         })
     }
 
+    /// Spawn the cookie vault (Linux, multi-process), handing it `vault_end` as
+    /// its one inherited link — the vault talks only to the net component. Reuses
+    /// the fork+exec service spawn path; the vault self-confines to the tightest
+    /// filter in the model. `None` in single-process mode (no exe to spawn), where
+    /// the caller leaves net without a vault link.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    fn spawn_vault(
+        &self,
+        vault_end: std::os::unix::net::UnixStream,
+    ) -> Option<crate::spawn::Child> {
+        match self {
+            Spawner::Multi { exe, .. } => Some(spawn_inherited(
+                exe,
+                &["vault"],
+                crate::channel::Channel::from_stream(vault_end),
+                true,
+            )),
+            _ => None,
+        }
+    }
+
     /// Shut down the fork server (Linux). No-op otherwise.
     fn shutdown_forkserver(&mut self) {
         #[cfg(all(feature = "multi-process", target_os = "linux"))]
@@ -1987,6 +2248,9 @@ mod tests {
     use crate::events::EngineEvent;
     use std::time::Duration;
 
+    // The broker-jar cookie helpers exist only where the broker holds the jar;
+    // on Linux the vault owns it (and is unit-tested in `vault.rs`).
+    #[cfg(not(all(feature = "multi-process", target_os = "linux")))]
     fn cookie(name: &str, value: &str, http_only: bool) -> Cookie {
         Cookie { name: name.into(), value: value.into(), http_only }
     }
@@ -2041,6 +2305,7 @@ mod tests {
         assert!(t.allow(ServiceKind::Font, later), "stale deaths prune away");
     }
 
+    #[cfg(not(all(feature = "multi-process", target_os = "linux")))]
     fn pair(a: &str, b: &str) -> (String, String) {
         (a.to_string(), b.to_string())
     }
@@ -2093,6 +2358,7 @@ mod tests {
         assert!(!may_fetch("https://example.com", "not-a-url"));
     }
 
+    #[cfg(not(all(feature = "multi-process", target_os = "linux")))]
     #[test]
     fn cookies_partitioned_by_zone_and_httponly_hidden() {
         let mut jar: HashMap<(ZoneId, String), Vec<Cookie>> = HashMap::new();

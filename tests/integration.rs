@@ -102,7 +102,27 @@ fn cookie_flow_hides_httponly_and_partitions_by_zone() {
     let out = run_env(&[], &[("GOSUB_OBSERVE_COOKIES", "1")]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "exit {:?}\nstdout: {stdout}", out.status);
+    assert_cookie_flow(&stdout);
+}
 
+/// The same properties must hold in **single-process** mode — cookies are
+/// *policy*, not transport, so unlike the vault's out-of-process isolation they
+/// run identically in both modes (single-process falls back to the in-broker jar,
+/// which has nothing to isolate anyway). Guards the single-process regression the
+/// vault cutover briefly introduced.
+#[test]
+fn cookie_flow_identical_in_single_process() {
+    let out = run_env(&["--single-process"], &[("GOSUB_OBSERVE_COOKIES", "1")]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exit {:?}\nstdout: {stdout}", out.status);
+    assert_cookie_flow(&stdout);
+}
+
+/// The end-to-end HttpOnly + `(zone,origin)`-partition assertions, shared by the
+/// multi- and single-process cookie-flow tests. Matched on the broker's stdout,
+/// which — unlike the child processes' shared, interleaving stderr — is a single
+/// process and can be asserted deterministically.
+fn assert_cookie_flow(stdout: &str) {
     // document.cookie exposes the non-HttpOnly cookie…
     assert!(
         stdout.contains("zone 0 document.cookie https://example.com = [theme]"),

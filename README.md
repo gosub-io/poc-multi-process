@@ -88,6 +88,17 @@ the broker); cookies are the outlier still to move. This is import-time
 architecture, not implemented here — see *Shortcuts taken* and the
 `browser-architecture-comparison.md` notes.
 
+The *parsing* half of that principle is a **deliberately accepted risk**: the
+deserialization stays in the broker rather than moving to an isolated subprocess.
+Chromium isolates its parser because it is C++; this one is safe Rust, so the
+residual (a bincode/serde soundness bug, a logic bug through a well-typed message,
+a bounded DoS) is low and is hardened *in-language* — bounds + framing + fuzzing
+today, and a **typestate** contract next (`IPC-TYPESTATE.md`), not an external IDL.
+The honest limit: a broker-parser exploit is still full compromise (the broker's
+danger is its ambient authority, which the vault does not reduce), so this is a
+conscious bet on Rust's memory safety, to be revisited if the parser ever gains
+`unsafe` or a C dependency.
+
 The broker is not left *entirely* unconfined, though. Like Chromium's browser
 process — which is sandboxed, just far more loosely than a renderer — it gets
 two loose, best-effort layers. A **Landlock sandbox** on the filesystem: it may

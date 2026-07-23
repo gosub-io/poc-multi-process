@@ -526,16 +526,31 @@ open one.
 *The fix, for import — shrink the broker*, on the principle that no one process
 should hold both large secrets *and* a large hostile-input surface (the broker
 fails it; so does Chromium's network service, which holds cookies *and* parses
-HTTP/TLS). Two moves: **(1)** move the secrets out — the **cookie jar** goes to a
+HTTP/TLS). The **secrets** half is addressed: the **cookie jar** goes to a
 dedicated low-authority **`vault`** process (no network; narrow typed interface
 `get-attachable`/`get-visible`/`set`; keyed by broker-stamped `(zone, origin)`;
 structured-cookie hand-off so it parses nothing hostile; origin-scoping enforced
 inside it; optionally partitioned per zone so it does not itself become an
 aggregation point). Storage already follows this shape — its data lives in the
-service, not the broker — so cookies are the outlier to move. **(2)** move the
-untrusted parsing out, or behind validated/codegen'd IPC bindings, rather than
-hand-rolled `bincode::deserialize` in the secret-holding process (a *minimized
-subprocess* parser). Do both and a broker compromise no longer yields the jar.
+service, not the broker — so cookies are the outlier to move.
+
+**The parsing half is a deliberately *accepted* risk — the deserialization stays
+in the broker.** Physically isolating the parser (Chromium's model) is skipped on
+purpose, because Chromium isolates a *C++* parser it cannot trust for memory
+safety, and this one is **safe Rust**: the residual tail is a bincode/serde
+soundness bug, a logic bug slipping through a well-typed message, or a bounded
+DoS — all low-probability, and mitigated by memory safety, length framing +
+`MAX_FRAME_LEN`, closed wire enums, a `cargo-fuzz` harness, and the planned
+**typestate** contract hardening (see [IPC-TYPESTATE.md](IPC-TYPESTATE.md), which
+adds Firefox-IPDL-style compile-checked message direction/pairing/ordering
+*without* an IDL toolchain). The honest limit of this acceptance: a successful
+broker-parser exploit is still *full* compromise, because the broker's danger is
+its **ambient authority** (it spawns processes and holds capabilities), which the
+vault does not reduce — so this is a bet that Rust's memory safety is strong
+enough to protect the most-privileged process's parser. **Revisit if** the parser
+ever gains `unsafe` or a C dependency, or the threat model shifts. Not an external
+IDL (Mojo/IPDL) — for a single-binary all-Rust engine those solve problems (cross-
+language bindings, version skew) this codebase does not have.
 
 Others:
 

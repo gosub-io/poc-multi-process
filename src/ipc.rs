@@ -140,19 +140,27 @@ pub enum NetRequest {
     Fetch {
         request_id: u64,
         /// The `(zone, origin)` identity, stamped by the *engine* from its own
-        /// bookkeeping — a compromised renderer cannot spoof either half.
+        /// bookkeeping — a compromised renderer cannot spoof either half. On
+        /// Linux the net component uses this pair to query the vault for the
+        /// cookies to attach; elsewhere the engine sends them in `cookies`.
         for_zone: u64,
         for_origin: String,
         url: String,
         /// The origin's cookies (name, value) for the net component to attach
-        /// to the request — *including* HttpOnly ones. These reach the
-        /// network process but never the renderer.
+        /// to the request — *including* HttpOnly ones. These reach the network
+        /// process but never the renderer. Populated where the broker holds the
+        /// jar (off Linux, and single-process on Linux, which has no vault);
+        /// **empty** in multi-process on Linux, where net sources them from the
+        /// vault via `for_zone`/`for_origin` — so no HttpOnly cookie rides this
+        /// field on the wire in the isolated mode.
         cookies: Vec<(String, String)>,
     },
-    /// A subresource fetch that may be cross-origin. `same_origin` and the
-    /// destination-origin `cookies` are computed by the *engine* (which owns the
-    /// canonical origins and the jar); the net component applies SSRF +
-    /// redirects like a fetch, then Opaque Response Blocking on the response.
+    /// A subresource fetch that may be cross-origin. `same_origin` is computed by
+    /// the *engine* (which owns the canonical origins); the net component applies
+    /// SSRF + redirects like a fetch, then Opaque Response Blocking on the
+    /// response. The destination-origin cookies are the broker's `cookies` field
+    /// elsewhere, or sourced by net from the vault on Linux via `for_zone`/
+    /// `for_origin` (the destination identity the engine computed).
     Subresource {
         request_id: u64,
         url: String,
@@ -161,8 +169,32 @@ pub enum NetRequest {
         /// by the engine. The net component additionally treats a redirect that
         /// leaves the initial authority as cross-origin (fails safe).
         same_origin: bool,
+        /// The destination `(zone, origin)` the engine resolved, so net can query
+        /// the vault for the cookies to attach (Linux — the vault path).
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        for_zone: u64,
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        for_origin: String,
+        /// The destination-origin cookies the broker attached. Populated where the
+        /// broker holds the jar (off Linux, and single-process on Linux, which has
+        /// no vault); **empty** in multi-process on Linux, where net sources them
+        /// from the vault via `for_zone`/`for_origin` instead — so no HttpOnly
+        /// cookie ever rides this field on the wire in the isolated mode.
         cookies: Vec<(String, String)>,
     },
+    /// Adopt the vault link (Linux): the vault-facing socket fd follows this
+    /// message via `SCM_RIGHTS`. Sent once at engine startup — net is the vault's
+    /// sole client, and all cookie ops route through it thereafter.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    BindVault,
+    /// Store a cookie (fire-and-forget): net forwards it to the vault as a
+    /// [`VaultRequest::Set`]. Identity stamped by the broker.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    CookieSet { zone: u64, origin: String, name: String, value: String, http_only: bool },
+    /// The `document.cookie` view for `(zone, origin)`: net queries the vault
+    /// (`visible_only`) and answers the broker with [`FromNet::CookieVisible`].
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    CookieGetVisible { request_id: u64, zone: u64, origin: String },
     Shutdown,
 }
 
@@ -171,6 +203,26 @@ pub enum NetRequest {
 pub struct NetResponse {
     pub request_id: u64,
     pub outcome: FetchOutcome,
+}
+
+/// Net component -> engine, on Linux where net routes cookies through the vault.
+/// Multiplexes the ordinary fetch reply with the two cookie-flow messages net
+/// now originates: the `document.cookie` view it read from the vault, and an
+/// observe-report of the cookies it attached to an outbound fetch (the broker no
+/// longer sees the values, only the report). Elsewhere net sends a bare
+/// [`NetResponse`] and the broker keeps the jar.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[derive(Serialize, Deserialize, Debug)]
+pub enum FromNet {
+    /// A fetch/subresource reply — routed exactly as a bare `NetResponse` was
+    /// (including the streamed-body path, whose ring fd still follows).
+    Reply(NetResponse),
+    /// The vault's `document.cookie` set for a [`NetRequest::CookieGetVisible`].
+    CookieVisible { request_id: u64, cookies: Vec<(String, String)> },
+    /// The names net attached to a fetch/subresource, with the `(zone, origin)`
+    /// they were attached for, so the broker can emit the observe line without
+    /// ever holding the values.
+    CookieAttached { request_id: u64, zone: u64, origin: String, names: Vec<String> },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
