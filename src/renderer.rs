@@ -111,13 +111,25 @@ fn render_page(ep: &mut Endpoint, origin: &str, url: &str) -> io::Result<()> {
         _ => None,
     };
 
-    // Cookies for our own origin — held by the engine, requested via the
-    // broker (Phase 2).
+    // Cookies for our own origin — held out of this process, requested via the
+    // broker (Phase 2). The reply is the `document.cookie` view: non-HttpOnly
+    // cookies only, so a session token never enters a renderer's address space.
     ep.send(&FromRenderer::NeedCookies { origin: origin.to_string() })?;
-    let _cookies = match ep.recv::<ToRenderer>()? {
+    let cookies = match ep.recv::<ToRenderer>()? {
         ToRenderer::Cookies(cookies) => cookies,
         _ => None,
     };
+    // Report what document.cookie exposed, so the end-to-end HttpOnly property
+    // is observable (and asserted by the integration suite): the visible names
+    // must include non-HttpOnly cookies and never an HttpOnly one.
+    let names = cookies
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!("[renderer] document.cookie exposes: [{names}]");
 
     // The page has an image. A renderer never parses image bytes itself — that
     // is the most dangerous input a browser handles — so it brokers the decode

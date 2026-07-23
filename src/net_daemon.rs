@@ -85,6 +85,13 @@ pub fn serve(mut ep: Endpoint) {
                 // route it back to the tab that asked, even with many
                 // fetches in flight.
                 let requester = format!("zone-{for_zone}/{for_origin}");
+                // Report the cookies attached to the outbound request, so the
+                // end-to-end property is observable (and asserted): the *full*
+                // set — including HttpOnly — reaches the network here, having
+                // skipped the renderer entirely.
+                let names =
+                    cookies.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(",");
+                eprintln!("[net] fetch for {requester} attaches cookies: [{names}]");
                 let outcome = handle_fetch(&requester, &url, &cookies, &SyntheticResolver);
                 let resp = NetResponse { request_id, outcome };
                 if ep.send(&resp).is_err() {
