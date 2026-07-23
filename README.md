@@ -142,6 +142,20 @@ what Chromium and Firefox do. Naming them keeps the honest ones honest and stops
   ICU/locale data, fonts, the GPU shader cache, `dlopen`'d libraries, and
   `/proc/self/maps`; "no `openat` ever" is tighter than reality. It moves to a
   path broker + Landlock rather than an outright denial.
+- **The `fcntl` allowlist is tile-shaped** — `fcntl` is argument-filtered to the
+  seal commands (`F_ADD_SEALS`/`F_GET_SEALS`/`F_GETFD`, plus `F_SETFD` only to
+  *set* `CLOEXEC`), enforceable only because the renderer does nothing but seal
+  tiles. A real renderer issues `fcntl` beyond these — `F_SETFL` for non-blocking
+  fds in async I/O, `F_DUPFD_CLOEXEC` outside the fork path — so this filter
+  relaxes alongside the threads/JIT ones.
+- **The ephemeral decoder's timeout only *reaps* a wedged fork-served decoder at
+  shutdown** — on a decode timeout the engine frees the slot, replies `Failed`,
+  and drops the socket, but it cannot *kill* a fork-served child (it isn't the
+  parent; the fork server is), so a decoder compromised into spinning lingers
+  until the fork server dies with its PID namespace. Harmless for the bounded
+  `GIMG` stub (which can't loop), but a real codec that infinite-loops on hostile
+  input wants an active kill path — the fork server reporting child pids, or a
+  per-`(zone,origin)` decoder pool it can terminate.
 - **Net component is outbound-only** — no `bind`/`listen`, which is right for a
   fetcher, but WebRTC's ICE/STUN/TURN binds local UDP sockets. Real-time media
   reopens `bind` (QUIC is fine — it is connected UDP).
@@ -716,9 +730,10 @@ simplified is the surrounding browser. What each entry below still needs:
   `open`/`openat` and `kill`/`ptrace` denials cover the properties regardless.
   Also still wanted: a per-arch seccomp baseline tested across libc/kernel
   versions. And several of the tightest limits here (W^X, no renderer threads,
-  the 512 MiB `RLIMIT_AS`, zero file opens) are enforceable only because this
-  renderer is a stub — a real JIT-and-media renderer relaxes each and compensates
-  elsewhere; see *What a real renderer would force open* above.
+  the 512 MiB `RLIMIT_DATA` committed-heap cap, zero file opens, the seal-only
+  `fcntl` allowlist) are enforceable only because this renderer is a stub — a
+  real JIT-and-media renderer relaxes each and compensates elsewhere; see *What a
+  real renderer would force open* above.
 
   **Platform status.** Linux is the reference implementation: seccomp, empty
   net/IPC/UTS/PID namespaces, rlimits, non-dumpable processes, broker Landlock + a

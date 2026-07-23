@@ -893,6 +893,11 @@ impl EngineLoop {
                 let mut tab = self.tabs.remove(&tab_id).unwrap();
                 tab.gate.close(); // unblock the reader thread if it's flooding
                 let _ = tab.tx.send(&ToRenderer::Shutdown);
+                // Kill-before-join: a renderer that ignores Shutdown must not hang
+                // the loop on the join (a no-op for a fork-served child, which the
+                // fork server reaps; matters for the directly-parented Process
+                // renderers on non-Linux).
+                kill_child(&mut tab.handle);
                 join(tab.handle);
                 self.pending_fetches.retain(|_, t| *t != tab_id);
                 self.pending_subresources.retain(|_, t| *t != tab_id);
@@ -940,9 +945,12 @@ impl EngineLoop {
 
         // Tear down the old renderer. Closing the gate before ending the link is
         // what makes this a *swap* and not a *crash*: the reader sees the gate
-        // closed on EOF and does not raise TabGone for `tab_id`.
+        // closed on EOF and does not raise TabGone for `tab_id`. Kill-before-join
+        // so an old renderer that ignores Shutdown can't hang the swap (no-op for
+        // a fork-served child; matters for Process renderers on non-Linux).
         old.gate.close();
         let _ = old.tx.send(&ToRenderer::Shutdown);
+        kill_child(&mut old.handle);
         join(old.handle);
         self.pending_fetches.retain(|_, t| *t != tab_id);
         self.pending_subresources.retain(|_, t| *t != tab_id);
@@ -1563,26 +1571,42 @@ impl EngineLoop {
     }
 
     fn shutdown(&mut self) {
+        // Kill-before-join throughout: each child gets its Shutdown message (so a
+        // cooperative one exits cleanly), then is killed before the join so a
+        // wedged or compromised child — a service that ignores Shutdown, a
+        // non-Linux Process renderer — cannot hang the engine's own exit. `kill`
+        // is a harmless no-op on an already-exiting child, a fork-served child
+        // (reaped by the fork server), or an in-process thread.
         for (_, mut tab) in self.tabs.drain() {
             tab.gate.close();
             let _ = tab.tx.send(&ToRenderer::Shutdown);
+            kill_child(&mut tab.handle);
             join(tab.handle);
         }
         self.net_gate.close();
         let _ = self.net_tx.send(&NetRequest::Shutdown);
-        join(std::mem::replace(&mut self.net_handle, ChildHandle::Thread(dummy_thread())));
+        let mut net_handle = std::mem::replace(&mut self.net_handle, ChildHandle::Thread(dummy_thread()));
+        kill_child(&mut net_handle);
+        join(net_handle);
 
-        // End the services. Each gets its shutdown message, then its handle is
+        // End the services. Each gets its shutdown message, then is killed and
         // reaped; the device stubs only need their links dropped (they exit on
         // EOF), but a Shutdown makes the intent explicit.
         self.storage_gate.close();
         let _ = self.storage.tx.send(&StorageRequest::Shutdown);
-        join(std::mem::replace(&mut self.storage.handle, ChildHandle::Thread(dummy_thread())));
+        let mut storage_handle =
+            std::mem::replace(&mut self.storage.handle, ChildHandle::Thread(dummy_thread()));
+        kill_child(&mut storage_handle);
+        join(storage_handle);
         self.font_gate.close();
         let _ = self.font.tx.send(&FontRequest::Shutdown);
-        join(std::mem::replace(&mut self.font.handle, ChildHandle::Thread(dummy_thread())));
+        let mut font_handle =
+            std::mem::replace(&mut self.font.handle, ChildHandle::Thread(dummy_thread()));
+        kill_child(&mut font_handle);
+        join(font_handle);
         for mut dev in self.devices.drain(..) {
             let _ = dev.tx.send(&ServiceControl::Shutdown);
+            kill_child(&mut dev.handle);
             join(dev.handle);
         }
 
