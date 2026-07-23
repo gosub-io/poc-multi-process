@@ -365,6 +365,17 @@ pub fn lock_down_renderer() {
     enforce("renderer", install(BASELINE.to_vec()));
 }
 
+/// Cap the **vault** (cookie store): the same bare baseline as a renderer — no
+/// network, no `openat`, no `ioctl`, no exec — because it needs the least
+/// authority of any process. It only moves bytes on its inherited IPC fd and
+/// touches its own memory. The tightest filter in the model, for the process
+/// that holds the secrets.
+#[cfg(feature = "multi-process")]
+pub fn lock_down_vault() {
+    deny_debugger_attach();
+    enforce("vault", install(BASELINE.to_vec()));
+}
+
 /// Cap the net component: the baseline plus the socket family.
 #[cfg(feature = "multi-process")]
 pub fn lock_down_net() {

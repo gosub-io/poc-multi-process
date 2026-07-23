@@ -161,6 +161,15 @@ pub fn lock_down_net() {
     imp::lock_down_net();
 }
 
+/// Confine the **vault** (cookie store): the tightest filter of any role — the
+/// bare content baseline (no network, files, devices, or exec) plus
+/// non-dumpable. It holds secrets, so it gets the least authority of any
+/// process. Linux only (the vault is Linux-only). Fail-closed.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn lock_down_vault() {
+    imp::lock_down_vault();
+}
+
 /// What extra capability an engine-spawned service needs beyond the content
 /// baseline. Unlike a renderer or the decoder, these roles need a privilege the
 /// zygote gave up (filesystem or device access), which is why each is spawned

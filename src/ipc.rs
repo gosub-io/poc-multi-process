@@ -254,6 +254,32 @@ pub struct FontResponse {
     pub metrics: Option<FontMetrics>,
 }
 
+/// Engine/net -> **vault**: the cookie store lives in its own low-authority
+/// process (Linux), out of the secret-holding broker. Identity (`zone`,
+/// `origin`) is stamped by the broker from its own bookkeeping — never a
+/// renderer claim — exactly as for storage/fetch. Linux-only, like the rest of
+/// the fd-passing machinery (fork server, shm, ring) the vault is wired with.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[derive(Serialize, Deserialize, Debug)]
+pub enum VaultRequest {
+    /// Store a cookie in the `(zone, origin)` partition.
+    Set { zone: u64, origin: String, name: String, value: String, http_only: bool },
+    /// Read a partition's cookies. `visible_only` returns just the non-HttpOnly
+    /// set (the `document.cookie` view); otherwise the full set to attach to an
+    /// outbound request (including HttpOnly — this reply goes to the net
+    /// component, never to a renderer).
+    Get { request_id: u64, zone: u64, origin: String, visible_only: bool },
+    Shutdown,
+}
+
+/// Vault -> engine/net: the cookies for a [`VaultRequest::Get`].
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct VaultResponse {
+    pub request_id: u64,
+    pub cookies: Vec<(String, String)>,
+}
+
 /// The decode outcome as it reaches the renderer — the decoder's own result,
 /// plus a synthesized failure for the case where the decoder died before
 /// answering (which the engine turns into a `Failed`, so a decoder crash is

@@ -11,7 +11,7 @@ use gosub_proc_iso_poc::renderer;
 #[cfg(feature = "multi-process")]
 use gosub_proc_iso_poc::{decoder, device_service, font, net_daemon, selftest, storage};
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
-use gosub_proc_iso_poc::fork_server;
+use gosub_proc_iso_poc::{fork_server, vault};
 
 #[cfg(feature = "multi-process")]
 const DEFAULT_MODE: Mode = Mode::Multi;
@@ -56,6 +56,10 @@ fn main() {
         Some("gpu") => device_service::run("gpu", &args[2]),
         #[cfg(all(feature = "multi-process", target_os = "linux"))]
         Some("fork-server") => fork_server::run(&args[2]),
+        // The cookie vault: a low-authority in-memory secret store, kept out of
+        // the broker (Linux only — see `vault`).
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        Some("vault") => vault::run(&args[2]),
         // Internal sandbox self-test, spawned only by the integration suite.
         #[cfg(feature = "multi-process")]
         Some("selftest") => selftest::run(&args[2]),

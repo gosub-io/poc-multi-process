@@ -44,6 +44,10 @@ pub mod net_daemon;
 pub mod orb;
 pub mod renderer;
 pub mod storage;
+// The vault (cookie store) is Linux-only, like the fork server / shm / ring it
+// shares fd-passing machinery with.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub mod vault;
 // Unconditional: the per-OS confinement machinery inside is feature-gated, but
 // `deny_debugger_attach` applies to the single-process build too — that build
 // still holds the cookie jar in its address space. The platform backend
