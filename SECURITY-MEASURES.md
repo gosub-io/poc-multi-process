@@ -33,7 +33,8 @@ is no boundary behind them (`--single-process` / `--no-default-features`).
 
 Every engine-spawned child (services + the fork server) is additionally placed in
 its own **cgroup v2 `memory.max`** where the platform allows it (best-effort — a
-delegated systemd scope or root; see §2.5). The governing rule: **the zygote may
+delegated systemd scope or root; see §2.5); the broker tears that subtree back
+down at shutdown rather than orphaning it under `/sys/fs/cgroup`. The governing rule: **the zygote may
 only parent processes strictly less privileged than itself.** Its filter,
 namespaces and non-dumpable flag are inherited and only ever narrow — so any role
 needing a capability the zygote gave up (files, devices, network) is spawned
@@ -49,12 +50,12 @@ fork+exec from the engine instead, with its own wider filter.
 |---|---|---|
 | Capability split across processes — network, filesystem, devices and rendering each live in a different process | `engine.rs`, `sandbox/mod.rs` | Applied |
 | **Site isolation**: one renderer per `(zone, origin)`; the same origin in two zones is two processes with independent partitions | `engine.rs` | Applied |
-| **Ephemeral image decoder** — one process decodes exactly one image and exits, so a decoder can never see a second origin's data | `decoder.rs` (`serve_one`) | Applied |
+| **Ephemeral image decoder** — one process decodes exactly one image and exits, so a decoder can never see a second origin's data. The engine's wait for its reply is time-bounded (`DECODE_TIMEOUT`) so a decoder wedged by the image it parsed can't pin a reader thread or hold the tab's decode slot forever | `decoder.rs` (`serve_one`), `engine.rs` (`broker_decode`) | Applied |
 | Renderers hold **no secrets** — no cookies, no network handle; they can only send IPC messages | `renderer.rs` | Applied |
 | **Cross-origin navigation swaps renderers** — a cross-origin navigation tears down the tab's renderer and brings up a fresh process bound to the new origin (Chromium's `RenderFrameHost` change), so two origins never share a process. The swap reuses the `tab_id`, so each renderer generation carries a monotonic **epoch**: a message the old renderer already queued is dropped rather than processed against the new origin (which would be a cross-origin storage write) | `engine.rs` | Applied |
 | Crash containment — a dead renderer surfaces as `TabCrashed` for that tab only; engine and other tabs continue | `engine.rs` | Applied |
 | **Crash-loop guard** — an origin that crashes its renderer `CRASH_LOOP_THRESHOLD`+ times within a window is refused a fresh one (`OpenTabFailed`/`NavigationFailed`) instead of being respawned into a loop; the backoff is scoped to `(zone, origin)` and expires with the window | `engine.rs` (`CrashTracker`) | Applied |
-| Fork server is **minimal, single-threaded and secret-free**, and is started *before* the engine loads any cookies | `fork_server.rs` | Applied |
+| Fork server is **minimal, single-threaded and secret-free**, and is started *before* the engine loads any cookies. As the OS parent of every renderer and (short-lived) decoder it sets `SA_NOCLDWAIT`, so exited children are auto-reaped rather than accumulating as zombies over a long session | `fork_server.rs` | Applied |
 
 ### 1.2 Broker policy (the engine event loop *is* the boundary)
 
@@ -80,7 +81,9 @@ Classifies the **numeric** address, so alternate spellings do not help:
   6to4 relay.
 - IPv6 equivalents incl. unique-local and link-local.
 - Alternate IP encodings (`http://2130706433/`, `0x7f.1`, octal), IPv4-mapped
-  IPv6, NAT64 / IPv4-compatible embeddings (`64:ff9b::7f00:1`, `::127.0.0.1`).
+  IPv6, NAT64 / IPv4-compatible / 6to4 embeddings (`64:ff9b::7f00:1`,
+  `::127.0.0.1`, `2002:c0a8:0101::`) — the embedded IPv4 is re-classified, so a
+  public embed stays allowed while an internal one is blocked.
 - Userinfo confusion (`http://real.com@127.0.0.1/`) and trailing dot.
 - Fails **closed** on any blocked answer.
 - **Re-run on every redirect hop**, with the resolved IP pinned per hop: an open
@@ -222,10 +225,15 @@ does not fit (Chromium's *browser* process is likewise not allowlisted). Instead
 it runs default-**allow** with a `Trap` on the post-compromise escalation
 primitives it never needs: `ptrace`/`process_vm_*`, kernel-module loading
 (`init_module`/`finit_module`/`kexec_*`/`bpf`), the LPE surfaces
-(`perf_event_open`/`userfaultfd`/keyring/`kcmp`), and namespace/mount escapes
-(`setns`/`mount`/`umount2`/`pivot_root`/`swapon`/`reboot`). Every denied syscall
+(`perf_event_open`/`userfaultfd`/keyring/`kcmp`), and namespace/mount escapes —
+the classic calls (`setns`/`mount`/`umount2`/`pivot_root`) *and* the newer
+fd-based mount API (`fsopen`/`fsconfig`/`fsmount`/`move_mount`/`open_tree`/
+`fspick`/`mount_setattr`), which reach the same capability a different way — plus
+`open_by_handle_at` (opening by handle bypasses path checks and Landlock) and
+`swapon`/`swapoff`/`reboot`. Every denied syscall
 is one **no child needs either**, since this filter is inherited before each child
-installs its own stricter allowlist. Best-effort (`lock_down_broker`).
+installs its own stricter allowlist. Best-effort (`lock_down_broker`); the
+`broker-seccomp-mount` probe verifies the fd-based mount API actually traps.
 
 ### 2.2 Argument filtering
 
@@ -470,12 +478,13 @@ be a backend-shaped piece of work.
 
 - **Probe suite** (`selftest.rs`), asserted against a per-platform expectation
   so a probe that silently disappears behind a `cfg` fails the build:
-  - **Linux (22)**: `baseline`, `mprotect-exec`, `socket`, `memfd-seal`,
+  - **Linux (23)**: `baseline`, `mprotect-exec`, `socket`, `memfd-seal`,
     `fcntl-dupfd`, `ring`, `netns`, `pidns`, `no-ptrace`, `forkserver-can-fork`,
     `forkserver-canary-gap`, `forkserver-no-exec`, `forkserver-no-socket`,
     `forkserver-no-newuser-clone`, `service-fs-openat`, `service-fs-no-socket`,
     `service-device-ioctl`, `service-landlock`, `broker-landlock`,
-    `broker-seccomp`, `cgroup-memory-limit`, `crash-report`.
+    `broker-seccomp`, `broker-seccomp-mount`, `cgroup-memory-limit`,
+    `crash-report`.
   - **macOS (13)**: `seatbelt-file`, `seatbelt-network`, `seatbelt-exec`,
     `seatbelt-net-role-keeps-network`, `seatbelt-baseline`,
     `seatbelt-file-write`, `seatbelt-fork`, `seatbelt-signal-other`,

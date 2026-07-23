@@ -83,7 +83,9 @@ syscall surface it genuinely needs (exec, threads, files, sockets — which is w
 a renderer-style allowlist does not fit, and why Chromium's browser process is
 not allowlisted either), but the escalation primitives it never uses are a fatal
 `SIGSYS` — `ptrace`/`process_vm_*`, kernel-module loading, `kexec`, `bpf`,
-`perf_event_open`, `userfaultfd`, the keyring, `mount`/`setns`/`pivot_root`. So a
+`perf_event_open`, `userfaultfd`, the keyring, and both the classic *and* the
+fd-based mount escapes (`mount`/`setns`/`pivot_root` **and**
+`fsopen`/`fsmount`/`move_mount`/`open_tree`/…, plus `open_by_handle_at`). So a
 broker compromise can no longer reach for a kernel exploit. Every denied syscall
 is also one no child needs, because this filter is inherited before each child
 installs its own stricter allowlist. See `lock_down_broker` in `src/sandbox/`.
@@ -216,7 +218,10 @@ capability the zygote gave up cannot be its child.
   exactly one image and exits. It is a content process with the renderer's
   confinement (no network, files, or exec), so a parser bug is contained; a
   crash is relayed to the renderer as a decode *failure*, never a crash of
-  anything else. It is deliberately **ephemeral, not shared**: holding no state,
+  anything else. The wait for its reply is **time-bounded** (`DECODE_TIMEOUT`):
+  a decoder wedged by the image it parsed can't pin the engine's reader thread
+  or hold the tab's decode slot forever — it times out to a decode failure, the
+  socket is dropped, and the process is reaped. It is deliberately **ephemeral, not shared**: holding no state,
   a decoder can never see a second origin's image — a single long-lived decoder
   would reintroduce the cross-origin channel the per-`(zone,origin)` split
   closes. The per-image fork is what the warm fork server makes cheap.
@@ -304,8 +309,9 @@ capability the zygote gave up cannot be its child.
   — TEST-NETs, benchmarking, `192.0.0/24`, 6to4 relay — and the IPv6
   equivalents incl. unique-local and link-local), so it isn't fooled by
   alternate IP encodings (`http://2130706433/`, `0x7f.1`, octal), IPv4-mapped
-  IPv6, NAT64/IPv4-compatible embeddings (`64:ff9b::7f00:1`, `::127.0.0.1`),
-  userinfo confusion (`http://real.com@127.0.0.1/`), or a trailing dot.
+  IPv6, NAT64/IPv4-compatible/6to4 embeddings (`64:ff9b::7f00:1`,
+  `::127.0.0.1`, `2002:c0a8:0101::`), userinfo confusion
+  (`http://real.com@127.0.0.1/`), or a trailing dot.
   Subnet-directed broadcast (`x.y.z.255`) is knowingly not classified — it
   depends on the local netmask, and refusing every `.255` would break
   legitimate public hosts.
@@ -338,7 +344,9 @@ capability the zygote gave up cannot be its child.
   RSS bound whose OOM kill is scoped to the offending child rather than the global
   killer reaching the broker; it degrades to rlimits-only in a shared scope. This
   is the parent-side `confine_spawned_child` seam, the Linux analogue of the
-  Windows job-object memory cap.
+  Windows job-object memory cap. At shutdown the broker tears its cgroup subtree
+  back down (removing the per-child leaves it can, the rest reclaimed by the
+  enclosing `Delegate=yes` scope) rather than orphaning it under `/sys/fs/cgroup`.
 - **Crash reporting** without a core dump or `ptrace`: `RLIMIT_CORE=0` stops
   cores, `PR_SET_DUMPABLE=0` and the broker deny-list stop any *other* process
   reading a crashed one — so, like Crashpad on Linux, the crashing process
@@ -404,6 +412,10 @@ forked child then drops privileges (its own seccomp filter; rlimits inherited
 from the fork server) and serves. Crash detection is unchanged: the engine holds
 the renderer's socket end, so a dead renderer still surfaces as `TabCrashed`
 regardless of which process is its OS parent; the fork server reaps the corpse.
+Because it is the OS parent of every renderer and (short-lived) decoder, the
+fork server sets `SA_NOCLDWAIT` so the kernel auto-reaps them as they exit —
+otherwise a long session's exited decoders and crashed renderers would pile up
+as zombies until it shut down.
 
 You can see it in a syscall trace: only `fork-server` and `net-daemon` are ever
 `execve`'d — the renderers appear only as `clone()`/`fork()` from the fork
@@ -673,7 +685,8 @@ simplified is the surrounding browser. What each entry below still needs:
   **broker** gets a loose Landlock too (read/exec anywhere, write only the temp
   dir) plus a **deny-list seccomp filter** (allow by default, `SIGSYS` on the
   escalation syscalls it never uses — `ptrace`, kernel-module loading, `kexec`,
-  `bpf`, `mount`/`setns`). Renderers also get a **PID** namespace now (shared
+  `bpf`, and both the classic and fd-based mount escapes,
+  `mount`/`setns` and `fsopen`/`fsmount`/`move_mount`/…). Renderers also get a **PID** namespace now (shared
   across the fork server's renderers, with a pinned PID-1 placeholder so one
   renderer exiting can't `SIGKILL` its siblings) — so a renderer can't name the
   broker or host by pid. *Per-renderer* PID namespaces and an empty-root **mount**
@@ -694,7 +707,7 @@ simplified is the surrounding browser. What each entry below still needs:
   **Platform status.** Linux is the reference implementation: seccomp, empty
   net/IPC/UTS/PID namespaces, rlimits, non-dumpable processes, broker Landlock + a
   seccomp deny-list, best-effort per-child cgroup v2 `memory.max`, self-captured
-  scrubbed crash reports, 22 probes.
+  scrubbed crash reports, 23 probes.
   macOS runs a Seatbelt `(deny default)`
   profile with 13 probes — including **path-scoped file services** (storage/font
   get `subpath` read/write grants for their own directory plus a broad
