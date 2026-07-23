@@ -793,6 +793,11 @@ simplified is the surrounding browser. What each entry below still needs:
   *restricting-SID* token stays out for the same image-loading reason; the
   AppContainer is what actually clears that wall. See `src/sandbox/windows.rs`.
 
+  For a side-by-side of exactly where macOS and Windows lag Linux — and which
+  gaps are portable (the cookie vault, the crash reporter, the zero-copy
+  transports) versus genuine platform limits (macOS has no hard memory cap, the
+  fork-server zygote is Linux-only) — see [`PLATFORM-PARITY.md`](PLATFORM-PARITY.md).
+
   Note the netns is obtained via `CLONE_NEWUSER | CLONE_NEWNET` (an unprivileged
   `CLONE_NEWNET` alone needs `CAP_SYS_ADMIN`) and the uid map is deliberately
   left unwritten, so children run as the overflow uid. This makes multi-process

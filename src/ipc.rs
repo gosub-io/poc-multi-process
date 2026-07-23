@@ -407,17 +407,20 @@ impl EndpointTx {
     /// forever; `None` clears it.
     ///
     /// A no-op on local (in-process) channels — same address space, not a
-    /// security boundary — and on Windows, whose transport is an anonymous pipe
-    /// (`File`) that std gives no per-write timeout for; the reply-timeout caller
-    /// simply blocks there as it did before, and Windows is not the reference
-    /// platform for this bound. Mirrors [`EndpointRx::set_read_timeout`].
-    #[cfg_attr(not(all(feature = "multi-process", unix)), allow(unused_variables))]
+    /// security boundary. On Windows the transport is an anonymous pipe with no
+    /// std timeout, so the deadline is enforced by a `CancelIoEx` watchdog in the
+    /// channel backend (see `channel::windows`); the observable behaviour matches
+    /// the unix socket path. Mirrors [`EndpointRx::set_read_timeout`].
+    #[cfg_attr(not(feature = "multi-process"), allow(unused_variables))]
     pub fn set_write_timeout(&mut self, dur: Option<std::time::Duration>) -> io::Result<()> {
         match self {
             #[cfg(all(feature = "multi-process", unix))]
             EndpointTx::Socket(stream) => stream.set_write_timeout(dur),
-            #[cfg(all(feature = "multi-process", not(unix)))]
-            EndpointTx::Socket(_) => Ok(()),
+            #[cfg(all(feature = "multi-process", windows))]
+            EndpointTx::Socket(stream) => {
+                stream.set_timeout(dur);
+                Ok(())
+            }
             EndpointTx::Local(_) => Ok(()),
         }
     }
@@ -459,17 +462,19 @@ impl EndpointRx {
     /// rather than blocking the caller forever; `None` clears it.
     ///
     /// A no-op on local (in-process) channels — same address space, not a
-    /// security boundary — and on Windows, whose transport is an anonymous pipe
-    /// (`File`) that std gives no per-read timeout for; the decode-timeout caller
-    /// simply blocks there as it did before, and Windows is not the reference
-    /// platform for this bound.
-    #[cfg_attr(not(all(feature = "multi-process", unix)), allow(unused_variables))]
+    /// security boundary. On Windows the deadline is enforced by a `CancelIoEx`
+    /// watchdog in the channel backend (see `channel::windows`), matching the
+    /// unix socket path.
+    #[cfg_attr(not(feature = "multi-process"), allow(unused_variables))]
     pub fn set_read_timeout(&mut self, dur: Option<std::time::Duration>) -> io::Result<()> {
         match self {
             #[cfg(all(feature = "multi-process", unix))]
             EndpointRx::Socket(stream) => stream.set_read_timeout(dur),
-            #[cfg(all(feature = "multi-process", not(unix)))]
-            EndpointRx::Socket(_) => Ok(()),
+            #[cfg(all(feature = "multi-process", windows))]
+            EndpointRx::Socket(stream) => {
+                stream.set_timeout(dur);
+                Ok(())
+            }
             EndpointRx::Local(_) => Ok(()),
         }
     }
