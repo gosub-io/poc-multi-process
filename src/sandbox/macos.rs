@@ -225,9 +225,9 @@ fn enforce(role: &str, profile: &str) {
 /// safe: only `setrlimit`/`setpriority` syscalls.
 #[cfg(feature = "multi-process")]
 pub fn apply_child_rlimits() -> std::io::Result<()> {
-    // No RLIMIT_AS on macOS (see above): a compromised child's memory growth is
-    // bounded by the machine, not by us. A production build would reach for a
-    // Jetsam/memory-pressure limit or a per-process memory footprint API.
+    // No RLIMIT_AS on macOS (see above), and no other per-process memory cap a
+    // third-party app can self-impose either — a genuine platform gap, documented
+    // in full below (a content process is bounded by the OS's Jetsam instead).
     // A child needs only a handful of fds (its IPC socket + std streams).
     set_rlimit(libc::RLIMIT_NOFILE, 128)?;
     // No core dumps — a crash must not spill page contents (cookies, tokens).
@@ -238,6 +238,29 @@ pub fn apply_child_rlimits() -> std::io::Result<()> {
     set_priority(10)?;
     Ok(())
 }
+
+// ── No per-process memory cap on macOS (a platform gap, not a shortcut) ──
+//
+// The Linux backend bounds a child's *resident* memory with a cgroup `memory.max`
+// and Windows with a job-object memory cap. macOS has no equivalent a *third-party*
+// app can self-impose:
+//
+//   * `RLIMIT_AS` — rejected outright (`EINVAL`); see `apply_child_rlimits`.
+//   * `RLIMIT_DATA` — accepted but ineffective: macOS allocators use `mmap`, which
+//     it does not account.
+//   * `task_set_phys_footprint_limit` / `memorystatus_control` — the kernel's real
+//     memory-ledger limits (what Jetsam enforces), but gated behind root or the
+//     `com.apple.private.memorystatus` **Apple-private** entitlement. Verified on
+//     an M1: `task_set_phys_footprint_limit(mach_task_self, …)` returns
+//     `KERN_NO_ACCESS` unprivileged, and a browser cannot obtain a `com.apple.private.*`
+//     entitlement, so this is not a path that exists for gosub.
+//   * memory-pressure dispatch sources — a *notification* to shed caches, not a cap.
+//
+// So on macOS a content process's memory is bounded by the **OS's Jetsam** (the
+// system reclaims/kills under memory pressure, by process priority) rather than a
+// self-imposed hard cap, with in-process V8 heap limits as the eventual
+// cooperative layer. This mirrors Chromium, which likewise does not OS-hard-cap
+// renderer memory on macOS. Nothing to install here.
 
 /// No network namespaces on macOS: a renderer's network is denied inside its
 /// Seatbelt profile instead (see [`lock_down_renderer`]), applied once the
