@@ -374,6 +374,17 @@ mod seatbelt_enforcement {
         check("seatbelt-sysctl");
     }
 
+    /// The backend docs claim the profile grants no `mach-lookup` — reach into
+    /// the Mach bootstrap namespace (WindowServer, launchd services), the classic
+    /// macOS sandbox-escape surface. The probe confirms a service that resolves
+    /// before lockdown is refused after; if none of its candidate services resolve
+    /// in the bootstrap namespace it reports `CONTROL_FAILED` (the control is
+    /// broken, not the sandbox), exactly like the other seatbelt probes.
+    #[test]
+    fn renderer_cannot_look_up_mach_services() {
+        check("seatbelt-mach-lookup");
+    }
+
     /// A filesystem service is path-scoped to its own directory — read/write
     /// inside, denied outside — the SBPL counterpart of the Linux services'
     /// Landlock ruleset, so a compromised storage/font service cannot roam the
@@ -578,6 +589,7 @@ mod probe_inventory {
         "seatbelt-fork",
         "seatbelt-signal-other",
         "seatbelt-sysctl",
+        "seatbelt-mach-lookup",
         "seatbelt-service-scope",
         "rlimits",
         "ptrace-deny-accepted",

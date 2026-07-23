@@ -130,6 +130,8 @@ pub const PROBES: &[&str] = &[
     #[cfg(target_os = "macos")]
     "seatbelt-sysctl",
     #[cfg(target_os = "macos")]
+    "seatbelt-mach-lookup",
+    #[cfg(target_os = "macos")]
     "seatbelt-service-scope",
     #[cfg(target_os = "macos")]
     "rlimits",
@@ -569,6 +571,38 @@ fn try_connect() -> i32 {
     }
 }
 
+/// Candidate Mach services the `seatbelt-mach-lookup` probe tries as its control
+/// — at least one resolves in any user session's bootstrap namespace. A renderer
+/// needs *none* of them; the point is to prove a lookup that works before
+/// lockdown is refused after.
+#[cfg(target_os = "macos")]
+const MACH_CONTROL_SERVICES: &[&str] = &[
+    "com.apple.system.notification_center",
+    "com.apple.coreservices.launchservicesd",
+    "com.apple.CoreServices.coreservicesd",
+    "com.apple.system.opendirectoryd.api",
+];
+
+/// Look a Mach service up in the bootstrap namespace, returning the raw
+/// `kern_return_t` (0 = a send right was handed back). `bootstrap_look_up` and
+/// the `bootstrap_port` global live in libSystem but are absent from the `libc`
+/// bindings, so they are declared here.
+#[cfg(target_os = "macos")]
+fn try_mach_lookup(name: &str) -> libc::kern_return_t {
+    extern "C" {
+        static mut bootstrap_port: libc::mach_port_t;
+        fn bootstrap_look_up(
+            bp: libc::mach_port_t,
+            service_name: *const libc::c_char,
+            sp: *mut libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    let cname = std::ffi::CString::new(name).expect("service name has no NUL");
+    let mut port: libc::mach_port_t = 0;
+    // SAFETY: valid (inherited) bootstrap port, NUL-terminated name, valid out-param.
+    unsafe { bootstrap_look_up(bootstrap_port, cname.as_ptr(), &mut port) }
+}
+
 /// The macOS probe set: Seatbelt profile enforcement.
 ///
 /// Every probe runs its operation **twice** — once before `sandbox_init` and
@@ -718,6 +752,35 @@ fn run_macos_probe(probe: &str) {
                 e if e == libc::EPERM => std::process::exit(0),
                 _ => std::process::exit(code::WRONG_ERROR),
             }
+        }
+
+        // The module docs claim the profile grants no `mach-lookup` — reach into
+        // the Mach bootstrap namespace (WindowServer, launchd services,
+        // privileged daemons), the classic macOS sandbox-escape surface. `(deny
+        // default)` covers it — tighter than Chromium's allow-specific-names
+        // approach — but nothing verified it. Control: a well-known service
+        // resolves before lockdown (proving the lookup machinery works and the
+        // service exists); after lockdown, the *same* lookup must be refused, and
+        // since only the profile changed between the two, a non-zero result is
+        // the profile's doing. (A Seatbelt mach-lookup denial surfaces as a
+        // bootstrap error — observed `BOOTSTRAP_NOT_PRIVILEGED` (1100) on an M1,
+        // not `EPERM` — so this checks for any failure and reports the code rather
+        // than pinning one errno.)
+        "seatbelt-mach-lookup" => {
+            let control = MACH_CONTROL_SERVICES.iter().copied().find(|n| try_mach_lookup(n) == 0);
+            let Some(name) = control else {
+                eprintln!("[selftest] mach-lookup: no control service resolved pre-lockdown — probe proves nothing");
+                std::process::exit(code::CONTROL_FAILED);
+            };
+            eprintln!("[selftest] mach-lookup: control service {name} resolved before lockdown");
+            crate::sandbox::lock_down_renderer();
+            let kr = try_mach_lookup(name);
+            if kr == 0 {
+                eprintln!("[selftest] mach-lookup: {name} still resolved after lockdown — NOT denied");
+                std::process::exit(code::NOT_DENIED);
+            }
+            eprintln!("[selftest] mach-lookup: denied after lockdown (kern_return {kr})");
+            std::process::exit(0);
         }
 
         // The rlimits are a mechanism entirely separate from Seatbelt and were

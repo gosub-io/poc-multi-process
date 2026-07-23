@@ -669,10 +669,11 @@ simplified is the surrounding browser. What each entry below still needs:
   net/IPC/UTS/PID namespaces, rlimits, non-dumpable processes, broker Landlock + a
   seccomp deny-list, best-effort per-child cgroup v2 `memory.max`, 21 probes.
   macOS runs a Seatbelt `(deny default)`
-  profile with 12 probes — including **path-scoped file services** (storage/font
+  profile with 13 probes — including **path-scoped file services** (storage/font
   get `subpath` read/write grants for their own directory plus a broad
   `file-read-metadata` so path lookup resolves, while contents outside the scope
-  stay unreadable). Windows spawns over a pair of anonymous pipes (see
+  stay unreadable) and a **denied Mach bootstrap** (no `mach-lookup` reach to
+  WindowServer/launchd services). Windows spawns over a pair of anonymous pipes (see
   `src/channel/`) and installs **process mitigation policies** — no dynamic
   code (the W^X analogue), no child processes, no injection extension points,
   plus win32k lockdown — with 4 probes, plus the parent-side access controls

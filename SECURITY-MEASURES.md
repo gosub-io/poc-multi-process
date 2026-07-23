@@ -383,6 +383,7 @@ Windows confinement comes in two halves, and only one can be self-applied.
 | Renderer profile | `(deny default)` + `signal (target self)` + `process-info* (target self)`. Nothing else — no `mach-lookup`, no `sysctl-read`, no files, no network. Each grant is a privilege a compromised renderer could turn against the host, so the list is kept minimal |
 | Net profile | The renderer profile + `network-outbound` + `system-socket` — the one role that keeps the network |
 | Service profile | `(deny default)` + **path-scoped** file access for filesystem services — `file-read*` (and, where writable, `file-write*`) on *only* the service's own declared path via `(subpath …)`/`(literal …)`, plus a broad `file-read-metadata` so path lookup resolves (the SBPL counterpart of the Linux services' Landlock ruleset). Device services instead get the broad `file-read*`/`file-write*` + `iokit-open` (the `ioctl`/device-node analogue). Validated on an M1 |
+| **Mach bootstrap denied** | `(deny default)` withholds `mach-lookup`, so a renderer cannot reach the bootstrap namespace (WindowServer, launchd services, privileged daemons) — the classic macOS escape surface, and *tighter* than Chromium's allow-specific-global-names approach (this stub renderer needs none). Verified by the `seatbelt-mach-lookup` probe. Residual: the window between `exec` and lockdown, where the inherited bootstrap port is still live but only the PoC's own handshake code runs — a production build would replace the bootstrap port with a restricted namespace to close it |
 | Fail-closed | If `sandbox_init` refuses the profile the component aborts, exactly as on Linux |
 | `ptrace(PT_DENY_ATTACH)` | The `PR_SET_DUMPABLE` analogue: refuses future `PT_ATTACH`/`task_for_pid` |
 | rlimits | `RLIMIT_NOFILE` = 128, `RLIMIT_CORE` = 0, nice +10 |
@@ -437,11 +438,11 @@ be a backend-shaped piece of work.
     `forkserver-no-newuser-clone`, `service-fs-openat`, `service-fs-no-socket`,
     `service-device-ioctl`, `service-landlock`, `broker-landlock`,
     `broker-seccomp`, `cgroup-memory-limit`.
-  - **macOS (12)**: `seatbelt-file`, `seatbelt-network`, `seatbelt-exec`,
+  - **macOS (13)**: `seatbelt-file`, `seatbelt-network`, `seatbelt-exec`,
     `seatbelt-net-role-keeps-network`, `seatbelt-baseline`,
     `seatbelt-file-write`, `seatbelt-fork`, `seatbelt-signal-other`,
-    `seatbelt-sysctl`, `seatbelt-service-scope`, `rlimits`,
-    `ptrace-deny-accepted`.
+    `seatbelt-sysctl`, `seatbelt-mach-lookup`, `seatbelt-service-scope`,
+    `rlimits`, `ptrace-deny-accepted`.
   - **Windows (7)**: `mitigation-baseline`, `mitigation-dynamic-code`,
     `mitigation-child-process`, `mitigation-policies-readback`,
     `low-integrity`, `job-memory-limit`, `restricted-token`.

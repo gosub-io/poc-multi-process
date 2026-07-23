@@ -75,6 +75,18 @@ extern "C" {
 // the smaller the surface. If a future renderer (a real rasterizer, fonts,
 // GPU) needs more, add the *narrowest* grant that unblocks it — a specific
 // `(allow mach-lookup (global-name "..."))`, not the blanket form.
+//
+// **Mach bootstrap.** `(deny default)` also withholds `mach-lookup`, so a
+// renderer cannot reach into the bootstrap namespace (WindowServer, launchd
+// services, privileged daemons) — the classic macOS sandbox-escape surface, and
+// a *tighter* stance than Chromium's allow-specific-global-names approach because
+// this stub renderer needs none. The `seatbelt-mach-lookup` probe verifies it (a
+// service that resolves before lockdown is refused after). The one unconfined
+// window is between `exec` and `lock_down_renderer`, where the inherited
+// bootstrap port is still live — but only the PoC's own IPC-handshake code runs
+// there, never web content; a production build that wanted to close even that
+// would replace the bootstrap port with a restricted namespace before handing off
+// (Chromium's bootstrap sandbox).
 
 /// A renderer may only push pixels: no network, no files, no new programs, and
 /// no Mach/sysctl reach beyond itself.
