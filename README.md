@@ -813,10 +813,13 @@ simplified is the surrounding browser. What each entry below still needs:
   classifier re-run on every hop — but real DNS and real HTTP are still stubbed.
 - **Event loop & writes**: std threads + mpsc instead of tokio; the real
   engine's worker loops are `select!`-based async tasks. The loop's replies to
-  components are *blocking* socket writes, so a renderer that floods requests
-  **and** refuses to read its replies can stall the loop (memory stays bounded —
-  the per-source gates handle that — but responsiveness doesn't). Non-blocking
-  per-channel writes on an async loop fix both. Relatedly, the per-source
+  components are *blocking* writes bounded by `REPLY_WRITE_TIMEOUT` (5 s) — a
+  socket timeout on unix, a `CancelIoEx` watchdog on the Windows pipe — so a
+  renderer that floods requests **and** refuses to read its replies is dropped
+  after that window rather than wedging the loop forever (memory stays bounded —
+  the per-source gates handle that — but responsiveness suffers during the
+  window). Non-blocking per-channel writes on an async loop remove the window.
+  Relatedly, the per-source
   gate bounds what sits *in the engine loop's inbox*, but `FrameReady` events
   ride an unbounded channel to the embedding application — a tile's gate
   permit is returned when the loop forwards it, not when the app drops it, so

@@ -395,6 +395,7 @@ Windows confinement comes in two halves, and only one can be self-applied.
 | **AppContainer** (per-role lowbox, env-gated `GOSUB_WIN_APPCONTAINER`) | The parent-side, object-confining half. Each role runs under its own registered lowbox profile (`CreateAppContainerProfile`) attached at `CreateProcess` via `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`: the **net** component gets the `internetClient` capability and renderers get **none** (no network) — the renderer/net split the other backends enforce. Each filesystem **service** is granted access to only its own path (ALL APPLICATION PACKAGES / its container SID ACL, with a Low-integrity relabel so the lowbox can write). Needs the image at an app-package-accessible install location, so it is opt-in rather than default-on. Validated end-to-end on Windows 11 | `sandbox/windows.rs` + `spawn/windows.rs` |
 | **Job object** (parent-side, post-spawn) | `PROCESS_MEMORY` = 512 MiB (the `RLIMIT_AS` analogue Windows otherwise lacks), `ACTIVE_PROCESS = 1` (belt and braces with the child-process policy), `KILL_ON_JOB_CLOSE` (an engine that crashes takes its renderers with it rather than orphaning them). The job handle is **intentionally leaked** — closing it is exactly what arms `KILL_ON_JOB_CLOSE` | ″ |
 | `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` | Handle inheritance on Windows is process-wide, so `HANDLE_FLAG_INHERIT` exposes a handle to *every* concurrent child. The explicit list restores the property the Unix side gets from clearing `FD_CLOEXEC` inside the forked child | `spawn/windows.rs` |
+| **Pipe read/write deadlines via `CancelIoEx`** | The reply-write anti-stall bound and the decode-stall timeout need a per-op deadline the anonymous pipe's *synchronous* `ReadFile`/`WriteFile` don't offer (and can't get from overlapped I/O without a named pipe, which would reintroduce the rendezvous race). A watchdog thread cancels the blocked call once the deadline passes; the aborted op surfaces as `TimedOut` — the same DoS bound Linux/macOS get from a socket timeout. Windows-gated tests cover both directions | `channel/windows.rs` |
 | SID alignment fix | A SID must be DWORD-aligned; a bare `[u8; 68]` intermittently faulted `CreateRestrictedToken` with `ERROR_NOACCESS`, which made a broken token *sometimes* build and mimic a working sandbox | `sandbox/windows.rs` |
 
 ### 3.2 Absent / caveats on Windows
@@ -608,10 +609,14 @@ Others:
   `RLIMIT_DATA` ineffective, the kernel ledger limits root/Apple-private-entitlement
   gated (`KERN_NO_ACCESS`); a macOS content process is bounded by the OS's Jetsam
   under pressure instead (§4). Linux gets a cgroup `memory.max`, Windows a job cap.
-- **Blocking replies**: the loop's replies to components are blocking socket
-  writes, so a renderer that floods requests *and* refuses to read replies can
-  stall the loop. Memory stays bounded (the gates handle that); responsiveness
-  does not.
+- **Blocking replies**: the loop's replies to components are blocking writes, so
+  a renderer that floods requests *and* refuses to read replies stalls the loop
+  until the write hits `REPLY_WRITE_TIMEOUT` (5 s) and the renderer is dropped.
+  That bound now holds on **every** platform (a socket timeout on unix, a
+  `CancelIoEx` watchdog on Windows), so the stall is finite rather than forever —
+  but responsiveness still suffers during the window. Memory stays bounded
+  throughout (the gates handle that); only the async-loop rewrite removes the
+  window entirely.
 - **`FrameReady` rides an unbounded channel** to the embedding application — a
   tile's gate permit is returned when the loop *forwards* it, not when the app
   drops it, so an app that stops draining accumulates tiles (16 MiB each).
