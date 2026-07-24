@@ -36,6 +36,10 @@ pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ForkRequest {
     Renderer { origin: String },
+    /// Fork a throwaway decoder. Its IPC fd follows via `SCM_RIGHTS`, exactly
+    /// like a renderer's; the difference is entirely in what the child does —
+    /// decode one image and exit.
+    Decoder,
     Shutdown,
 }
 
@@ -57,6 +61,46 @@ pub enum FromRenderer {
     /// validates the received fd's seals and real size against them.
     #[cfg(all(feature = "multi-process", target_os = "linux"))]
     TileShm { width: u32, height: u32 },
+    /// Renderers do not parse images themselves — that is the most dangerous
+    /// input a browser handles, so it is brokered to a throwaway decoder
+    /// process (see `decoder`). The bytes are the encoded image; the reply is a
+    /// [`ToRenderer::DecodeResult`].
+    NeedDecode { image: Vec<u8> },
+    /// Persist or read a value in this origin's storage partition (the
+    /// `localStorage`/`IndexedDB` stand-in). Renderers hold no filesystem
+    /// access; the engine brokers to the storage service, which is keyed by the
+    /// tab's `(zone, origin)` — never a claim in this message.
+    NeedStorage { op: StorageOp },
+    /// Ask the font service for a font's metrics. Renderers cannot open files;
+    /// the font service can, and returns only the derived data.
+    NeedFont { family: String },
+    /// Load a *subresource* (image, script, style, JSON, …) which — unlike
+    /// [`NeedFetch`], restricted to the renderer's own origin — may be
+    /// cross-origin. The response is subject to Opaque Response Blocking in the
+    /// broker/net: a cross-origin *data* type (HTML/JSON/XML) is withheld
+    /// entirely, an embeddable type (image/script/CSS/font) is delivered but
+    /// marked opaque, and a same-origin or CORS-approved response is readable.
+    /// See [`ToRenderer::SubresourceResult`].
+    ///
+    /// [`NeedFetch`]: FromRenderer::NeedFetch
+    NeedSubresource { url: String, mode: FetchMode },
+}
+
+/// A storage operation a renderer requests through the broker.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum StorageOp {
+    Get { key: String },
+    Set { key: String, value: Vec<u8> },
+}
+
+/// How a subresource request treats the cross-origin boundary, mirroring the
+/// Fetch `mode`: `NoCors` (an `<img>`/`<script>`/`<link>` load — usable but not
+/// readable cross-origin) or `Cors` (an explicit `crossorigin`/`fetch()` that
+/// asks the server's permission to read the bytes).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchMode {
+    NoCors,
+    Cors,
 }
 
 /// Engine -> renderer.
@@ -64,6 +108,19 @@ pub enum FromRenderer {
 pub enum ToRenderer {
     RenderPage { url: String },
     FetchResult { status: u16, body: Vec<u8> },
+    /// The outcome of a [`FromRenderer::NeedDecode`]: the decoded pixels, or the
+    /// reason the (ephemeral) decoder refused or died. A decoder crash is
+    /// reported as a failure here, never as a failure of the renderer.
+    DecodeResult(DecodeOutcome),
+    /// The outcome of a [`FromRenderer::NeedStorage`]. `Get` yields the value or
+    /// `None` if unset; `Set` yields `None`.
+    StorageResult(Option<Vec<u8>>),
+    /// The outcome of a [`FromRenderer::NeedFont`]: the font's metrics, or
+    /// `None` if the service could not read it.
+    FontResult(Option<FontMetrics>),
+    /// The outcome of a [`FromRenderer::NeedSubresource`] after Opaque Response
+    /// Blocking.
+    SubresourceResult(SubresourceOutcome),
     /// A fetch whose body streams through a shared-memory ring (Linux): the
     /// ring fd follows immediately via `SCM_RIGHTS`. `body_len` is a *claim*
     /// the renderer bounds before allocating; the ring fd itself is validated
@@ -83,15 +140,61 @@ pub enum NetRequest {
     Fetch {
         request_id: u64,
         /// The `(zone, origin)` identity, stamped by the *engine* from its own
-        /// bookkeeping — a compromised renderer cannot spoof either half.
+        /// bookkeeping — a compromised renderer cannot spoof either half. On
+        /// Linux the net component uses this pair to query the vault for the
+        /// cookies to attach; elsewhere the engine sends them in `cookies`.
         for_zone: u64,
         for_origin: String,
         url: String,
         /// The origin's cookies (name, value) for the net component to attach
-        /// to the request — *including* HttpOnly ones. These reach the
-        /// network process but never the renderer.
+        /// to the request — *including* HttpOnly ones. These reach the network
+        /// process but never the renderer. Populated where the broker holds the
+        /// jar (off Linux, and single-process on Linux, which has no vault);
+        /// **empty** in multi-process on Linux, where net sources them from the
+        /// vault via `for_zone`/`for_origin` — so no HttpOnly cookie rides this
+        /// field on the wire in the isolated mode.
         cookies: Vec<(String, String)>,
     },
+    /// A subresource fetch that may be cross-origin. `same_origin` is computed by
+    /// the *engine* (which owns the canonical origins); the net component applies
+    /// SSRF + redirects like a fetch, then Opaque Response Blocking on the
+    /// response. The destination-origin cookies are the broker's `cookies` field
+    /// elsewhere, or sourced by net from the vault on Linux via `for_zone`/
+    /// `for_origin` (the destination identity the engine computed).
+    Subresource {
+        request_id: u64,
+        url: String,
+        mode: FetchMode,
+        /// Whether the requesting origin equals the destination origin, decided
+        /// by the engine. The net component additionally treats a redirect that
+        /// leaves the initial authority as cross-origin (fails safe).
+        same_origin: bool,
+        /// The destination `(zone, origin)` the engine resolved, so net can query
+        /// the vault for the cookies to attach (Linux — the vault path).
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        for_zone: u64,
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        for_origin: String,
+        /// The destination-origin cookies the broker attached. Populated where the
+        /// broker holds the jar (off Linux, and single-process on Linux, which has
+        /// no vault); **empty** in multi-process on Linux, where net sources them
+        /// from the vault via `for_zone`/`for_origin` instead — so no HttpOnly
+        /// cookie ever rides this field on the wire in the isolated mode.
+        cookies: Vec<(String, String)>,
+    },
+    /// Adopt the vault link (Linux): the vault-facing socket fd follows this
+    /// message via `SCM_RIGHTS`. Sent once at engine startup — net is the vault's
+    /// sole client, and all cookie ops route through it thereafter.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    BindVault,
+    /// Store a cookie (fire-and-forget): net forwards it to the vault as a
+    /// [`VaultRequest::Set`]. Identity stamped by the broker.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    CookieSet { zone: u64, origin: String, name: String, value: String, http_only: bool },
+    /// The `document.cookie` view for `(zone, origin)`: net queries the vault
+    /// (`visible_only`) and answers the broker with [`FromNet::CookieVisible`].
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    CookieGetVisible { request_id: u64, zone: u64, origin: String },
     Shutdown,
 }
 
@@ -102,6 +205,30 @@ pub struct NetResponse {
     pub outcome: FetchOutcome,
 }
 
+/// Net component -> engine, on Linux where net routes cookies through the vault.
+/// Multiplexes the ordinary fetch reply with the two cookie-flow messages net
+/// now originates: the `document.cookie` view it read from the vault, and an
+/// observe-report of the cookies it attached to an outbound fetch (the broker no
+/// longer sees the values, only the report). Elsewhere net sends a bare
+/// [`NetResponse`] and the broker keeps the jar.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[derive(Serialize, Deserialize, Debug)]
+pub enum FromNet {
+    /// A fetch/subresource reply — routed exactly as a bare `NetResponse` was
+    /// (including the streamed-body path, whose ring fd still follows).
+    Reply(NetResponse),
+    /// The vault's `document.cookie` set for a [`NetRequest::CookieGetVisible`].
+    CookieVisible { request_id: u64, cookies: Vec<(String, String)> },
+    /// The names net attached to a fetch/subresource, with the `(zone, origin)`
+    /// they were attached for, so the broker can emit the observe line without
+    /// ever holding the values.
+    CookieAttached { request_id: u64, zone: u64, origin: String, names: Vec<String> },
+    /// The vault link died (a query failed): net has dropped it and now attaches
+    /// no cookies. The broker respawns the vault (bounded) and re-binds net with a
+    /// fresh link. Sent once per death.
+    VaultGone,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum FetchOutcome {
     Ok { status: u16, body: Vec<u8> },
@@ -110,6 +237,128 @@ pub enum FetchOutcome {
     /// requesting renderer without ever mapping the ring itself.
     #[cfg(all(feature = "multi-process", target_os = "linux"))]
     OkStreaming { status: u16, body_len: u64 },
+    /// A cross-origin no-cors *embeddable* resource (image/script/style/font):
+    /// the bytes are delivered but the renderer must treat them as opaque.
+    /// Produced only for subresource requests.
+    Opaque { status: u16, body: Vec<u8> },
+    /// Opaque Response Blocking withheld a cross-origin *data* response (the
+    /// bytes never leave the net component). Produced only for subresource
+    /// requests; distinct from `Denied`, which is an SSRF/policy refusal.
+    Blocked { reason: String },
+    Denied { reason: String },
+}
+
+/// Engine -> decoder. A decoder handles exactly one of these and exits.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ToDecoder {
+    Decode { image: Vec<u8> },
+}
+
+/// Decoder -> engine: the result of decoding one image.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum FromDecoder {
+    Decoded { width: u32, height: u32, pixels: Vec<u8> },
+    Failed { reason: String },
+}
+
+/// Engine -> storage service. `request_id` multiplexes many tabs over one link,
+/// like [`NetRequest`]; the `(zone, origin)` is stamped by the engine and
+/// selects the partition, so a renderer cannot read another origin's storage.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum StorageRequest {
+    Op { request_id: u64, zone: u64, origin: String, op: StorageOp },
+    Shutdown,
+}
+
+/// Storage service -> engine.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct StorageResponse {
+    pub request_id: u64,
+    /// `Get`: the value or `None`; `Set`: always `None`.
+    pub value: Option<Vec<u8>>,
+}
+
+/// Font metrics — the small derived data a renderer needs, without ever seeing
+/// the font file itself (which only the font service may open).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FontMetrics {
+    pub family: String,
+    /// Number of glyphs — stands in for the parsed contents of the font file.
+    pub glyphs: u32,
+    /// Size in bytes of the file the service read.
+    pub file_len: u64,
+}
+
+/// Engine -> font service.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum FontRequest {
+    Metrics { request_id: u64, family: String },
+    Shutdown,
+}
+
+/// Engine -> a stub device service (audio, GPU). They do no work; this exists
+/// only so the engine can end them cleanly at shutdown.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum ServiceControl {
+    Shutdown,
+}
+
+/// Font service -> engine.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct FontResponse {
+    pub request_id: u64,
+    pub metrics: Option<FontMetrics>,
+}
+
+/// Engine/net -> **vault**: the cookie store lives in its own low-authority
+/// process (Linux), out of the secret-holding broker. Identity (`zone`,
+/// `origin`) is stamped by the broker from its own bookkeeping — never a
+/// renderer claim — exactly as for storage/fetch. Linux-only, like the rest of
+/// the fd-passing machinery (fork server, shm, ring) the vault is wired with.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[derive(Serialize, Deserialize, Debug)]
+pub enum VaultRequest {
+    /// Store a cookie in the `(zone, origin)` partition.
+    Set { zone: u64, origin: String, name: String, value: String, http_only: bool },
+    /// Read a partition's cookies. `visible_only` returns just the non-HttpOnly
+    /// set (the `document.cookie` view); otherwise the full set to attach to an
+    /// outbound request (including HttpOnly — this reply goes to the net
+    /// component, never to a renderer).
+    Get { request_id: u64, zone: u64, origin: String, visible_only: bool },
+    Shutdown,
+}
+
+/// Vault -> engine/net: the cookies for a [`VaultRequest::Get`].
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct VaultResponse {
+    pub request_id: u64,
+    pub cookies: Vec<(String, String)>,
+}
+
+/// The decode outcome as it reaches the renderer — the decoder's own result,
+/// plus a synthesized failure for the case where the decoder died before
+/// answering (which the engine turns into a `Failed`, so a decoder crash is
+/// indistinguishable from a rejection to the renderer).
+#[derive(Serialize, Deserialize, Debug)]
+pub enum DecodeOutcome {
+    Ok { width: u32, height: u32, pixels: Vec<u8> },
+    Failed { reason: String },
+}
+
+/// The result of a subresource load after Opaque Response Blocking (ORB).
+#[derive(Serialize, Deserialize, Debug)]
+pub enum SubresourceOutcome {
+    /// Bytes reached the renderer. `opaque` = usable but not readable as data (a
+    /// cross-origin no-cors embeddable resource); `!opaque` = same-origin or
+    /// CORS-approved, so the bytes are readable. A real engine gives an opaque
+    /// response no readback API; here the flag records the distinction the
+    /// renderer would enforce.
+    Delivered { status: u16, opaque: bool, body: Vec<u8> },
+    /// ORB withheld the response: a cross-origin data type the renderer may not
+    /// read. The bytes never entered its address space.
+    Blocked { reason: String },
+    /// Refused before ORB — SSRF policy, unparseable URL, etc.
     Denied { reason: String },
 }
 
@@ -151,6 +400,31 @@ impl EndpointTx {
         }
     }
 
+    /// Bound how long a subsequent `send` will block trying to hand bytes to
+    /// the peer: `Some(dur)` arms a per-write timeout on the underlying socket
+    /// so a peer that refuses to read (a full socket buffer) is abandoned
+    /// (send returns `WouldBlock`/`TimedOut`) rather than blocking the caller
+    /// forever; `None` clears it.
+    ///
+    /// A no-op on local (in-process) channels — same address space, not a
+    /// security boundary. On Windows the transport is an anonymous pipe with no
+    /// std timeout, so the deadline is enforced by a `CancelIoEx` watchdog in the
+    /// channel backend (see `channel::windows`); the observable behaviour matches
+    /// the unix socket path. Mirrors [`EndpointRx::set_read_timeout`].
+    #[cfg_attr(not(feature = "multi-process"), allow(unused_variables))]
+    pub fn set_write_timeout(&mut self, dur: Option<std::time::Duration>) -> io::Result<()> {
+        match self {
+            #[cfg(all(feature = "multi-process", unix))]
+            EndpointTx::Socket(stream) => stream.set_write_timeout(dur),
+            #[cfg(all(feature = "multi-process", windows))]
+            EndpointTx::Socket(stream) => {
+                stream.set_timeout(dur);
+                Ok(())
+            }
+            EndpointTx::Local(_) => Ok(()),
+        }
+    }
+
     pub fn send<T: Serialize>(&mut self, msg: &T) -> io::Result<()> {
         match self {
             #[cfg(feature = "multi-process")]
@@ -179,6 +453,29 @@ impl EndpointRx {
             EndpointRx::Local(_) => {
                 Err(io::Error::new(io::ErrorKind::Unsupported, "no fd passing on local channels"))
             }
+        }
+    }
+
+    /// Bound how long a subsequent `recv` will block waiting for bytes:
+    /// `Some(dur)` arms a per-read timeout on the underlying socket so a peer
+    /// that stops sending is abandoned (recv returns `WouldBlock`/`TimedOut`)
+    /// rather than blocking the caller forever; `None` clears it.
+    ///
+    /// A no-op on local (in-process) channels — same address space, not a
+    /// security boundary. On Windows the deadline is enforced by a `CancelIoEx`
+    /// watchdog in the channel backend (see `channel::windows`), matching the
+    /// unix socket path.
+    #[cfg_attr(not(feature = "multi-process"), allow(unused_variables))]
+    pub fn set_read_timeout(&mut self, dur: Option<std::time::Duration>) -> io::Result<()> {
+        match self {
+            #[cfg(all(feature = "multi-process", unix))]
+            EndpointRx::Socket(stream) => stream.set_read_timeout(dur),
+            #[cfg(all(feature = "multi-process", windows))]
+            EndpointRx::Socket(stream) => {
+                stream.set_timeout(dur);
+                Ok(())
+            }
+            EndpointRx::Local(_) => Ok(()),
         }
     }
 
@@ -276,7 +573,9 @@ pub fn recv_msg<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<T> {
 /// dummy payload (fd-passing must carry at least one data byte). The kernel
 /// duplicates the fd into the receiver; the sender keeps its own copy.
 ///
-/// SAFETY: `sock_fd` and `fd` must be valid open descriptors.
+/// # Safety
+///
+/// `sock_fd` and `fd` must be valid open descriptors.
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 pub unsafe fn send_fd(sock_fd: RawFd, fd: RawFd) -> io::Result<()> {
     let mut byte = [0u8; 1];
@@ -313,7 +612,9 @@ pub unsafe fn send_fd(sock_fd: RawFd, fd: RawFd) -> io::Result<()> {
 /// and every received fd closed — without this, each malicious message would
 /// leak descriptors into the engine until its fd table is exhausted.
 ///
-/// SAFETY: `sock_fd` must be a valid open descriptor.
+/// # Safety
+///
+/// `sock_fd` must be a valid open descriptor.
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
 pub unsafe fn recv_fd(sock_fd: RawFd) -> io::Result<OwnedFd> {
     let mut byte = [0u8; 1];
@@ -462,6 +763,76 @@ mod tests {
         assert!(unsafe { recv_fd(b.as_raw_fd()) }.is_err());
     }
 
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    #[test]
+    fn recv_returns_a_timeout_error_when_the_peer_is_silent() {
+        // The primitive behind the decode stall timeout: with a read timeout
+        // armed, recv on a socket whose peer sends nothing must return a
+        // WouldBlock/TimedOut error near the deadline — never block forever.
+        use std::time::{Duration, Instant};
+        // Keep `_peer` bound so the socket is not closed (a closed peer gives EOF,
+        // not a timeout — a different, already-handled case).
+        let (mine, _peer) = UnixStream::pair().unwrap();
+        let ep = Endpoint::from_channel(channel::Channel::from_stream(mine)).unwrap();
+        let (_tx, mut rx) = ep.split();
+        rx.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+
+        let start = Instant::now();
+        let err = rx.recv::<u32>().expect_err("silent peer must not yield a value");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+            "expected a timeout error, got {:?}",
+            err.kind()
+        );
+        assert!(elapsed < Duration::from_secs(2), "recv should return near the deadline, took {elapsed:?}");
+    }
+
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    #[test]
+    fn send_returns_a_timeout_error_when_the_peer_never_reads() {
+        // The primitive behind the reply-write timeout: with a write timeout
+        // armed, sending to a peer that never drains eventually fills the socket
+        // buffers, and the send must then return a WouldBlock/TimedOut error near
+        // the deadline — never block forever, which on the single-threaded engine
+        // loop with blocking writes would wedge the whole browser.
+        use std::time::{Duration, Instant};
+        // Keep `_peer` bound and never read from it: the buffers fill (a closed
+        // peer would instead give a broken pipe — a different, already-handled
+        // case).
+        let (mine, _peer) = UnixStream::pair().unwrap();
+        let mut ep = Endpoint::from_channel(channel::Channel::from_stream(mine)).unwrap();
+        ep.tx.set_write_timeout(Some(Duration::from_millis(150))).unwrap();
+
+        // A sizable payload so the fixed-size socket buffers fill in a bounded
+        // number of iterations; the peer reads nothing, so a send must time out.
+        let big = vec![0u8; 256 * 1024];
+        let start = Instant::now();
+        let mut err = None;
+        for _ in 0..1024 {
+            if let Err(e) = ep.send(&big) {
+                err = Some(e);
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "send never blocked against a non-reading peer"
+            );
+        }
+        let err = err.expect("a non-reading peer must eventually make send time out");
+        assert!(
+            matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+            "expected a timeout error, got {:?}",
+            err.kind()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "send should return near the deadline, took {:?}",
+            start.elapsed()
+        );
+    }
+
     #[cfg(feature = "multi-process")]
     #[test]
     fn oversized_length_prefix_rejected() {
@@ -471,5 +842,35 @@ mod tests {
         let mut cur = std::io::Cursor::new(buf);
         let r: io::Result<NetResponse> = recv_msg(&mut cur);
         assert!(r.is_err(), "should reject an oversized frame");
+    }
+
+    /// Deterministic stand-in for `cargo fuzz run ipc_frame`: hammer the broker's
+    /// untrusted → engine deserialization (the frames a compromised child sends
+    /// in) with arbitrary bytes. Each must return Ok/Err, never panic or
+    /// over-allocate. The `fuzz/` target explores far more; this is the CI floor.
+    #[cfg(feature = "multi-process")]
+    #[test]
+    fn recv_msg_never_panics_on_arbitrary_frames() {
+        let mut s = 0x1234_5678_9abc_def0u64;
+        for _ in 0..50_000 {
+            let len = (xorshift(&mut s) % 128) as usize;
+            let buf: Vec<u8> = (0..len).map(|_| xorshift(&mut s) as u8).collect();
+            let _ = recv_msg::<FromRenderer>(&mut std::io::Cursor::new(&buf));
+            let _ = recv_msg::<NetResponse>(&mut std::io::Cursor::new(&buf));
+            let _ = recv_msg::<FromDecoder>(&mut std::io::Cursor::new(&buf));
+            let _ = recv_msg::<StorageResponse>(&mut std::io::Cursor::new(&buf));
+            let _ = recv_msg::<FontResponse>(&mut std::io::Cursor::new(&buf));
+        }
+    }
+
+    /// Tiny deterministic xorshift PRNG — reproducible, no `rand`, no clock seed.
+    #[cfg(feature = "multi-process")]
+    fn xorshift(s: &mut u64) -> u64 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *s = x;
+        x
     }
 }

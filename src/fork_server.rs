@@ -50,6 +50,13 @@ pub fn run(control_fd: &str) {
     // forked below, covering the window before each reaches its own lockdown.
     crate::sandbox::lock_down_fork_server();
 
+    // Pin PID 1 of the renderers' shared PID namespace *before* forking anything
+    // else, so a renderer's death never tears the namespace down (see
+    // `fork_pinned_init`). Must come first: the first child forked into a fresh
+    // PID namespace becomes PID 1, and we want that to be the placeholder, not the
+    // verification canary below (which exits) or a renderer.
+    fork_pinned_init();
+
     // Then prove the filter is right for *this* host's C library before any
     // renderer stakes its life on it. The allowlist depends on how libc issues
     // fork and how it splits descriptors, which varies by glibc version and
@@ -58,11 +65,21 @@ pub fn run(control_fd: &str) {
     // one fork; failing later looks like every tab crashing on open.
     crate::sandbox::verify_fork_server_filter();
 
-    loop {
-        let req: ForkRequest = match ipc::recv_msg(&mut control) {
-            Ok(req) => req,
-            Err(_) => break, // engine went away
-        };
+    // From here on, let the kernel auto-reap our children. The fork server is the
+    // direct parent of every renderer and decoder (it `fork()`s them without
+    // exec), and its serve loop blocks in `recv_msg` between requests — so without
+    // this, every decoder that exits after one image and every renderer that
+    // crashes would sit as a zombie until teardown, and a long session decoding
+    // thousands of images would climb toward `pid_max` and starve new forks. We
+    // never need a child's exit status (the engine detects a dead renderer via
+    // socket EOF, not `wait`), so `SA_NOCLDWAIT` — discard the status, leave no
+    // zombie — is the right tool, and unlike a `SIGCHLD` handler it does not
+    // interrupt the blocking `recv_msg` with `EINTR`. Set *after* the canary,
+    // which must still `waitpid` its own probe child to read the verdict.
+    reap_children_automatically();
+
+    // Loop ends when `recv_msg` errors (engine went away) or on `Shutdown`.
+    while let Ok(req) = ipc::recv_msg::<ForkRequest>(&mut control) {
         match req {
             ForkRequest::Shutdown => break,
             ForkRequest::Renderer { origin } => {
@@ -72,16 +89,111 @@ pub fn run(control_fd: &str) {
                     Ok(fd) => fd,
                     Err(_) => break,
                 };
-                fork_renderer(control.as_raw_fd(), comp_fd, origin);
+                fork_child(control.as_raw_fd(), comp_fd, Child::Renderer(origin));
+            }
+            ForkRequest::Decoder => {
+                // SAFETY: the control stream is a valid open descriptor.
+                let comp_fd = match unsafe { ipc::recv_fd(control.as_raw_fd()) } {
+                    Ok(fd) => fd,
+                    Err(_) => break,
+                };
+                fork_child(control.as_raw_fd(), comp_fd, Child::Decoder);
             }
         }
     }
 
-    // Reap every renderer we forked before exiting, so none is left orphaned.
-    while unsafe { libc::waitpid(-1, std::ptr::null_mut(), 0) } > 0 {}
+    // Children auto-reap via `SA_NOCLDWAIT` (set above), so there are normally no
+    // zombies left to collect here. This non-blocking sweep is a fallback for the
+    // case where that `sigaction` failed to install: mop up any content process
+    // that has already exited, `WNOHANG` so we never block on the pinned init
+    // (PID 1 of the renderers' namespace, which does not exit on its own — it dies
+    // with us via `PR_SET_PDEATHSIG`).
+    while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
 }
 
-fn fork_renderer(control_fd: RawFd, comp_fd: OwnedFd, origin: String) {
+/// Ask the kernel to auto-reap our children: with `SA_NOCLDWAIT` a terminated
+/// child is discarded immediately rather than left a zombie for us to `wait` on.
+/// The disposition stays `SIG_DFL` (we install no `SIGCHLD` handler), so the
+/// blocking `recv_msg` in the serve loop is never interrupted. `rt_sigaction` is
+/// on the fork server's seccomp allowlist.
+fn reap_children_automatically() {
+    // SAFETY: a zeroed `sigaction` is a valid `SIG_DFL` disposition with an empty
+    // mask; we only add the `SA_NOCLDWAIT` flag.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        sa.sa_flags = libc::SA_NOCLDWAIT;
+        if libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut()) != 0 {
+            eprintln!(
+                "[fork-server] could not set SA_NOCLDWAIT ({}); exited children may linger as zombies",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Fork the pinned "init" for the renderers' shared PID namespace.
+///
+/// When [`crate::sandbox::isolate_network`] created a PID namespace for the fork
+/// server, every child it forks lands in that namespace and the *first* becomes
+/// PID 1 — and a PID namespace is destroyed, `SIGKILL`ing all its members, the
+/// moment its PID 1 exits. If a renderer were PID 1, closing its tab would kill
+/// every other renderer. So we fork one placeholder first, as PID 1, that does
+/// nothing but stay alive; real renderers are then PID 2+, and any of them
+/// exiting leaves the namespace (and its siblings) intact. The placeholder dies
+/// with the fork server via `PR_SET_PDEATHSIG`, which tears the namespace down and
+/// takes any survivors with it.
+///
+/// A no-op where no PID namespace was created (best-effort `unshare` fell back, or
+/// the build lacks it): the placeholder sees a normal pid rather than 1 and exits
+/// immediately, so nothing is pinned and nothing leaks.
+fn fork_pinned_init() {
+    // SAFETY: the fork server is single-threaded, so the child may run normal
+    // code; it touches only allowlisted syscalls (getpid, prctl, nanosleep).
+    match unsafe { libc::fork() } {
+        -1 => eprintln!(
+            "[fork-server] could not fork the pid-ns init ({}); renderers share the namespace unpinned",
+            std::io::Error::last_os_error()
+        ),
+        0 => {
+            // Arm parent-death delivery **first**, before anything else, so the
+            // fork→arm window in which the fork server dying would leave us
+            // un-notified is as small as the kernel allows — a single syscall
+            // after fork returns. `getppid()` cannot shrink it further here: as
+            // PID 1 of a fresh PID namespace our real parent (the fork server)
+            // lives in the *outer* namespace, so `getppid()` is always 0 and
+            // can't tell a dead parent from a live one. The residual
+            // sub-microsecond window is benign — at worst an ill-timed fork-server
+            // crash leaves this placeholder holding an otherwise-empty namespace.
+            // (Harmless in the no-namespace fallback below: we exit immediately.)
+            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+            // Ask the kernel via the raw syscall (not glibc's possibly cached
+            // `getpid`) whether we are PID 1 of a fresh namespace.
+            let pid = unsafe { libc::syscall(libc::SYS_getpid) };
+            if pid != 1 {
+                // No PID namespace here — nothing to pin.
+                unsafe { libc::_exit(0) };
+            }
+            // Stay alive as PID 1, doing nothing. Long sleeps in a loop; every
+            // wake (a stray signal, or the timer) just sleeps again.
+            loop {
+                let req = libc::timespec { tv_sec: 1 << 20, tv_nsec: 0 };
+                unsafe { libc::nanosleep(&req, std::ptr::null_mut()) };
+            }
+        }
+        _ => { /* fork server continues; the init is collected at teardown */ }
+    }
+}
+
+/// What a forked child becomes. Both are content processes forked the same
+/// way and confined the same way; only the serve loop differs — a renderer is
+/// long-lived and per-origin, a decoder handles one image and exits.
+enum Child {
+    Renderer(String),
+    Decoder,
+}
+
+fn fork_child(control_fd: RawFd, comp_fd: OwnedFd, kind: Child) {
     // SAFETY: we are single-threaded, so the child may run normal code (the
     // async-signal-safe-only rule applies to *multithreaded* fork).
     match unsafe { libc::fork() } {
@@ -90,20 +202,32 @@ fn fork_renderer(control_fd: RawFd, comp_fd: OwnedFd, origin: String) {
             // comp_fd drops (closes) here.
         }
         0 => {
-            // Child — this IS the renderer now. It inherited the fork server's
-            // warm runtime via copy-on-write; no exec, no re-init.
+            // Child — this IS the content process now. It inherited the fork
+            // server's warm runtime via copy-on-write; no exec, no re-init.
+            if std::env::var_os("GOSUB_DEBUG_PIDNS").is_some() {
+                // Raw getpid: a small pid (2+, since the pinned init is 1) means
+                // we are in the renderers' PID namespace; a large host pid means
+                // none was created (best-effort fell back).
+                let pid = unsafe { libc::syscall(libc::SYS_getpid) };
+                eprintln!("[fork-server child] ns-local pid = {pid}");
+            }
             unsafe { libc::close(control_fd) }; // never touch the engine's control channel
             let ch = crate::channel::Channel::from_stream(UnixStream::from(comp_fd));
             let ep = Endpoint::from_channel(ch).expect("fork-server child: wrap fd");
-            // Drop privileges, then serve. rlimits were inherited from the
-            // fork server; seccomp is per-process, applied here.
+            // Drop privileges, then serve. rlimits were inherited from the fork
+            // server; seccomp is per-process, applied here. A decoder is a
+            // content process just like a renderer, so it shares the lockdown.
             crate::sandbox::lock_down_renderer();
-            crate::renderer::serve(ep, &origin);
+            match kind {
+                Child::Renderer(origin) => crate::renderer::serve(ep, &origin),
+                Child::Decoder => crate::decoder::serve_one(ep),
+            }
             std::process::exit(0); // must not fall back into the fork-server loop
         }
         _pid => {
-            // Parent (fork server): drop our copy of the renderer's end so the
-            // engine sees EOF (→ TabCrashed) when the renderer dies.
+            // Parent (fork server): drop our copy of the child's end so the
+            // engine sees EOF when the child dies (a decoder always exits after
+            // one image; a renderer only on crash).
             drop(comp_fd);
         }
     }

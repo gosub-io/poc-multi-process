@@ -84,6 +84,8 @@ pub const PROBES: &[&str] = &[
     #[cfg(target_os = "linux")]
     "netns",
     #[cfg(target_os = "linux")]
+    "pidns",
+    #[cfg(target_os = "linux")]
     "no-ptrace",
     #[cfg(target_os = "linux")]
     "forkserver-can-fork",
@@ -93,6 +95,26 @@ pub const PROBES: &[&str] = &[
     "forkserver-no-exec",
     #[cfg(target_os = "linux")]
     "forkserver-no-socket",
+    #[cfg(target_os = "linux")]
+    "forkserver-no-newuser-clone",
+    #[cfg(target_os = "linux")]
+    "service-fs-openat",
+    #[cfg(target_os = "linux")]
+    "service-fs-no-socket",
+    #[cfg(target_os = "linux")]
+    "service-device-ioctl",
+    #[cfg(target_os = "linux")]
+    "service-landlock",
+    #[cfg(target_os = "linux")]
+    "broker-landlock",
+    #[cfg(target_os = "linux")]
+    "broker-seccomp",
+    #[cfg(target_os = "linux")]
+    "broker-seccomp-mount",
+    #[cfg(target_os = "linux")]
+    "cgroup-memory-limit",
+    #[cfg(target_os = "linux")]
+    "crash-report",
     #[cfg(target_os = "macos")]
     "seatbelt-file",
     #[cfg(target_os = "macos")]
@@ -111,6 +133,10 @@ pub const PROBES: &[&str] = &[
     "seatbelt-signal-other",
     #[cfg(target_os = "macos")]
     "seatbelt-sysctl",
+    #[cfg(target_os = "macos")]
+    "seatbelt-mach-lookup",
+    #[cfg(target_os = "macos")]
+    "seatbelt-service-scope",
     #[cfg(target_os = "macos")]
     "rlimits",
     #[cfg(target_os = "macos")]
@@ -549,6 +575,38 @@ fn try_connect() -> i32 {
     }
 }
 
+/// Candidate Mach services the `seatbelt-mach-lookup` probe tries as its control
+/// — at least one resolves in any user session's bootstrap namespace. A renderer
+/// needs *none* of them; the point is to prove a lookup that works before
+/// lockdown is refused after.
+#[cfg(target_os = "macos")]
+const MACH_CONTROL_SERVICES: &[&str] = &[
+    "com.apple.system.notification_center",
+    "com.apple.coreservices.launchservicesd",
+    "com.apple.CoreServices.coreservicesd",
+    "com.apple.system.opendirectoryd.api",
+];
+
+/// Look a Mach service up in the bootstrap namespace, returning the raw
+/// `kern_return_t` (0 = a send right was handed back). `bootstrap_look_up` and
+/// the `bootstrap_port` global live in libSystem but are absent from the `libc`
+/// bindings, so they are declared here.
+#[cfg(target_os = "macos")]
+fn try_mach_lookup(name: &str) -> libc::kern_return_t {
+    extern "C" {
+        static mut bootstrap_port: libc::mach_port_t;
+        fn bootstrap_look_up(
+            bp: libc::mach_port_t,
+            service_name: *const libc::c_char,
+            sp: *mut libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+    let cname = std::ffi::CString::new(name).expect("service name has no NUL");
+    let mut port: libc::mach_port_t = 0;
+    // SAFETY: valid (inherited) bootstrap port, NUL-terminated name, valid out-param.
+    unsafe { bootstrap_look_up(bootstrap_port, cname.as_ptr(), &mut port) }
+}
+
 /// The macOS probe set: Seatbelt profile enforcement.
 ///
 /// Every probe runs its operation **twice** — once before `sandbox_init` and
@@ -700,6 +758,35 @@ fn run_macos_probe(probe: &str) {
             }
         }
 
+        // The module docs claim the profile grants no `mach-lookup` — reach into
+        // the Mach bootstrap namespace (WindowServer, launchd services,
+        // privileged daemons), the classic macOS sandbox-escape surface. `(deny
+        // default)` covers it — tighter than Chromium's allow-specific-names
+        // approach — but nothing verified it. Control: a well-known service
+        // resolves before lockdown (proving the lookup machinery works and the
+        // service exists); after lockdown, the *same* lookup must be refused, and
+        // since only the profile changed between the two, a non-zero result is
+        // the profile's doing. (A Seatbelt mach-lookup denial surfaces as a
+        // bootstrap error — observed `BOOTSTRAP_NOT_PRIVILEGED` (1100) on an M1,
+        // not `EPERM` — so this checks for any failure and reports the code rather
+        // than pinning one errno.)
+        "seatbelt-mach-lookup" => {
+            let control = MACH_CONTROL_SERVICES.iter().copied().find(|n| try_mach_lookup(n) == 0);
+            let Some(name) = control else {
+                eprintln!("[selftest] mach-lookup: no control service resolved pre-lockdown — probe proves nothing");
+                std::process::exit(code::CONTROL_FAILED);
+            };
+            eprintln!("[selftest] mach-lookup: control service {name} resolved before lockdown");
+            crate::sandbox::lock_down_renderer();
+            let kr = try_mach_lookup(name);
+            if kr == 0 {
+                eprintln!("[selftest] mach-lookup: {name} still resolved after lockdown — NOT denied");
+                std::process::exit(code::NOT_DENIED);
+            }
+            eprintln!("[selftest] mach-lookup: denied after lockdown (kern_return {kr})");
+            std::process::exit(0);
+        }
+
         // The rlimits are a mechanism entirely separate from Seatbelt and were
         // wholly unverified on macOS. Checks the two caps that actually change
         // a value here — note `RLIMIT_CORE` is deliberately not asserted,
@@ -749,6 +836,45 @@ fn run_macos_probe(probe: &str) {
             std::process::exit(0);
         }
 
+        // A filesystem service is path-scoped to *its own* directory — the SBPL
+        // counterpart of the Linux services' Landlock ruleset. It may read+write
+        // inside its declared path but is denied outside, even though the profile
+        // is a filesystem-service profile. Mirrors the Linux `service-landlock`
+        // probe. The control (both work pre-lockdown) keeps a broken path or a
+        // read-only temp dir from passing this vacuously.
+        "seatbelt-service-scope" => {
+            let dir = std::env::temp_dir().join("gosub-seatbelt-scope");
+            let _ = std::fs::create_dir_all(&dir);
+            let inside = dir.join("inside.tmp");
+            let outside = std::env::temp_dir().join("gosub-seatbelt-outside.tmp");
+            let _ = std::fs::write(&outside, b"pre");
+            if std::fs::write(&inside, b"x").is_err() || std::fs::read(&outside).is_err() {
+                std::process::exit(code::CONTROL_FAILED);
+            }
+
+            crate::sandbox::lock_down_service(
+                "probe",
+                crate::sandbox::ServiceCaps { filesystem: true, device: false },
+                &[(dir.as_path(), true)],
+            );
+
+            // Inside the scope: writing must still work (the allow rule took).
+            if let Err(e) = std::fs::write(&inside, b"after") {
+                eprintln!(
+                    "[selftest] seatbelt-service-scope: inside write DENIED errno={:?} path={}",
+                    e.raw_os_error(),
+                    inside.display()
+                );
+                std::process::exit(code::WRONG_VALUE);
+            }
+            // Outside the scope: reading must be refused with EPERM.
+            match std::fs::read(&outside) {
+                Ok(_) => std::process::exit(code::NOT_DENIED),
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) => std::process::exit(0),
+                Err(_) => std::process::exit(code::WRONG_ERROR),
+            }
+        }
+
         other => {
             eprintln!("unknown macOS probe: {other}");
             std::process::exit(2);
@@ -795,17 +921,70 @@ fn run_platform_probe(probe: &str) {
             names
         };
 
-        let before = std::fs::read_link("/proc/self/ns/net").expect("read netns link");
+        let ns_link = |kind: &str| {
+            std::fs::read_link(format!("/proc/self/ns/{kind}")).expect("read ns link")
+        };
+        // `isolate_network` unshares net + ipc + uts together, so all three
+        // namespace ids must change — checking only net would miss a regression
+        // that dropped ipc/uts from the flag set.
+        let (net0, ipc0, uts0) = (ns_link("net"), ns_link("ipc"), ns_link("uts"));
         assert!(interfaces().len() > 1, "host netns looks empty already — probe proves nothing");
 
-        crate::sandbox::isolate_network(true).expect("unshare netns");
+        crate::sandbox::isolate_network(true).expect("unshare namespaces");
 
-        // The namespace must actually have changed, and the new one must hold
-        // nothing but loopback: no route off this machine exists at all.
-        let after = std::fs::read_link("/proc/self/ns/net").expect("read netns link");
-        assert_ne!(before, after, "still in the host network namespace");
+        // The network namespace must actually have changed, and the new one must
+        // hold nothing but loopback: no route off this machine exists at all.
+        assert_ne!(net0, ns_link("net"), "still in the host network namespace");
         assert_eq!(interfaces(), vec!["lo".to_string()], "netns is not empty");
+        // ...and the IPC and UTS namespaces changed too (defense in depth).
+        assert_ne!(ipc0, ns_link("ipc"), "still in the host IPC namespace");
+        assert_ne!(uts0, ns_link("uts"), "still in the host UTS namespace");
         std::process::exit(0);
+    }
+
+    if probe == "pidns" {
+        // `isolate_network` also requests a PID namespace, which (because
+        // `unshare(CLONE_NEWPID)` is lazy) places the caller's *children* — not
+        // the caller — in it. So prove it the way the fork server relies on:
+        // after the unshare, a forked child must be PID 1 of a fresh namespace.
+        // Best-effort like the real path — where the kernel refused CLONE_NEWPID
+        // and it fell back, the child is not PID 1, and we skip (exit 0) rather
+        // than fail a host that cannot make PID namespaces.
+        crate::sandbox::isolate_network(true).expect("unshare namespaces");
+        // SAFETY: single-threaded probe; child runs only getpid + _exit.
+        match unsafe { libc::fork() } {
+            -1 => {
+                eprintln!("[selftest] pidns: fork failed: {}", std::io::Error::last_os_error());
+                std::process::exit(1);
+            }
+            0 => {
+                // Raw getpid (not glibc's possibly-cached wrapper): 1 ⇒ we are
+                // init of a fresh PID namespace. Carry the answer in the code.
+                let pid = unsafe { libc::syscall(libc::SYS_getpid) };
+                unsafe { libc::_exit(if pid == 1 { 0 } else { 40 }) };
+            }
+            child => {
+                let mut st = 0;
+                if unsafe { libc::waitpid(child, &mut st, 0) } != child {
+                    eprintln!("[selftest] pidns: could not reap the child");
+                    std::process::exit(1);
+                }
+                match libc::WEXITSTATUS(st) {
+                    0 => {
+                        eprintln!("[selftest] pidns: child is PID 1 of a fresh namespace (ok)");
+                        std::process::exit(0);
+                    }
+                    40 => {
+                        eprintln!("[selftest] pidns: CLONE_NEWPID unavailable (fell back) — skipping");
+                        std::process::exit(0);
+                    }
+                    other => {
+                        eprintln!("[selftest] pidns: unexpected child exit {other}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
     }
 
     // Also pre-lockdown, for the same reason: `prctl` is not on the allowlist,
@@ -827,9 +1006,206 @@ fn run_platform_probe(probe: &str) {
         std::process::exit(0);
     }
 
+    // The broker's *loose* Landlock: read/exec anywhere, write only beneath the
+    // temp dir. Runs before any seccomp lockdown (it needs `openat` to test file
+    // writes). Prove both halves — a write inside temp succeeds, a write outside
+    // is denied (`EACCES`) — with a control that shows the outside write worked
+    // *before* lockdown, so the denial is Landlock's and not a plain permission
+    // error. Skips cleanly where Landlock is unavailable, like the service probe.
+    if probe == "broker-landlock" {
+        if !crate::sandbox::landlock_available() {
+            eprintln!("[selftest] landlock unavailable — skipping");
+            std::process::exit(0);
+        }
+        let inside = std::env::temp_dir().join("gosub-broker-inside.tmp");
+        // Outside temp: the cwd the probe was spawned from (the crate root),
+        // which the user can normally write — a real control, not `/`.
+        let outside =
+            std::env::current_dir().unwrap_or_else(|_| "/".into()).join("gosub-broker-outside.tmp");
+
+        let control_ok = std::fs::write(&outside, b"pre").is_ok();
+        let _ = std::fs::remove_file(&outside);
+
+        crate::sandbox::lock_down_broker();
+
+        let inside_ok = std::fs::write(&inside, b"x").is_ok();
+        let _ = std::fs::remove_file(&inside);
+        let outside_denied = match std::fs::write(&outside, b"x") {
+            Err(e) if e.raw_os_error() == Some(libc::EACCES) => true,
+            Ok(()) => {
+                let _ = std::fs::remove_file(&outside); // Landlock didn't bind — clean up
+                false
+            }
+            Err(_) => false,
+        };
+        eprintln!(
+            "[selftest] broker-landlock: control_ok={control_ok} inside_ok={inside_ok} \
+             outside_denied={outside_denied}"
+        );
+        std::process::exit(if control_ok && inside_ok && outside_denied { 0 } else { 1 });
+    }
+
+    // The broker's deny-list seccomp filter must actually *bite*. `lock_down_broker`
+    // installs it (default-allow, `Trap` the escalation syscalls); `ptrace` is on
+    // that list, so any call to it is a fatal `SIGSYS` — the same terminate-on-
+    // violation the allowlist probes assert. `PTRACE_TRACEME` needs no target and
+    // would ordinarily *succeed* (return 0), so if this process is still alive on
+    // the next line the deny-list did not bind, and we exit non-zero to say so.
+    // The paired positive case — the broker doing its real work under this filter
+    // — is the whole multi-process demo, which spawns, execs, and opens files.
+    if probe == "broker-seccomp" {
+        crate::sandbox::lock_down_broker();
+        // SAFETY: a plain ptrace request; the point is that the syscall is trapped
+        // before it returns, not what it would have done.
+        unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) };
+        eprintln!("[selftest] broker-seccomp: ptrace was NOT denied — deny-list did not bind");
+        std::process::exit(1);
+    }
+
+    // The deny-list must close the *fd-based* mount API too, not only the classic
+    // `mount`/`pivot_root` — otherwise a compromised broker could `fsopen`+
+    // `fsmount`+`move_mount` its way to the same escape. `fsopen` is on the list,
+    // so a raw call to it is a fatal `SIGSYS`; reaching the line past it means the
+    // new mount API was left open, and we exit non-zero to say so.
+    if probe == "broker-seccomp-mount" {
+        crate::sandbox::lock_down_broker();
+        // SAFETY: a raw `fsopen` with a dummy fs name; the point is that the
+        // syscall traps before it returns, not what it would have opened.
+        let name = b"tmpfs\0";
+        unsafe { libc::syscall(libc::SYS_fsopen, name.as_ptr(), 0u32) };
+        eprintln!("[selftest] broker-seccomp-mount: fsopen was NOT denied — the fd-based mount API is not on the deny-list");
+        std::process::exit(1);
+    }
+
+    // cgroup v2 per-child memory bound: place this process in a child cgroup with
+    // a known `memory.max` and read it back, proving the limit actually binds.
+    // Best-effort like the Landlock probes — where cgroup v2 memory delegation is
+    // unavailable (a shared login/tmux scope, no `Delegate=yes`), it skips (exit
+    // 0) rather than failing an untestable host. Run under a delegated scope
+    // (`systemd-run --user -p Delegate=yes --scope …`) to exercise the real path.
+    // The self-capturing crash reporter must fire *and* still let the process
+    // die with the original signal. Under the renderer lockdown (so this also
+    // proves the handler works within the seccomp filter — it uses only `write`
+    // + `sigaction`, and re-dies by restoring `SIG_DFL` and returning rather than
+    // a filter-blocked `tgkill`), dereference a null pointer to raise SIGSEGV.
+    // The handler writes a `[crash]` line, restores the default, and returns; the
+    // faulting instruction re-executes and the process dies with SIGSEGV, which
+    // the parent observes. Reaching the line below would mean the fault was
+    // swallowed — a bug.
+    if probe == "crash-report" {
+        crate::sandbox::lock_down_renderer();
+        // SAFETY: an intentional wild read of address 0 to trigger SIGSEGV;
+        // `read_volatile` is not optimized away.
+        let _ = unsafe { std::ptr::read_volatile(std::ptr::null::<u8>()) };
+        eprintln!("[selftest] crash-report: SIGSEGV did not terminate the process");
+        std::process::exit(1);
+    }
+
+    if probe == "cgroup-memory-limit" {
+        const WANT: u64 = 64 * 1024 * 1024;
+        match crate::sandbox::cgroup_confine_self(WANT) {
+            None => {
+                eprintln!("[selftest] cgroup v2 memory delegation unavailable — skipping");
+                std::process::exit(0);
+            }
+            Some(Ok(got)) if got == WANT => {
+                eprintln!("[selftest] cgroup-memory-limit: memory.max read back {got} (ok)");
+                std::process::exit(0);
+            }
+            Some(Ok(got)) => {
+                eprintln!("[selftest] cgroup-memory-limit: memory.max was {got}, wanted {WANT}");
+                std::process::exit(1);
+            }
+            Some(Err(e)) => {
+                eprintln!("[selftest] cgroup-memory-limit: could not apply the limit ({e})");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Fork-server probes: this role's filter is not the renderer's, and it is
     // inherited by every renderer forked under it — so it gets its own
     // lockdown here rather than falling through to `lock_down_renderer`.
+    // Service-filter probes: each confines itself with a service filter, then
+    // tests one syscall. They run before the renderer lockdown below because
+    // they need a *different* filter (a superset of the baseline).
+    if let Some(op) = probe.strip_prefix("service-") {
+        use crate::sandbox::ServiceCaps;
+        match op {
+            // The filesystem filter must permit `openat` — the whole reason a
+            // storage/font service is a separate process. Allowed = the syscall
+            // returns (fd or errno) rather than a fatal SIGSYS; clean exit.
+            "fs-openat" => {
+                crate::sandbox::lock_down_service("probe", ServiceCaps { filesystem: true, device: false }, &[]);
+                // SAFETY: a NUL-terminated path and standard open flags.
+                let fd = unsafe { libc::openat(libc::AT_FDCWD, c"/dev/null".as_ptr(), libc::O_RDONLY) };
+                if fd >= 0 {
+                    unsafe { libc::close(fd) };
+                }
+                std::process::exit(0);
+            }
+            // ...but it is a *superset of the baseline*, not a blank cheque:
+            // network is still denied. Reached (clean exit) only if the filter
+            // wrongly allowed `socket`; otherwise SIGSYS.
+            "fs-no-socket" => {
+                crate::sandbox::lock_down_service("probe", ServiceCaps { filesystem: true, device: false }, &[]);
+                // SAFETY: obtaining a socket; expected to be fatal.
+                let _ = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+                std::process::exit(0);
+            }
+            // The device filter must permit `ioctl` (how a real audio/GPU
+            // service drives its device). An unsupported request returns ENOTTY
+            // rather than being killed; clean exit = the syscall was allowed.
+            "device-ioctl" => {
+                crate::sandbox::lock_down_service("probe", ServiceCaps { filesystem: false, device: true }, &[]);
+                let mut winsz: libc::winsize = unsafe { std::mem::zeroed() };
+                // SAFETY: TIOCGWINSZ with a valid out-struct; fd 2 may not be a
+                // tty, in which case it errors — which is fine, we only need the
+                // syscall to be permitted rather than killed.
+                let _ = unsafe { libc::ioctl(2, libc::TIOCGWINSZ, &mut winsz) };
+                std::process::exit(0);
+            }
+            // Landlock: the path-level confinement seccomp cannot do. Scoped to
+            // a temp dir, the service may open files *inside* it but is denied
+            // (EACCES) *outside* — even though seccomp still permits `openat`.
+            // Skips cleanly where Landlock is unavailable (kernel/config), like
+            // the macOS ptrace probe, so it never fails for an untestable host.
+            "landlock" => {
+                if !crate::sandbox::landlock_available() {
+                    eprintln!("[selftest] landlock unavailable on this kernel — skipping");
+                    std::process::exit(0);
+                }
+                let dir = std::env::temp_dir().join("gosub-ll-probe");
+                let _ = std::fs::create_dir_all(&dir);
+                let inside = dir.join("inside.tmp");
+                // A file *outside* the ruleset, created before lockdown so it
+                // certainly exists (an EACCES below is Landlock, not ENOENT).
+                let outside = std::env::temp_dir().join("gosub-ll-outside.tmp");
+                let _ = std::fs::write(&outside, b"pre");
+
+                crate::sandbox::lock_down_service(
+                    "probe",
+                    ServiceCaps { filesystem: true, device: false },
+                    &[(dir.as_path(), true)],
+                );
+
+                // Inside the scope: creating/writing must work.
+                let ok_inside = std::fs::write(&inside, b"x").is_ok();
+                // Outside the scope: reading must be refused with EACCES.
+                let denied_outside = matches!(
+                    std::fs::read(&outside),
+                    Err(e) if e.raw_os_error() == Some(libc::EACCES)
+                );
+                eprintln!("[selftest] landlock: inside_ok={ok_inside} outside_denied={denied_outside}");
+                std::process::exit(if ok_inside && denied_outside { 0 } else { 1 });
+            }
+            other => {
+                eprintln!("unknown service probe: {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     if let Some(op) = probe.strip_prefix("forkserver-") {
         crate::sandbox::lock_down_fork_server();
         match op {
@@ -875,6 +1251,27 @@ fn run_platform_probe(probe: &str) {
             "no-socket" => unsafe {
                 let _ = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
                 std::process::exit(0);
+            },
+
+            // A *plain* fork is allowed (see `can-fork`), but a `clone` that
+            // unshares a namespace is not: once `clone3` is `ENOSYS`'d, the
+            // register-visible `clone` flags are argument-filtered to mask off
+            // CLONE_NEW*/CLONE_THREAD/CLONE_VM. Attempt a clone into a new *user*
+            // namespace directly; the mask must trap it with SIGSYS *before* the
+            // kernel even checks userns permissions. Reached (clean exit) only if
+            // the mask let a dangerous flag through — i.e. the hardening is a
+            // no-op. This is what keeps `install_clone3_enosys` + the `clone`
+            // rule from being an untested pair of moving parts.
+            "no-newuser-clone" => unsafe {
+                // Raw `clone` with SIGCHLD (fork semantics) so a NULL stack is a
+                // copy-on-write fork; `flags` is arg 0 on both x86_64 and
+                // aarch64. If the filter works this never returns.
+                let flags = (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_long;
+                let ret = libc::syscall(libc::SYS_clone, flags, 0, 0, 0, 0);
+                if ret == 0 {
+                    libc::_exit(0); // the child, if the clone wrongly succeeded
+                }
+                std::process::exit(0); // parent reached here → not denied
             },
 
             other => {

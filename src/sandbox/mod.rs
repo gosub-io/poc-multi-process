@@ -43,7 +43,7 @@
 //! | [`lock_down_renderer`]   | after the IPC link is connected | renderer |
 //! | [`lock_down_net`]        | after the IPC link is connected | net component |
 //!
-//! | [`confine_spawned_child`] | immediately after spawn, **by the parent** | children (Windows only in effect) |
+//! | [`confine_spawned_child`] | immediately after spawn, **by the parent** | children (Windows job object; Linux cgroup memory bound) |
 //!
 //! Linux additionally has [`lock_down_fork_server`], which is not part of the
 //! cross-platform contract: no other backend has a zygote to confine.
@@ -122,18 +122,24 @@ pub fn deny_debugger_attach() {
     imp::deny_debugger_attach();
 }
 
-/// Impose resource ceilings (address space, fd count, no core dumps, lowered
-/// scheduling priority) on a child. Called from `pre_exec`, so it must stay
-/// async-signal-safe. rlimits only ever lower, so a child cannot undo them.
+/// Impose resource ceilings (committed heap plus an address-space ceiling, fd
+/// count, no core dumps, lowered scheduling priority) on a child. Called from
+/// `pre_exec`, so it must stay async-signal-safe. rlimits only ever lower, so a
+/// child cannot undo them.
 #[cfg(feature = "multi-process")]
 pub fn apply_child_rlimits() -> std::io::Result<()> {
     imp::apply_child_rlimits()
 }
 
-/// Isolate a child from the network when `enable` is set (renderers), leaving
-/// it in place otherwise (the net component). Called from `pre_exec`, so it
-/// must stay async-signal-safe. On platforms without network namespaces this
-/// is deferred into the lockdown profile — see the backend docs.
+/// Isolate a child's namespaces when `enable` is set (content processes and
+/// services), leaving them in place otherwise (the net component). On Linux this
+/// unshares the network namespace (the load-bearing one) plus IPC and UTS as
+/// defense in depth, and (best-effort) a PID namespace — which, because the
+/// unshare is lazy, isolates the *fork server's forked renderers* rather than the
+/// caller (see the backend docs). The mount namespace is deliberately left out
+/// for concrete reasons (see the backend docs). Called from `pre_exec`, so it
+/// must stay async-signal-safe. On platforms without namespaces this is deferred
+/// into the lockdown profile — see the backend docs.
 #[cfg(feature = "multi-process")]
 pub fn isolate_network(enable: bool) -> std::io::Result<()> {
     imp::isolate_network(enable)
@@ -155,27 +161,103 @@ pub fn lock_down_net() {
     imp::lock_down_net();
 }
 
+/// Confine the **vault** (cookie store): the tightest filter of any role — the
+/// bare content baseline (no network, files, devices, or exec) plus
+/// non-dumpable. It holds secrets, so it gets the least authority of any
+/// process. Linux only (the vault is Linux-only). Fail-closed.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn lock_down_vault() {
+    imp::lock_down_vault();
+}
+
+/// What extra capability an engine-spawned service needs beyond the content
+/// baseline. Unlike a renderer or the decoder, these roles need a privilege the
+/// zygote gave up (filesystem or device access), which is why each is spawned
+/// from the engine with its own filter rather than forked from the fork server.
+#[derive(Clone, Copy)]
+pub struct ServiceCaps {
+    /// Needs to open files (font, storage). Adds `openat` on Linux.
+    pub filesystem: bool,
+    /// Needs a device node + `ioctl` (audio, GPU). Adds `openat` + `ioctl`.
+    pub device: bool,
+}
+
+/// Confine an engine-spawned service to the content baseline plus exactly the
+/// capability `caps` selects. `name` is the label in its lockdown banner.
+///
+/// `fs_allow` names the directories/files a filesystem service may touch, each
+/// with a `writable` flag. On Linux these become a Landlock ruleset that
+/// confines the service's `openat` to exactly those paths — the path-level
+/// guard seccomp cannot provide. Ignored on platforms whose confinement gates
+/// files another way (macOS) or not at all (Windows). Empty for device
+/// services and where no path scoping applies.
+///
+/// Fail-closed on the seccomp/profile install like the other lockdowns; the
+/// Landlock portion is best-effort (see the Linux backend).
+#[cfg(feature = "multi-process")]
+pub fn lock_down_service(name: &str, caps: ServiceCaps, fs_allow: &[(&std::path::Path, bool)]) {
+    imp::lock_down_service(name, caps.filesystem, caps.device, fs_allow);
+}
+
 /// Apply parent-side confinement to a child that has just been spawned.
 ///
 /// **The sixth operation**, and the first that is not self-applied: the parent
 /// does this *to* the child. Windows needs it because its access controls
 /// (here a job object; later a restricted token and an AppContainer) can only
 /// be attached from outside — see the note below on why the contract assumed
-/// otherwise. On Linux and macOS confinement is entirely self-applied, so this
-/// is a no-op there and the platforms stay symmetric at the call site.
+/// otherwise. **Linux** uses it too, for the one bound a process cannot set on
+/// itself usefully: a cgroup v2 `memory.max` places the child in its own
+/// memory-limited cgroup (the RSS analogue of the Windows job-object memory cap),
+/// best-effort. macOS confinement is entirely self-applied, so this stays a no-op
+/// there and the platforms keep a symmetric call site.
 ///
-/// Called immediately after spawn, before the child has done any work.
+/// Called immediately after spawn, before the child has done any work. The
+/// Windows path is fail-closed; the Linux cgroup bound is best-effort (never
+/// fatal — a child that can't be cgroup-limited still runs, rlimit-bounded).
 #[cfg(feature = "multi-process")]
 pub fn confine_spawned_child(child: &crate::spawn::Child) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
         return imp::confine_spawned_child(child.raw_handle());
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        // Best-effort cgroup memory bound (never fatal); see the backend.
+        return imp::confine_spawned_child(child.id());
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = child;
         Ok(())
     }
+}
+
+/// Tear down the broker's cgroup subtree at shutdown, symmetric to
+/// [`confine_spawned_child`]. Best-effort and safe to call unconditionally: a
+/// no-op where no subtree was set up, and outside Linux. Call once every child
+/// has been reaped, so the per-child cgroups are empty and removable.
+#[cfg(feature = "multi-process")]
+pub fn cleanup_spawned_cgroups() {
+    #[cfg(target_os = "linux")]
+    imp::cleanup_spawned_cgroups();
+}
+
+/// Arm an alternate signal stack for the **current** thread, so the self-capturing
+/// crash reporter can still run when this thread's own stack overflows. The
+/// broker is multithreaded and the reporter's altstack is per-thread, so each
+/// engine thread calls this at startup. A no-op off Linux (only the Linux backend
+/// installs the crash reporter) and safe to call unconditionally.
+pub fn install_thread_crash_altstack() {
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    imp::install_thread_crash_altstack();
+}
+
+/// Test hook for the `cgroup-memory-limit` probe: bound this process's memory via
+/// cgroup v2 `memory.max` and read the ceiling back, or `None` where cgroup v2
+/// memory delegation is unavailable (the probe then skips). Linux only.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn cgroup_confine_self(limit: u64) -> Option<std::io::Result<u64>> {
+    imp::cgroup_confine_self(limit)
 }
 
 /// Build a restricted primary token for a Windows child, or `None` if the host
@@ -183,6 +265,39 @@ pub fn confine_spawned_child(child: &crate::spawn::Child) -> std::io::Result<()>
 #[cfg(all(feature = "multi-process", target_os = "windows"))]
 pub fn restricted_token() -> Option<::windows_sys::Win32::Foundation::HANDLE> {
     imp::restricted_token()
+}
+
+/// The AppContainer (lowbox) identity for a Windows child — the capability
+/// sandbox that gives content roles no network and the net component
+/// `internetClient`. Windows only. See the backend for the image-loading caveat.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub use imp::AppContainerIdentity;
+
+/// Build the AppContainer identity for a child (`internet` grants the
+/// `internetClient` capability), or `None` if the SIDs cannot be built (the
+/// spawner then falls back to the restricted-token path). Windows only.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub fn app_container_identity(name: &str, internet: bool) -> Option<AppContainerIdentity> {
+    imp::app_container_identity(name, internet)
+}
+
+/// Grant ALL APPLICATION PACKAGES read+execute on `path` so an AppContainer
+/// child can load the image (the install-time ACL, done at spawn). Windows only.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub fn grant_app_package_execute(path: &std::path::Path) -> std::io::Result<()> {
+    imp::grant_app_package_execute(path)
+}
+
+/// Give a service's own AppContainer access to its file/directory (`writable`
+/// also relabels it Low integrity) — the Windows analogue of the Linux services'
+/// `openat` + Landlock to their own path. Windows only.
+#[cfg(all(feature = "multi-process", target_os = "windows"))]
+pub fn grant_container_path_access(
+    path: &std::path::Path,
+    container_sid: *mut std::ffi::c_void,
+    writable: bool,
+) -> std::io::Result<()> {
+    imp::grant_container_path_access(path, container_sid, writable)
 }
 
 /// Apply a job-object memory cap to a process. Exposed for the probe suite,
@@ -203,6 +318,33 @@ pub fn get_mitigation_policy(
 ) -> std::io::Result<u32> {
     imp::get_policy(policy)
 }
+
+/// Whether Landlock (path-level filesystem confinement) is usable on this
+/// kernel. Linux only; used by the probe to skip cleanly where it is absent.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn landlock_available() -> bool {
+    imp::landlock_available()
+}
+
+/// Confine the **broker** (engine) process: a *loose* sandbox — like a browser's
+/// main process — for the one process that holds every secret and deserializes
+/// untrusted frames. It cannot be tightened to a renderer's degree (it must spawn
+/// children, exec their libraries, thread, and open files and sockets), but two
+/// blast radii can be reduced: a **Landlock** ruleset limits *writes* to the temp
+/// dir (read/exec stay open), and a **deny-list seccomp filter** removes the
+/// escalation syscalls it never uses (`ptrace`, kernel-module/`kexec`/`bpf`, the
+/// keyring, `mount`/`setns`, …) while allowing everything else. Called by the
+/// binary on its main thread before the engine starts, so every engine thread and
+/// child inherits both. Linux only; a no-op elsewhere (a macOS Seatbelt broker
+/// profile would be the equivalent, and is not built yet). Best-effort: a kernel
+/// missing either mechanism leaves that layer off rather than aborting.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+pub fn lock_down_broker() {
+    imp::lock_down_broker();
+}
+
+#[cfg(all(feature = "multi-process", not(target_os = "linux")))]
+pub fn lock_down_broker() {}
 
 /// Cap the fork server (Linux only — it is the one platform with a zygote).
 ///

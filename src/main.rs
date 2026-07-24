@@ -1,61 +1,17 @@
-//! Proof of concept for gosub-engine issue #1080:
-//! "Process Isolation for Security: Multi-Process Architecture".
-//!
-//! The engine is event-driven, shaped like the real gosub engine: commands
-//! in through an `EngineHandle`, events out through a channel. Underneath,
-//! its components run in one of two setups over the *same* code and broker
-//! protocol; only the transport and spawning differ:
-//!
-//! ```text
-//! multi-process (default)             single-process
-//! engine event loop (broker)          engine event loop (broker)
-//! ├── net component     [process]     ├── net component     [thread]
-//! ├── renderer origin A     [""]      ├── renderer origin A     [""]
-//! └── renderer origin B     [""]      └── renderer origin B     [""]
-//! ```
-//!
-//! Selection is two-level:
-//! - compile time: the `multi-process` cargo feature (on by default) gates
-//!   all process/socket code; `--no-default-features` builds a
-//!   single-process-only engine (e.g. for platforms without fork/UDS).
-//! - run time: when the feature is compiled in, `--single-process` still
-//!   selects the thread-based setup (like Chromium's `--single-process`).
+//! Binary entry point for the gosub process-isolation PoC. The engine and all
+//! its components live in the library crate (`src/lib.rs`); this file is only
+//! the child-role dispatch for re-exec plus a minimal event-driven demo. See
+//! the library crate docs for the architecture.
 
-// The transport seam, mirroring `sandbox`: the only place a `target_os` cfg
-// for the IPC byte channel lives. Multi-process only — single-process links
-// are in-process channels.
+use gosub_proc_iso_poc::engine::{self, Mode};
+use gosub_proc_iso_poc::events::{self, EngineEvent, ZoneId};
+use gosub_proc_iso_poc::renderer;
+// Child-role entry points and the selftest exist only in the multi-process
+// build; import them under the same gate the dispatch below uses.
 #[cfg(feature = "multi-process")]
-mod channel;
-mod engine;
-mod events;
+use gosub_proc_iso_poc::{decoder, device_service, font, net_daemon, selftest, storage};
 #[cfg(all(feature = "multi-process", target_os = "linux"))]
-mod fork_server;
-mod ip_utils;
-mod ipc;
-mod net_daemon;
-mod renderer;
-// Unconditional: the per-OS confinement machinery inside is feature-gated, but
-// `deny_debugger_attach` applies to the single-process build too — that build
-// still holds the cookie jar in its address space. The platform backend
-// (seccomp / Seatbelt / none) is selected inside the module.
-mod sandbox;
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
-mod ring;
-// Compiled on every platform (not just Linux) so the integration suite can
-// query the probe inventory anywhere — a platform with no probes must fail
-// loudly rather than silently skip its enforcement tests.
-#[cfg(feature = "multi-process")]
-mod selftest;
-// The spawn seam: how a child process is created. Owned rather than delegated
-// to std::process::Command because Windows access controls must be supplied at
-// CreateProcess time.
-#[cfg(feature = "multi-process")]
-mod spawn;
-#[cfg(all(feature = "multi-process", target_os = "linux"))]
-mod shm;
-
-use engine::Mode;
-use events::{EngineEvent, ZoneId};
+use gosub_proc_iso_poc::{fork_server, vault};
 
 #[cfg(feature = "multi-process")]
 const DEFAULT_MODE: Mode = Mode::Multi;
@@ -83,8 +39,27 @@ fn main() {
         Some("net-daemon") => net_daemon::run(&args[2]),
         #[cfg(feature = "multi-process")]
         Some("renderer") => renderer::run(&args[2], &args[3]),
+        // Ephemeral image decoder: decodes one image and exits (see decoder.rs).
+        // On Linux it is forked from the zygote and never takes this path; this
+        // is the fork+exec fallback used elsewhere.
+        #[cfg(feature = "multi-process")]
+        Some("decoder") => decoder::run(&args[2]),
+        // Engine-spawned services — filesystem or device capable, so they live
+        // outside the zygote with their own filters (see each module).
+        #[cfg(feature = "multi-process")]
+        Some("storage") => storage::run(&args[2]),
+        #[cfg(feature = "multi-process")]
+        Some("font") => font::run(&args[2]),
+        #[cfg(feature = "multi-process")]
+        Some("audio") => device_service::run("audio", &args[2]),
+        #[cfg(feature = "multi-process")]
+        Some("gpu") => device_service::run("gpu", &args[2]),
         #[cfg(all(feature = "multi-process", target_os = "linux"))]
         Some("fork-server") => fork_server::run(&args[2]),
+        // The cookie vault: a low-authority in-memory secret store, kept out of
+        // the broker (Linux only — see `vault`).
+        #[cfg(all(feature = "multi-process", target_os = "linux"))]
+        Some("vault") => vault::run(&args[2]),
         // Internal sandbox self-test, spawned only by the integration suite.
         #[cfg(feature = "multi-process")]
         Some("selftest") => selftest::run(&args[2]),
@@ -108,6 +83,29 @@ fn main() {
 
 /// Minimal event-driven usage: send commands, react to events.
 fn run(mode: Mode) {
+    // Give this engine instance its own storage dir and font file, so parallel
+    // runs (the integration suite launches many binaries at once) never share a
+    // `/tmp` path and race each other's files. Children inherit these via the
+    // environment. Set on the main thread before any thread spawns (so the
+    // `set_var` is race-free) and before the broker Landlock below.
+    #[cfg(feature = "multi-process")]
+    {
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        std::env::set_var("GOSUB_STORAGE_DIR", tmp.join(format!("gosub-storage-{pid}")));
+        std::env::set_var("GOSUB_FONT_FILE", tmp.join(format!("gosub-font-{pid}.dat")));
+    }
+
+    // Confine the broker process's filesystem before it spawns anything or loads
+    // the cookie jar: it may read and exec (to launch children and load their
+    // libraries) but may only *write* beneath the temp dir, so a compromised
+    // broker cannot plant persistence or tamper with the user's files. Applied
+    // here, on the main thread, so every engine thread and every child inherits
+    // it. Done in the binary rather than `engine::start` so unit tests and
+    // embedders — which drive the engine directly — are not confined.
+    #[cfg(feature = "multi-process")]
+    gosub_proc_iso_poc::sandbox::lock_down_broker();
+
     let (engine, events) = engine::start(mode);
 
     // Two zones = two storage/cookie partitions (think "Work" and "Personal").
@@ -131,10 +129,18 @@ fn run(mode: Mode) {
     // outcome, not a reason to wait forever — see `TabCrashed` below.
     let mut tabs_finished = 0;
     let mut crashed = 0;
+    // The work tab, and whether it has already demonstrated a cross-origin
+    // renderer swap. After its first frame it navigates cross-origin once, so
+    // the demo exercises site isolation's renderer swap end to end.
+    let mut work_tab: Option<events::TabId> = None;
+    let mut work_swapped = false;
     for event in events {
         match event {
             EngineEvent::TabOpened { tab_id, zone, origin } => {
                 println!("{tab_id} [{zone}]: opened for {origin}");
+                if zone == work {
+                    work_tab = Some(tab_id);
+                }
                 // The personal tab fetches a large (4 MiB) body — the PoC's
                 // stand-in for a big download — to exercise the shared-memory
                 // ring transport; the work tab fetches a small in-band page.
@@ -153,7 +159,21 @@ fn run(mode: Mode) {
                     tile.pixels.transport(),
                     if tile_matches_pattern(&tile) { "ok" } else { "MISMATCH" },
                 );
-                engine.close_tab(tab_id).unwrap();
+                // Site isolation: with `GOSUB_DEMO_SWAP` set, the work tab
+                // navigates cross-origin after its first frame. The engine swaps
+                // in a fresh renderer for the new origin — two origins never
+                // share a process — then renders it, after which we close. The
+                // flag keeps the *default* run (and every other integration
+                // test that drives it) at its original process count; only the
+                // swap's own test opts the extra renderer in. Every other frame
+                // just closes its tab.
+                let demo_swap = std::env::var_os("GOSUB_DEMO_SWAP").is_some();
+                if demo_swap && Some(tab_id) == work_tab && !work_swapped {
+                    work_swapped = true;
+                    engine.navigate(tab_id, "https://other.example/page").unwrap();
+                } else {
+                    engine.close_tab(tab_id).unwrap();
+                }
             }
             EngineEvent::TabClosed { tab_id } => {
                 println!("{tab_id}: closed");
@@ -164,6 +184,9 @@ fn run(mode: Mode) {
             }
             EngineEvent::OpenTabFailed { url, reason } => {
                 println!("could not open {url}: {reason}");
+            }
+            EngineEvent::TabNavigated { tab_id, origin } => {
+                println!("{tab_id}: swapped to a new renderer for {origin}");
             }
             EngineEvent::NavigationFailed { tab_id, reason } => {
                 println!("{tab_id}: navigation failed: {reason}");
@@ -190,6 +213,18 @@ fn run(mode: Mode) {
                 println!("engine shut down");
                 break;
             }
+        }
+    }
+
+    // Best-effort cleanup of this instance's per-run storage/font paths, so the
+    // per-PID directories do not accumulate in the temp dir across runs.
+    #[cfg(feature = "multi-process")]
+    {
+        if let Some(dir) = std::env::var_os("GOSUB_STORAGE_DIR") {
+            let _ = std::fs::remove_dir_all(std::path::PathBuf::from(dir));
+        }
+        if let Some(file) = std::env::var_os("GOSUB_FONT_FILE") {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(file));
         }
     }
 

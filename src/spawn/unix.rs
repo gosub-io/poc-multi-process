@@ -17,10 +17,16 @@ impl Child {
         self.0.wait().map(|_| ())
     }
 
-    /// The underlying `std::process::Child`, for the parent-side confinement
-    /// hook (a no-op on Unix, but the seam is shared).
-    pub fn as_std(&self) -> &std::process::Child {
-        &self.0
+    /// The child's process id — needed so the parent can place it in its own
+    /// cgroup (the Linux half of `confine_spawned_child`).
+    pub fn id(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// Best-effort SIGKILL — used to abandon a child that has wedged (e.g. a
+    /// decoder that stopped answering), so `wait` does not block forever.
+    pub fn kill(&mut self) -> io::Result<()> {
+        self.0.kill()
     }
 }
 

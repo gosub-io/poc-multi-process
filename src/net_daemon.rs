@@ -5,9 +5,19 @@
 //! production build would enforce that with seccomp/landlock). In
 //! single-process mode the very same `serve` loop runs as a thread: the
 //! policy checks still apply, but there is no hard boundary behind them.
+//!
+//! Fetching follows redirects, and the SSRF classifier runs on **every hop**,
+//! not just the entry URL — an open redirect to an internal address is the
+//! classic way past an entry-only check. Each hop is re-resolved and re-pinned
+//! through the [`Resolver`] seam, the chain is bounded, and a redirect that
+//! crosses an origin drops the request's cookies rather than leaking them
+//! onward. See [`handle_fetch`].
 
 use crate::ip_utils::{resolve_and_pin, Resolver};
-use crate::ipc::{Endpoint, FetchOutcome, NetRequest, NetResponse};
+use crate::ipc::{Endpoint, FetchMode, FetchOutcome, NetRequest, NetResponse};
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+use crate::ipc::{FromNet, VaultRequest, VaultResponse};
+use crate::orb::{orb_decide, MimeKind, OrbDecision};
 
 /// Multi-process entry point: adopt the inherited IPC link, sandbox, serve.
 /// `link` is the transport's argv token for the channel end the engine handed
@@ -51,14 +61,87 @@ impl Resolver for SyntheticResolver {
 }
 
 pub fn serve(mut ep: Endpoint) {
-    loop {
-        let req: NetRequest = match ep.recv() {
-            Ok(req) => req,
-            Err(_) => break, // engine went away
-        };
+    // The vault link (Linux): net is the vault's sole client. Bound on the
+    // `BindVault` control message that arrives once at startup, before any
+    // cookie op. Held as a raw stream, not an `Endpoint`: the fd arrives *after*
+    // `lock_down_net`, and splitting it into halves would `dup` via `fcntl`,
+    // which the net filter denies (its own link is split pre-lockdown for the
+    // same reason). Net uses the vault link from this one thread, synchronously,
+    // so a single stream — read and written through a shared ref — suffices.
+    // `vault_rid` correlates net's own request/reply on that link.
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    let mut vault: Option<std::os::unix::net::UnixStream> = None;
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    let mut vault_rid: u64 = 0;
+
+    // Loop ends when `recv` errors (engine went away) or on `Shutdown`.
+    while let Ok(req) = ep.recv::<NetRequest>() {
         match req {
             NetRequest::Shutdown => break,
-            NetRequest::Fetch { request_id, for_zone, for_origin, url, cookies } => {
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            NetRequest::BindVault => {
+                // The vault-facing socket fd follows via SCM_RIGHTS. Adopt it as
+                // a raw stream (no split → no fcntl dup, which the filter denies).
+                match ep.rx.recv_fd() {
+                    Ok(fd) => vault = Some(std::os::unix::net::UnixStream::from(fd)),
+                    Err(e) => eprintln!("[net] BindVault without a vault fd: {e}"),
+                }
+            }
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            NetRequest::CookieSet { zone, origin, name, value, http_only } => {
+                // Fire-and-forget to the vault; if it is absent (shouldn't
+                // happen — BindVault comes first) the cookie is simply dropped.
+                if let Some(stream) = vault.as_ref() {
+                    let req = VaultRequest::Set { zone, origin, name, value, http_only };
+                    let mut w: &std::os::unix::net::UnixStream = stream;
+                    let _ = crate::ipc::send_msg(&mut w, &req);
+                }
+            }
+            #[cfg(all(feature = "multi-process", target_os = "linux"))]
+            NetRequest::CookieGetVisible { request_id, zone, origin } => {
+                // The document.cookie view: the vault filters HttpOnly.
+                let cookies = vault_get(&mut vault, &mut vault_rid, &mut ep, zone, &origin, true);
+                if ep.send(&FromNet::CookieVisible { request_id, cookies }).is_err() {
+                    break;
+                }
+            }
+            NetRequest::Fetch {
+                request_id,
+                for_zone,
+                for_origin,
+                url,
+                cookies,
+            } => {
+                // The request id travels with the reply so the engine can
+                // route it back to the tab that asked, even with many
+                // fetches in flight.
+                let requester = format!("zone-{for_zone}/{for_origin}");
+                // The origin's cookies to attach — *including HttpOnly*. In
+                // multi-process on Linux net sources them from the vault (keyed by
+                // the broker-stamped identity) and reports the attached names for
+                // the observe line — sent *before* the streaming decision, so a
+                // streamed (blob) body is observed exactly like an in-band one.
+                // Single-process / off Linux the broker attached them in `cookies`.
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                let cookies = if vault.is_some() {
+                    let c = vault_get(&mut vault, &mut vault_rid, &mut ep, for_zone, &for_origin, false);
+                    let names = c.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+                    if ep
+                        .send(&FromNet::CookieAttached {
+                            request_id,
+                            zone: for_zone,
+                            origin: for_origin.clone(),
+                            names,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    c
+                } else {
+                    cookies
+                };
+
                 // Large bodies stream through a shared-memory ring when the
                 // transport can carry the fd (SSRF policy still applies
                 // first). `GOSUB_BODY_TRANSPORT=socket` forces the in-band
@@ -76,16 +159,118 @@ pub fn serve(mut ep: Endpoint) {
                     }
                 }
 
-                // The request id travels with the reply so the engine can
-                // route it back to the tab that asked, even with many
-                // fetches in flight.
-                let requester = format!("zone-{for_zone}/{for_origin}");
-                let outcome = handle_fetch(&requester, &url, &cookies);
-                let resp = NetResponse { request_id, outcome };
-                if ep.send(&resp).is_err() {
+                // Report the cookies attached to the outbound request, so the
+                // end-to-end property is observable: the *full* set — including
+                // HttpOnly — reaches the network here, having skipped the
+                // renderer entirely.
+                let names =
+                    cookies.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(",");
+                eprintln!("[net] fetch for {requester} attaches cookies: [{names}]");
+                let outcome = handle_fetch(&requester, &url, &cookies, &SyntheticResolver);
+                if send_reply(&mut ep, request_id, outcome).is_err() {
                     break;
                 }
             }
+            NetRequest::Subresource {
+                request_id,
+                url,
+                mode,
+                same_origin,
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                for_zone,
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                for_origin,
+                cookies,
+            } => {
+                // Subresources may be cross-origin: same SSRF + redirect handling
+                // as a fetch, then Opaque Response Blocking decides what — if
+                // anything — reaches the renderer. No streaming path; a
+                // subresource rides the ordinary reply. Cookies come from the
+                // vault in multi-process on Linux (with an attached-names report),
+                // else from the broker-attached `cookies` field.
+                #[cfg(all(feature = "multi-process", target_os = "linux"))]
+                let cookies = if vault.is_some() {
+                    let c = vault_get(&mut vault, &mut vault_rid, &mut ep, for_zone, &for_origin, false);
+                    let names = c.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+                    if ep
+                        .send(&FromNet::CookieAttached {
+                            request_id,
+                            zone: for_zone,
+                            origin: for_origin.clone(),
+                            names,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    c
+                } else {
+                    cookies
+                };
+                let outcome =
+                    handle_subresource(&url, mode, same_origin, &cookies, &SyntheticResolver);
+                if send_reply(&mut ep, request_id, outcome).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Send a fetch/subresource reply to the engine. On Linux it is wrapped in
+/// [`FromNet::Reply`] (the engine reads a `FromNet` there); elsewhere it is a
+/// bare [`NetResponse`].
+fn send_reply(ep: &mut Endpoint, request_id: u64, outcome: FetchOutcome) -> std::io::Result<()> {
+    let resp = NetResponse { request_id, outcome };
+    #[cfg(all(feature = "multi-process", target_os = "linux"))]
+    {
+        ep.send(&FromNet::Reply(resp))
+    }
+    #[cfg(not(all(feature = "multi-process", target_os = "linux")))]
+    {
+        ep.send(&resp)
+    }
+}
+
+/// Query the vault synchronously on net's dedicated link. Net blocking itself
+/// here is fine — the vault answers a narrow, bounded query. An absent or broken
+/// vault link yields no cookies (fail closed), never a hang.
+#[cfg(all(feature = "multi-process", target_os = "linux"))]
+fn vault_get(
+    vault: &mut Option<std::os::unix::net::UnixStream>,
+    rid: &mut u64,
+    ep: &mut Endpoint,
+    zone: u64,
+    origin: &str,
+    visible_only: bool,
+) -> Vec<(String, String)> {
+    if vault.is_none() {
+        return Vec::new();
+    }
+    let request_id = *rid;
+    *rid = rid.wrapping_add(1);
+    let req = VaultRequest::Get { request_id, zone, origin: origin.to_string(), visible_only };
+    // Read/write through a shared ref to the one stream — no dup. Scoped so the
+    // borrow ends before we may drop the link on failure below.
+    let result: Result<Vec<(String, String)>, ()> = {
+        let stream = vault.as_ref().unwrap();
+        let mut w: &std::os::unix::net::UnixStream = stream;
+        if crate::ipc::send_msg(&mut w, &req).is_err() {
+            Err(())
+        } else {
+            let mut r: &std::os::unix::net::UnixStream = stream;
+            crate::ipc::recv_msg::<VaultResponse>(&mut r).map(|resp| resp.cookies).map_err(|_| ())
+        }
+    };
+    match result {
+        Ok(cookies) => cookies,
+        Err(()) => {
+            // The vault died: drop the link (subsequent queries fail fast to
+            // empty — fail open, never a leak) and tell the broker once, so it
+            // respawns the vault and re-binds us with a fresh link.
+            *vault = None;
+            let _ = ep.send(&FromNet::VaultGone);
+            Vec::new()
         }
     }
 }
@@ -127,11 +312,11 @@ fn stream_blob(ep: &mut Endpoint, request_id: u64, body_len: u64) -> std::io::Re
         Err(e) => {
             eprintln!("[net] ring setup failed ({e}); denying stream");
             let outcome = FetchOutcome::Denied { reason: "body stream setup failed".into() };
-            return ep.send(&NetResponse { request_id, outcome });
+            return send_reply(ep, request_id, outcome);
         }
     };
     let outcome = FetchOutcome::OkStreaming { status: 200, body_len };
-    ep.send(&NetResponse { request_id, outcome })?;
+    send_reply(ep, request_id, outcome)?;
     ep.tx.send_fd(fd.as_raw_fd())?;
     drop(fd); // the consumer got its duplicate; our mapping needs no fd
 
@@ -155,23 +340,173 @@ fn stream_blob(ep: &mut Endpoint, request_id: u64, body_len: u64) -> std::io::Re
     Ok(())
 }
 
-/// `requester` is the `zone-N/origin` identity as recorded by the engine; a
-/// real implementation uses it for per-partition network policy. `cookies` are
-/// that partition's cookies (including HttpOnly) the engine wants attached to
-/// this request — the net component is the only process outside the engine
-/// that sees their values.
-fn handle_fetch(_requester: &str, url: &str, cookies: &[(String, String)]) -> FetchOutcome {
-    // Policy and destination in one step: what comes back is the address a
-    // real component would connect to, not a verdict it would then re-resolve.
-    let _pinned = match resolve_and_pin(url, &SyntheticResolver) {
-        Ok(pinned) => pinned,
+/// Redirect chain bound. Large enough for real navigation, small enough that a
+/// redirect *loop* terminates as a refusal rather than spinning forever. Every
+/// mainstream browser caps this around 20; 10 is plenty for the PoC.
+const MAX_REDIRECTS: u32 = 10;
+
+/// How the (synthetic) origin server routes one request: serve a body, or
+/// redirect. Real HTTP lives here in a production component; the PoC models just
+/// enough to exercise the redirect-following and ORB policies — the
+/// security-relevant parts. Routing is separated from the body bytes so the
+/// redirect follower can classify a hop without materializing a response.
+enum Route {
+    Body,
+    Redirect { location: String },
+}
+
+/// The (synthetic) origin server's routing. Recognised paths:
+/// - `/redirect-loop…` redirects to itself (exercises the hop cap).
+/// - `/relative-redirect` returns `Location: /landing` (root-relative, same origin).
+/// - `/redirect/<rest>` returns `Location: <rest>` when `<rest>` carries a
+///   scheme, else `http://<rest>/` — a targeted, usually cross-origin redirect,
+///   the open-redirect an SSRF abuses.
+/// - anything else serves a body (its content type is inferred from the path;
+///   see [`mime_of`]).
+fn route(url: &str) -> Route {
+    let path = path_of(url);
+    if path.starts_with("/redirect-loop") {
+        return Route::Redirect { location: url.to_string() };
+    }
+    if path.starts_with("/relative-redirect") {
+        return Route::Redirect { location: "/landing".into() };
+    }
+    if let Some(rest) = path.strip_prefix("/redirect/") {
+        let location =
+            if rest.contains("://") { rest.to_string() } else { format!("http://{rest}/") };
+        return Route::Redirect { location };
+    }
+    Route::Body
+}
+
+/// The (synthetic) response body for a served URL. A real component would set
+/// `Cookie: name=value; ...` on the outbound request from the attached cookies
+/// and return the origin's actual bytes; the PoC synthesizes a body that names
+/// how many cookies rode along, so tests can observe cookie handling.
+fn synthetic_body(url: &str, cookie_count: usize) -> Vec<u8> {
+    format!("<html><!-- 200 OK for {url}; {cookie_count} cookie(s) attached --></html>")
+        .into_bytes()
+}
+
+/// The path (with any query/fragment) of a URL, or `/` if it has none.
+fn path_of(url: &str) -> &str {
+    match url.split_once("://") {
+        Some((_, rest)) => match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => "/",
+        },
+        None => "/",
+    }
+}
+
+/// `scheme://authority` of a URL, for resolving root-relative redirects and
+/// comparing origins. Deliberately coarse (keeps userinfo/port verbatim): a
+/// mismatch only makes a cookie decision err on the *drop* side.
+fn origin_prefix(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    (!authority.is_empty()).then(|| format!("{scheme}://{authority}"))
+}
+
+/// Whether two URLs share a `scheme://authority`. Used to decide if cookies may
+/// follow a redirect.
+fn same_authority(a: &str, b: &str) -> bool {
+    match (origin_prefix(a), origin_prefix(b)) {
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(&y),
+        _ => false,
+    }
+}
+
+/// Resolve a `Location` against the URL it was returned from: an absolute URL
+/// (has a scheme) is used as-is; a root-relative path is joined onto the current
+/// origin. Anything else (a bare relative path) is not modeled → `None`.
+fn resolve_redirect_target(current: &str, location: &str) -> Option<String> {
+    if location.contains("://") {
+        Some(location.to_string())
+    } else if let Some(path) = location.strip_prefix('/') {
+        Some(format!("{}/{}", origin_prefix(current)?, path))
+    } else {
+        None
+    }
+}
+
+/// The result of following a redirect chain to a servable body.
+struct Follow {
+    /// The final URL whose response is a body (each hop was SSRF-checked).
+    final_url: String,
+    /// Whether any hop left the initial authority — so the response is
+    /// definitely cross-origin and cookies must not have travelled.
+    left_origin: bool,
+}
+
+/// Follow the (synthetic) server's redirects to a body, running [`resolve_and_pin`]
+/// on **every** hop — the entry URL and each `Location` alike.
+///
+/// An entry-only SSRF check is a classic hole: the entry is public, the server
+/// 302s to `http://169.254.169.254/`, and a naive client follows it. Here each
+/// hop is re-resolved and re-pinned (so a redirect into blocked space is refused
+/// even when the entry was allowed), the chain is bounded by [`MAX_REDIRECTS`],
+/// and any hop that leaves the initial authority is recorded so the caller can
+/// drop cookies / apply ORB. `Err` carries the refusal reason.
+fn follow_redirects(start_url: &str, resolver: &impl Resolver) -> Result<Follow, String> {
+    let mut url = start_url.to_string();
+    let mut left_origin = false;
+    let mut hops = 0u32;
+
+    loop {
+        // Policy + destination for THIS hop. `Pinned.addr` is the address a real
+        // component would connect to (connecting to the *name* would re-resolve
+        // and undo the pin). We only need the yes/no here.
+        resolve_and_pin(&url, resolver)?;
+
+        // A blob path is a terminal body handled specially by callers (streamed,
+        // or copied in-band) — stop here rather than route it.
+        if blob_len(&url).is_some() {
+            return Ok(Follow { final_url: url, left_origin });
+        }
+
+        match route(&url) {
+            Route::Body => return Ok(Follow { final_url: url, left_origin }),
+            Route::Redirect { location } => {
+                hops += 1;
+                if hops > MAX_REDIRECTS {
+                    return Err(format!("too many redirects (> {MAX_REDIRECTS})"));
+                }
+                let next = resolve_redirect_target(&url, &location)
+                    .ok_or_else(|| format!("unfollowable redirect Location: {location}"))?;
+                if !same_authority(&url, &next) {
+                    left_origin = true;
+                }
+                url = next;
+            }
+        }
+    }
+}
+
+/// Perform a same-origin document fetch, following redirects.
+///
+/// `requester` is the `zone-N/origin` identity the engine recorded; a real
+/// component uses it for per-partition network policy. `cookies` are that
+/// partition's cookies (including HttpOnly) the engine wants attached — the net
+/// component is the only process outside the engine that sees their values, and
+/// a redirect that leaves the origin drops them rather than leaking one origin's
+/// session token to another host.
+fn handle_fetch(
+    _requester: &str,
+    start_url: &str,
+    cookies: &[(String, String)],
+    resolver: &impl Resolver,
+) -> FetchOutcome {
+    let follow = match follow_redirects(start_url, resolver) {
+        Ok(f) => f,
         Err(reason) => return FetchOutcome::Denied { reason },
     };
-    // A large body on a transport without fd passing (single-process mode,
-    // or the bench's forced-socket comparison) is copied in-band — if it
-    // fits. The 16 MiB frame cap is DoS protection and stays authoritative:
-    // beyond it the honest answer is a refusal, not a raised limit.
-    if let Some(body_len) = blob_len(url) {
+    let url = follow.final_url;
+
+    // A large body is terminal and copied in-band here (the streaming path in
+    // `serve` handles it when fd-passing is available). The 16 MiB frame cap
+    // stays authoritative: beyond it the honest answer is a refusal.
+    if let Some(body_len) = blob_len(&url) {
         const MAX_INLINE_BLOB: u64 = 12 * 1024 * 1024; // frame cap minus headroom
         if body_len > MAX_INLINE_BLOB {
             return FetchOutcome::Denied {
@@ -184,13 +519,291 @@ fn handle_fetch(_requester: &str, url: &str, cookies: &[(String, String)]) -> Fe
         }
         return FetchOutcome::Ok { status: 200, body };
     }
-    // A real implementation would set `Cookie: name=value; ...` on the
-    // outbound request from `cookies` and perform the HTTP fetch here; the PoC
-    // synthesizes the response so it runs offline and deterministically.
-    let body = format!(
-        "<html><!-- 200 OK for {url}; {} cookie(s) attached --></html>",
-        cookies.len()
-    )
-    .into_bytes();
-    FetchOutcome::Ok { status: 200, body }
+
+    // Cookies do not survive a redirect that left the origin.
+    let cookie_count = if follow.left_origin { 0 } else { cookies.len() };
+    FetchOutcome::Ok { status: 200, body: synthetic_body(&url, cookie_count) }
+}
+
+/// The (synthetic) content type of a served URL, inferred from the last path
+/// segment's extension. A real component reads the response's `Content-Type`
+/// (and sniffs the bytes); the PoC keys ORB off this. A path with no extension
+/// is treated as a document (HTML).
+fn mime_of(url: &str) -> MimeKind {
+    let path = path_of(url);
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let seg = path.rsplit('/').next().unwrap_or("");
+    match seg.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "ico") => MimeKind::Image,
+        Some("js" | "mjs") => MimeKind::Script,
+        Some("css") => MimeKind::Css,
+        Some("woff" | "woff2" | "ttf" | "otf") => MimeKind::Font,
+        Some("json") => MimeKind::Json,
+        Some("xml") => MimeKind::Xml,
+        Some("html" | "htm") => MimeKind::Html,
+        None => MimeKind::Html,     // no extension → a document
+        Some(_) => MimeKind::Other, // unknown extension → conservative
+    }
+}
+
+/// Whether the (synthetic) server grants CORS read access. It does so under
+/// `/cors/`; a real server sets `Access-Control-Allow-Origin` per its own
+/// policy, which the net component would parse from the response headers.
+fn cors_allowed(url: &str) -> bool {
+    path_of(url).starts_with("/cors/")
+}
+
+/// Perform a subresource fetch (possibly cross-origin), applying Opaque Response
+/// Blocking to what — if anything — reaches the renderer.
+///
+/// Same SSRF + redirect handling as [`handle_fetch`], then [`orb_decide`] on the
+/// final response. `engine_same_origin` is the engine's verdict on the entry
+/// URL; a redirect that leaves the initial authority downgrades it to
+/// cross-origin (fail safe toward blocking). Cross-origin cookies that left the
+/// origin are dropped from the attached set, as for a fetch.
+fn handle_subresource(
+    url: &str,
+    mode: FetchMode,
+    engine_same_origin: bool,
+    cookies: &[(String, String)],
+    resolver: &impl Resolver,
+) -> FetchOutcome {
+    let follow = match follow_redirects(url, resolver) {
+        Ok(f) => f,
+        Err(reason) => return FetchOutcome::Denied { reason },
+    };
+    let final_url = follow.final_url;
+
+    // A redirect that left the initial authority is cross-origin regardless of
+    // what the engine computed on the entry URL.
+    let same_origin = engine_same_origin && !follow.left_origin;
+    let mime = mime_of(&final_url);
+    let cors_ok = matches!(mode, FetchMode::Cors) && cors_allowed(&final_url);
+
+    match orb_decide(same_origin, mode, cors_ok, mime) {
+        OrbDecision::Block => {
+            FetchOutcome::Blocked { reason: format!("ORB: cross-origin {mime:?} response withheld") }
+        }
+        OrbDecision::Allow { opaque } => {
+            let cookie_count = if follow.left_origin { 0 } else { cookies.len() };
+            let body = synthetic_body(&final_url, cookie_count);
+            if opaque {
+                FetchOutcome::Opaque { status: 200, body }
+            } else {
+                FetchOutcome::Ok { status: 200, body }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ip_utils::Resolver;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// A resolver where one name points into private space and everything else
+    /// is public — so a hop to `internal.example` proves the per-hop check
+    /// re-*resolves* (not merely re-classifies an IP literal).
+    struct RedirectResolver;
+    impl Resolver for RedirectResolver {
+        fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            Ok(match host.to_ascii_lowercase().as_str() {
+                "internal.example" => vec![ip("10.0.0.5")],
+                _ => vec![ip("93.184.216.34")],
+            })
+        }
+    }
+
+    fn body_text(o: &FetchOutcome) -> String {
+        match o {
+            FetchOutcome::Ok { body, .. } => String::from_utf8_lossy(body).into_owned(),
+            other => panic!("expected an Ok body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follows_a_redirect_to_a_public_body() {
+        let out =
+            handle_fetch("r", "https://example.com/redirect/example.com", &[], &RedirectResolver);
+        assert!(matches!(out, FetchOutcome::Ok { status: 200, .. }));
+    }
+
+    /// The property #4 exists for: entry public, `Location` link-local (cloud
+    /// metadata). An entry-only check would have followed it.
+    #[test]
+    fn a_redirect_to_an_internal_literal_is_refused_at_the_hop() {
+        let out = handle_fetch(
+            "r",
+            "https://example.com/redirect/169.254.169.254",
+            &[],
+            &RedirectResolver,
+        );
+        match out {
+            FetchOutcome::Denied { reason } => {
+                assert!(reason.contains("169.254"), "reason should name the address: {reason}");
+                assert!(reason.contains("SSRF"), "reason should cite the policy: {reason}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    /// Proves the hop is re-*resolved*: the `Location` is a bare name only the
+    /// resolver knows maps to 10.0.0.5.
+    #[test]
+    fn a_redirect_to_a_name_resolving_internal_is_refused() {
+        let out = handle_fetch(
+            "r",
+            "https://example.com/redirect/internal.example",
+            &[],
+            &RedirectResolver,
+        );
+        match out {
+            FetchOutcome::Denied { reason } => {
+                assert!(reason.contains("10.0.0.5"), "reason should name the address: {reason}")
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_redirect_loop_terminates_as_too_many_redirects() {
+        let out = handle_fetch("r", "https://example.com/redirect-loop", &[], &RedirectResolver);
+        match out {
+            FetchOutcome::Denied { reason } => {
+                assert!(reason.contains("too many redirects"), "{reason}")
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_internal_entry_url_is_still_refused() {
+        let out = handle_fetch("r", "http://127.0.0.1/", &[], &RedirectResolver);
+        assert!(matches!(out, FetchOutcome::Denied { .. }));
+    }
+
+    /// A redirect that changes origin must not carry this origin's cookies; a
+    /// same-origin (root-relative) redirect keeps them.
+    #[test]
+    fn cookies_do_not_cross_an_origin_boundary_on_redirect() {
+        let cookies = vec![("sid".to_string(), "secret".to_string())];
+
+        let out = handle_fetch(
+            "r",
+            "https://example.com/redirect/other.example",
+            &cookies,
+            &RedirectResolver,
+        );
+        assert!(
+            body_text(&out).contains("0 cookie"),
+            "cookies must not follow a cross-origin redirect: {}",
+            body_text(&out)
+        );
+
+        let out =
+            handle_fetch("r", "https://example.com/relative-redirect", &cookies, &RedirectResolver);
+        assert!(
+            body_text(&out).contains("1 cookie"),
+            "a same-origin redirect keeps cookies: {}",
+            body_text(&out)
+        );
+    }
+
+    // --- Opaque Response Blocking (subresources) ---
+
+    #[test]
+    fn subresource_same_origin_data_is_readable() {
+        // Same-origin (engine's verdict): even a JSON data type is the
+        // renderer's own to read.
+        let out = handle_subresource(
+            "https://example.com/app.json",
+            FetchMode::NoCors,
+            true,
+            &[],
+            &RedirectResolver,
+        );
+        assert!(matches!(out, FetchOutcome::Ok { .. }), "got {out:?}");
+    }
+
+    #[test]
+    fn subresource_cross_origin_image_is_opaque() {
+        let out = handle_subresource(
+            "https://cdn.other.test/logo.png",
+            FetchMode::NoCors,
+            false,
+            &[],
+            &RedirectResolver,
+        );
+        assert!(matches!(out, FetchOutcome::Opaque { .. }), "got {out:?}");
+    }
+
+    #[test]
+    fn subresource_cross_origin_data_is_blocked_by_orb() {
+        // The property ORB exists for: a cross-origin JSON pulled no-cors never
+        // reaches the renderer.
+        let out = handle_subresource(
+            "https://api.other.test/secret.json",
+            FetchMode::NoCors,
+            false,
+            &[],
+            &RedirectResolver,
+        );
+        assert!(matches!(out, FetchOutcome::Blocked { .. }), "got {out:?}");
+    }
+
+    #[test]
+    fn subresource_cors_grant_makes_cross_origin_data_readable() {
+        // Cross-origin JSON in CORS mode with the server's grant (`/cors/`): read.
+        let out = handle_subresource(
+            "https://api.other.test/cors/data.json",
+            FetchMode::Cors,
+            false,
+            &[],
+            &RedirectResolver,
+        );
+        assert!(matches!(out, FetchOutcome::Ok { .. }), "got {out:?}");
+        // Same request without the grant path is still blocked.
+        let out = handle_subresource(
+            "https://api.other.test/data.json",
+            FetchMode::Cors,
+            false,
+            &[],
+            &RedirectResolver,
+        );
+        assert!(matches!(out, FetchOutcome::Blocked { .. }), "got {out:?}");
+    }
+
+    #[test]
+    fn subresource_to_internal_is_refused_by_ssrf() {
+        // ORB does not replace SSRF: an internal subresource is denied before it.
+        let out = handle_subresource(
+            "http://169.254.169.254/x.png",
+            FetchMode::NoCors,
+            false,
+            &[],
+            &RedirectResolver,
+        );
+        assert!(matches!(out, FetchOutcome::Denied { .. }), "got {out:?}");
+    }
+
+    #[test]
+    fn a_cross_origin_redirect_downgrades_same_origin_for_orb() {
+        // The engine judged this same-origin (entry on example.com), but it
+        // redirects to another authority serving JSON. A redirect leaving the
+        // origin must force ORB, which blocks the now cross-origin data — the
+        // fail-safe the net component adds on top of the engine's verdict.
+        let out = handle_subresource(
+            "https://example.com/redirect/http://api.other.test/secret.json",
+            FetchMode::NoCors,
+            true,
+            &[],
+            &RedirectResolver,
+        );
+        assert!(matches!(out, FetchOutcome::Blocked { .. }), "got {out:?}");
+    }
 }

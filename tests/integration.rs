@@ -23,14 +23,18 @@ const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// for hours on a demo that had already lost both its renderers, reporting
 /// nothing. A hang must present as a fast, loud failure.
 fn run(args: &[&str]) -> Output {
+    run_env(args, &[])
+}
+
+fn run_env(args: &[&str], env: &[(&str, &str)]) -> Output {
     use std::process::Stdio;
 
-    let mut child = Command::new(bin())
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn poc binary");
+    let mut cmd = Command::new(bin());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn poc binary");
 
     let deadline = std::time::Instant::now() + RUN_TIMEOUT;
     loop {
@@ -55,15 +59,140 @@ fn run(args: &[&str]) -> Output {
 }
 
 /// The default run (multi-process where the feature is on) must open two tabs,
-/// render a frame for each, and shut down cleanly with no crash.
+/// render a frame for each, and shut down cleanly with no crash — *including* a
+/// cross-origin renderer swap. With `GOSUB_DEMO_SWAP` the work tab navigates
+/// cross-origin after its first frame; the engine tears that renderer down and
+/// brings up a fresh one bound to the new origin (site isolation), which renders
+/// too — all with real child processes and, crucially, no `TabCrashed` leaking
+/// from the teardown. Folded into this run rather than a separate one so the
+/// integration suite does not spawn an extra full process tree in parallel.
 #[test]
 fn default_run_renders_and_shuts_down() {
-    let out = run(&[]);
+    let out = run_env(&[], &[("GOSUB_DEMO_SWAP", "1")]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "exit {:?}\nstdout: {stdout}", out.status);
     assert!(stdout.contains("frame ready"), "no frame rendered:\n{stdout}");
     assert!(stdout.contains("engine shut down"), "no clean shutdown:\n{stdout}");
     assert!(!stdout.contains("crashed"), "unexpected crash:\n{stdout}");
+
+    // The cross-origin swap: the tab commits the new origin, and a frame arrives
+    // *after* the swap line — proof the freshly-spawned renderer rendered.
+    assert!(
+        stdout.contains("swapped to a new renderer for https://other.example"),
+        "no cross-origin renderer swap:\n{stdout}"
+    );
+    let after_swap = stdout.split("swapped to a new renderer").nth(1).unwrap_or("");
+    assert!(after_swap.contains("frame ready"), "swapped renderer produced no frame:\n{stdout}");
+}
+
+/// End-to-end cookie flow — the HttpOnly and `(zone, origin)`-partition
+/// properties — asserted on the broker's **stdout**. The broker is a single
+/// process, so its stdout can be matched deterministically; the child processes
+/// share one stderr fd and their lines interleave mid-token, so combined stderr
+/// is not reliable for assertions. `GOSUB_OBSERVE_COOKIES` makes the engine print
+/// the visible set it hands a renderer (`document.cookie`) and the full set it
+/// attaches to an outbound fetch. The demo sets an HttpOnly `session` + a visible
+/// `theme` in the work zone (0), and only an HttpOnly `session` in the personal
+/// zone (1).
+///
+/// This is the regression net the vault cutover must keep green: whatever moves
+/// the cookie jar out of the broker, these properties must still hold.
+#[test]
+fn cookie_flow_hides_httponly_and_partitions_by_zone() {
+    let out = run_env(&[], &[("GOSUB_OBSERVE_COOKIES", "1")]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exit {:?}\nstdout: {stdout}", out.status);
+    assert_cookie_flow(&stdout);
+}
+
+/// The same properties must hold in **single-process** mode — cookies are
+/// *policy*, not transport, so unlike the vault's out-of-process isolation they
+/// run identically in both modes (single-process falls back to the in-broker jar,
+/// which has nothing to isolate anyway). Guards the single-process regression the
+/// vault cutover briefly introduced.
+#[test]
+fn cookie_flow_identical_in_single_process() {
+    let out = run_env(&["--single-process"], &[("GOSUB_OBSERVE_COOKIES", "1")]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "exit {:?}\nstdout: {stdout}", out.status);
+    assert_cookie_flow(&stdout);
+}
+
+/// The end-to-end HttpOnly + `(zone,origin)`-partition assertions, shared by the
+/// multi- and single-process cookie-flow tests. Matched on the broker's stdout,
+/// which — unlike the child processes' shared, interleaving stderr — is a single
+/// process and can be asserted deterministically.
+fn assert_cookie_flow(stdout: &str) {
+    // document.cookie exposes the non-HttpOnly cookie…
+    assert!(
+        stdout.contains("zone 0 document.cookie https://example.com = [theme]"),
+        "work document.cookie should expose only the non-HttpOnly `theme`:\n{stdout}"
+    );
+    // …and NEVER the HttpOnly session, in any document.cookie line. This is the
+    // load-bearing property: a session token must not enter a renderer.
+    for line in stdout.lines().filter(|l| l.contains("document.cookie")) {
+        assert!(!line.contains("session"), "HttpOnly `session` leaked into document.cookie:\n{line}");
+    }
+    // Partition: the personal zone's document.cookie is empty — it never sees the
+    // work zone's `theme`, and its own cookie is HttpOnly so also hidden.
+    assert!(
+        stdout.contains("zone 1 document.cookie https://example.com = []"),
+        "personal document.cookie should be empty (partition + HttpOnly):\n{stdout}"
+    );
+    // The HttpOnly session DOES reach the network — attached to the outbound
+    // fetch — having skipped the renderer's address space entirely.
+    assert!(
+        stdout.contains("zone 0 fetch https://example.com = [session,theme]"),
+        "work fetch should attach both cookies incl. the HttpOnly session:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("zone 1 fetch https://example.com = [session]"),
+        "personal fetch should attach its own session:\n{stdout}"
+    );
+}
+
+/// Every rendered page decodes an image in a throwaway process; the renderer
+/// byte-compares the result and reports on stderr. Seeing this proves the whole
+/// broker → fork → decode → return path works across the process boundary.
+#[test]
+fn images_decode_in_an_isolated_process() {
+    let out = run(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {:?}\nstderr: {stderr}", out.status);
+    assert!(stderr.contains("image decoded 16x16 (pattern ok)"), "no verified decode:\n{stderr}");
+    assert!(!stderr.contains("MISMATCH"), "decoded pixels corrupted in transit:\n{stderr}");
+}
+
+/// Storage and font are filesystem-capable services renderers can't be: the
+/// renderer round-trips a value through storage and reads font metrics, both
+/// brokered to services that hold `openat` where the renderer denies it. Seeing
+/// these proves the services come up under their (wider) filter and actually
+/// touch the filesystem.
+#[test]
+fn filesystem_services_serve_renderers() {
+    let out = run(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "exit {:?}\nstderr: {stderr}", out.status);
+    assert!(stderr.contains("storage round-trip (ok)"), "storage did not round-trip:\n{stderr}");
+    assert!(stderr.contains("font 'sans' metrics"), "font service gave no metrics:\n{stderr}");
+    assert!(!stderr.contains("MISMATCH"), "storage value corrupted:\n{stderr}");
+}
+
+/// The fault-isolation guarantee: a malformed image is rejected by the decoder,
+/// the engine relays the failure, and *nothing else is disturbed* — the tab
+/// still renders its frame and the engine still shuts down cleanly. A hostile
+/// image is exactly this shape with a parser bug behind it; isolating the
+/// parser is what turns "RCE in the browser" into "one decode failed".
+#[test]
+fn a_bad_image_fails_without_taking_anything_down() {
+    let out = run_env(&[], &[("GOSUB_DECODE_BADIMAGE", "1")]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "a bad image should not fail the run:\n{stdout}{stderr}");
+    assert!(stderr.contains("image decode failed"), "expected a reported decode failure:\n{stderr}");
+    assert!(stdout.contains("frame ready"), "the tab should still render:\n{stdout}");
+    assert!(stdout.contains("engine shut down"), "the engine should still shut down:\n{stdout}");
+    assert!(!stdout.contains("crashed"), "nothing should crash:\n{stdout}");
 }
 
 /// The same lifecycle must work with components as threads. No fd-passing on
@@ -311,6 +440,26 @@ mod seatbelt_enforcement {
         check("seatbelt-sysctl");
     }
 
+    /// The backend docs claim the profile grants no `mach-lookup` — reach into
+    /// the Mach bootstrap namespace (WindowServer, launchd services), the classic
+    /// macOS sandbox-escape surface. The probe confirms a service that resolves
+    /// before lockdown is refused after; if none of its candidate services resolve
+    /// in the bootstrap namespace it reports `CONTROL_FAILED` (the control is
+    /// broken, not the sandbox), exactly like the other seatbelt probes.
+    #[test]
+    fn renderer_cannot_look_up_mach_services() {
+        check("seatbelt-mach-lookup");
+    }
+
+    /// A filesystem service is path-scoped to its own directory — read/write
+    /// inside, denied outside — the SBPL counterpart of the Linux services'
+    /// Landlock ruleset, so a compromised storage/font service cannot roam the
+    /// disk despite being a filesystem-service profile.
+    #[test]
+    fn service_filesystem_is_path_scoped() {
+        check("seatbelt-service-scope");
+    }
+
     /// The rlimits are a mechanism wholly separate from Seatbelt, and were
     /// entirely unverified on macOS.
     #[test]
@@ -477,11 +626,22 @@ mod probe_inventory {
         "fcntl-dupfd",
         "ring",
         "netns",
+        "pidns",
         "no-ptrace",
         "forkserver-can-fork",
         "forkserver-canary-gap",
         "forkserver-no-exec",
         "forkserver-no-socket",
+        "forkserver-no-newuser-clone",
+        "service-fs-openat",
+        "service-fs-no-socket",
+        "service-device-ioctl",
+        "service-landlock",
+        "broker-landlock",
+        "broker-seccomp",
+        "broker-seccomp-mount",
+        "cgroup-memory-limit",
+        "crash-report",
     ];
 
     /// The Seatbelt profile's enforcement. `PT_DENY_ATTACH` and the rlimits
@@ -497,6 +657,8 @@ mod probe_inventory {
         "seatbelt-fork",
         "seatbelt-signal-other",
         "seatbelt-sysctl",
+        "seatbelt-mach-lookup",
+        "seatbelt-service-scope",
         "rlimits",
         "ptrace-deny-accepted",
     ];
@@ -549,6 +711,8 @@ mod sandbox_enforcement {
 
     /// `SIGSYS` — the signal seccomp `KillProcess` terminates with.
     const SIGSYS: i32 = 31;
+    /// `SIGSEGV` — a segmentation fault (the crash-report probe's wild read).
+    const SIGSEGV: i32 = 11;
 
     fn probe(name: &str) -> std::process::ExitStatus {
         Command::new(bin()).args(["selftest", name]).status().expect("spawn selftest")
@@ -595,6 +759,18 @@ mod sandbox_enforcement {
         assert!(st.success(), "expected an empty netns, got {st:?}");
     }
 
+    /// The fork server also puts every renderer it forks in a PID namespace, so a
+    /// renderer can't see or signal the broker/host by pid (defense in depth for
+    /// what `kill`/`ptrace`'s absence already gives). The probe proves a forked
+    /// child becomes PID 1 of a fresh namespace; it skips cleanly (exit 0) where
+    /// the kernel refuses `CLONE_NEWPID`, so this passes everywhere and verifies
+    /// where PID namespaces are available.
+    #[test]
+    fn renderer_gets_a_pid_namespace() {
+        let st = probe("pidns");
+        assert!(st.success(), "expected a fresh PID namespace (or a clean skip), got {st:?}");
+    }
+
     /// The fork server's filter is inherited by every renderer it forks, so a
     /// gap in it kills *renderers*, not the fork server — and surfaces as
     /// `TabCrashed`, looking nothing like a sandbox problem. This is the
@@ -627,6 +803,120 @@ mod sandbox_enforcement {
     fn fork_server_cannot_open_a_socket() {
         let st = probe("forkserver-no-socket");
         assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (no network), got {st:?}");
+    }
+
+    /// The `clone3`→`ENOSYS` + argument-filtered `clone` hardening actually
+    /// bites: a plain fork works (see `can-fork`), but a `clone` into a new user
+    /// namespace is trapped by the flag mask. If this exited cleanly the mask
+    /// would be a silent no-op.
+    #[test]
+    fn fork_server_cannot_clone_into_a_new_namespace() {
+        let st = probe("forkserver-no-newuser-clone");
+        assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (clone flag filter), got {st:?}");
+    }
+
+    /// A filesystem service's filter is the baseline *plus* `openat` — the one
+    /// capability a font/storage service exists to have and a renderer denies.
+    #[test]
+    fn filesystem_service_may_open_files() {
+        let st = probe("service-fs-openat");
+        assert!(st.success(), "the fs filter should permit openat, got {st:?}");
+    }
+
+    /// ...but only that. The wider filter is still a superset of the baseline,
+    /// so network is denied exactly as for a renderer — a storage service
+    /// cannot phone home.
+    #[test]
+    fn filesystem_service_still_has_no_network() {
+        let st = probe("service-fs-no-socket");
+        assert_eq!(st.signal(), Some(SIGSYS), "fs service should have no socket, got {st:?}");
+    }
+
+    /// A device service's filter permits `ioctl` — how a real audio/GPU service
+    /// drives its device. (The stubs do no real work, but the filter is real.)
+    #[test]
+    fn device_service_may_ioctl() {
+        let st = probe("service-device-ioctl");
+        assert!(st.success(), "the device filter should permit ioctl, got {st:?}");
+    }
+
+    /// Landlock does what seccomp cannot: confine `openat` to specific paths. A
+    /// service scoped to a directory may open files inside it but is denied
+    /// (EACCES) outside — even though seccomp still permits the `openat` syscall.
+    /// Skips cleanly where the kernel lacks Landlock, so it never fails an
+    /// untestable host (the probe exits 0 in that case).
+    #[test]
+    fn landlock_scopes_a_service_to_its_directory() {
+        let st = probe("service-landlock");
+        assert!(st.success(), "landlock should confine openat to the ruleset, got {st:?}");
+    }
+
+    /// The broker's loose Landlock: read/exec anywhere, write only beneath temp.
+    /// The probe proves a write inside temp works while one outside is denied
+    /// (with a control showing the outside write worked before lockdown), so the
+    /// write-confinement is not a silent no-op. Skips (exit 0) without Landlock.
+    #[test]
+    fn broker_filesystem_writes_are_confined_to_temp() {
+        let st = probe("broker-landlock");
+        assert!(st.success(), "broker landlock should confine writes to temp, got {st:?}");
+    }
+
+    /// The broker's deny-list seccomp filter is not a no-op: it keeps the broad
+    /// surface the engine needs but `Trap`s the escalation syscalls. `ptrace` is
+    /// one, so a broker that tries it is killed by `SIGSYS` exactly as a renderer
+    /// reaching for a socket is — proving the trusted process lost its reach for a
+    /// kernel exploit while (per the demo) still doing its job.
+    #[test]
+    fn broker_denies_escalation_syscalls() {
+        let st = probe("broker-seccomp");
+        assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (ptrace denied), got {st:?}");
+        assert!(st.code().is_none(), "should be killed, not exit");
+    }
+
+    /// The deny-list must cover the *fd-based* mount API (Linux 5.1+), not just
+    /// the classic `mount`/`pivot_root`: otherwise a compromised broker reaches
+    /// the same mount escape via `fsopen`+`fsmount`+`move_mount`. The probe calls
+    /// `fsopen` under the broker filter and must die by `SIGSYS`.
+    #[test]
+    fn broker_denies_the_fd_based_mount_api() {
+        let st = probe("broker-seccomp-mount");
+        assert_eq!(st.signal(), Some(SIGSYS), "expected SIGSYS (fsopen denied), got {st:?}");
+        assert!(st.code().is_none(), "should be killed, not exit");
+    }
+
+    /// Crash reporting without a core dump or `ptrace`: a crashing content
+    /// process self-captures a scrubbed report from its own signal handler, then
+    /// still dies with the original signal (so the engine's crash detection is
+    /// unaffected). The report carries a faulting *address*, never memory
+    /// contents — leak-free even for the secret-holding broker. Checks both: the
+    /// `[crash]` record on stderr, and death by `SIGSEGV`.
+    #[test]
+    fn a_crashing_process_self_reports_then_dies() {
+        let out = Command::new(bin())
+            .args(["selftest", "crash-report"])
+            .output()
+            .expect("spawn selftest");
+        assert_eq!(
+            out.status.signal(),
+            Some(SIGSEGV),
+            "expected death by SIGSEGV, got {:?}",
+            out.status
+        );
+        assert!(out.status.code().is_none(), "should be killed by the signal, not exit");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("[crash] SIGSEGV"), "expected a self-captured crash record, got: {err}");
+    }
+
+    /// The cgroup v2 memory bound — the physical-RSS limit rlimits can't give,
+    /// with a scoped OOM kill. The probe places itself in a `memory.max`-limited
+    /// child cgroup and reads the ceiling back. Best-effort: where cgroup v2
+    /// memory delegation isn't available (a shared scope, no `Delegate=yes`) it
+    /// skips cleanly (exit 0), so this passes everywhere and *verifies* under a
+    /// delegated scope. Either way a non-zero exit means the limit misbound.
+    #[test]
+    fn cgroup_memory_limit_binds_or_skips() {
+        let st = probe("cgroup-memory-limit");
+        assert!(st.success(), "cgroup memory.max should bind (or skip cleanly), got {st:?}");
     }
 
     #[test]

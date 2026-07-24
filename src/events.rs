@@ -64,6 +64,10 @@ impl TilePixels {
         self.as_slice().len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
     /// Human-readable transport label, used by the demo/bench output (and
     /// asserted by the integration tests).
     pub fn transport(&self) -> &'static str {
@@ -114,6 +118,11 @@ pub enum EngineEvent {
     TabOpened { tab_id: TabId, zone: ZoneId, origin: String },
     /// `OpenTab` could not be honored (e.g. unparseable URL).
     OpenTabFailed { url: String, reason: String },
+    /// A tab navigated **cross-origin**: its renderer was torn down and a fresh
+    /// one bound to `origin` swapped in (site isolation — an origin's documents
+    /// never share a process with another's). The old renderer is gone; a
+    /// `FrameReady` for the new origin follows.
+    TabNavigated { tab_id: TabId, origin: String },
     /// A renderer delivered a frame for its tab.
     FrameReady { tab_id: TabId, tile: Tile },
     /// A navigation was refused (e.g. cross-origin for this tab's renderer).

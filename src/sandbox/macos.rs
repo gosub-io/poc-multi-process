@@ -26,10 +26,26 @@
 //!   syscall arguments, so the fine-grained "writable-xor-executable" rule the
 //!   seccomp filter carries has no direct analogue here. `(deny default)` still
 //!   denies the file/network/exec escalation surface.
-//! * **Seatbelt is deprecated API.** `sandbox_init` has been marked deprecated
-//!   since 10.7 yet remains the mechanism every shipping browser uses; a
-//!   production build would move to the modern App Sandbox entitlement model.
-//!   We suppress the deprecation warning at the call site.
+//! * **Filesystem services are path-scoped** — the SBPL counterpart of the Linux
+//!   services' Landlock ruleset. A storage/font service is granted `file-read*`
+//!   (and, where writable, `file-write*`) on *only* its own declared path via
+//!   `(subpath …)`/`(literal …)`, not the blanket `file-read* file-write*` a
+//!   compromised service could turn on the whole disk. See [`lock_down_service`].
+//!
+//! ### Why SBPL, not the "modern" App Sandbox
+//!
+//! `sandbox_init` is marked deprecated since 10.7, and the obvious "modernize"
+//! is the App Sandbox entitlement model. For a *multi-process browser* that is
+//! the **wrong** move, not a pending one: App Sandbox capabilities are declared
+//! as **entitlements in the code signature**, so every process launched from the
+//! same signed binary gets the *same* entitlements. The PoC re-execs one binary
+//! into every role, so App Sandbox could not give the net component the network
+//! while denying it to renderers — the per-role split would collapse. SBPL is
+//! **self-applied at runtime**, so each process installs a *different* profile
+//! for its role; that is precisely why Chromium and Firefox sandbox their
+//! renderer/GPU/network helpers with `sandbox_init`/SBPL rather than App Sandbox.
+//! The deprecation is API hygiene (silenced at the call site), not a signal to
+//! switch mechanisms.
 //!
 //! Startup is **fail-closed** exactly as on Linux: if `sandbox_init` refuses
 //! the profile the component aborts rather than run unconfined.
@@ -59,6 +75,18 @@ extern "C" {
 // the smaller the surface. If a future renderer (a real rasterizer, fonts,
 // GPU) needs more, add the *narrowest* grant that unblocks it — a specific
 // `(allow mach-lookup (global-name "..."))`, not the blanket form.
+//
+// **Mach bootstrap.** `(deny default)` also withholds `mach-lookup`, so a
+// renderer cannot reach into the bootstrap namespace (WindowServer, launchd
+// services, privileged daemons) — the classic macOS sandbox-escape surface, and
+// a *tighter* stance than Chromium's allow-specific-global-names approach because
+// this stub renderer needs none. The `seatbelt-mach-lookup` probe verifies it (a
+// service that resolves before lockdown is refused after). The one unconfined
+// window is between `exec` and `lock_down_renderer`, where the inherited
+// bootstrap port is still live — but only the PoC's own IPC-handshake code runs
+// there, never web content; a production build that wanted to close even that
+// would replace the bootstrap port with a restricted namespace before handing off
+// (Chromium's bootstrap sandbox).
 
 /// A renderer may only push pixels: no network, no files, no new programs, and
 /// no Mach/sysctl reach beyond itself.
@@ -94,6 +122,82 @@ pub fn lock_down_renderer() {
 pub fn lock_down_net() {
     deny_debugger_attach();
     enforce("net", NET_PROFILE);
+}
+
+/// Cap an engine-spawned service. Seatbelt gates *operations* rather than
+/// syscalls, so the Linux `filesystem`/`device` distinction maps onto profile
+/// clauses.
+///
+/// A **filesystem** service (storage, font) that declares `fs_allow` paths is
+/// path-scoped, the SBPL counterpart of the Linux services' Landlock ruleset:
+/// `file-read*` (and, where writable, `file-write*`) on *only* those paths, via
+/// `(subpath …)` for a directory or `(literal …)` for a file — so a compromised
+/// storage service cannot read `/etc` or write outside its own directory. The
+/// paths are canonicalized first, because SBPL matches the *resolved* path (on
+/// macOS `/tmp` is a symlink to `/private/tmp`).
+///
+/// A **device** service (audio, GPU) instead gets the broad `file-read*
+/// file-write*` plus `iokit-open` (the `ioctl`/device-node analogue): a driver
+/// node is not a simple path to scope, exactly as the Linux device filter is
+/// coarser than the filesystem one. Everything else stays `(deny default)`.
+#[cfg(feature = "multi-process")]
+pub fn lock_down_service(name: &str, filesystem: bool, device: bool, fs_allow: &[(&std::path::Path, bool)]) {
+    deny_debugger_attach();
+    let mut profile = String::from("(version 1)\n(deny default)\n");
+    profile.push_str("(allow signal (target self))\n");
+    profile.push_str("(allow process-info* (target self))\n");
+
+    if !fs_allow.is_empty() {
+        // Path resolution first: opening a file deep in the tree requires
+        // metadata (lookup/stat) access to its *ancestor* directories, which a
+        // `(subpath …)` grant does not cover — it grants the subtree, not the
+        // path *to* it. Without this a scoped service's own open fails `EPERM`
+        // during namei. `file-read-metadata` reveals only names/attributes,
+        // never contents — the actual read/write below stays scoped — so this is
+        // the standard Seatbelt pattern, not a widening of what can be *read*.
+        profile.push_str("(allow file-read-metadata)\n");
+        // Path-scoped data access: read (and optionally write) only the declared
+        // paths. macOS `/var` and `/tmp` are symlinks (to `/private/…`), and it
+        // is not obvious which spelling Seatbelt matches against — so grant
+        // *both* the path as given and its canonical (symlink-resolved) form.
+        for (path, writable) in fs_allow {
+            let mut variants: Vec<std::path::PathBuf> = vec![path.to_path_buf()];
+            if let Ok(canon) = std::fs::canonicalize(path) {
+                if canon != **path {
+                    variants.push(canon);
+                }
+            }
+            for v in &variants {
+                let matcher = if v.is_dir() { "subpath" } else { "literal" };
+                let p = sbpl_escape(&v.to_string_lossy());
+                profile.push_str(&format!("(allow file-read* ({matcher} \"{p}\"))\n"));
+                if *writable {
+                    profile.push_str(&format!("(allow file-write* ({matcher} \"{p}\"))\n"));
+                }
+            }
+        }
+    } else if filesystem || device {
+        // No path list to scope by (a device service opening a driver node):
+        // the broad grant, deliberately coarser like the Linux device filter.
+        profile.push_str("(allow file-read* file-write*)\n");
+    }
+    if device {
+        profile.push_str("(allow iokit-open)\n");
+    }
+    // Diagnostic: dump the exact profile when GOSUB_DEBUG_SBPL is set.
+    if std::env::var_os("GOSUB_DEBUG_SBPL").is_some() {
+        eprintln!("[{name}] SBPL profile:\n{}", profile);
+    }
+    profile.push('\0');
+    enforce(name, &profile);
+}
+
+/// Escape a path for embedding in an SBPL double-quoted string. macOS paths do
+/// not normally contain `"` or `\`, but a stray one would otherwise break the
+/// profile (or worse, widen it), so quote them.
+#[cfg(feature = "multi-process")]
+fn sbpl_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Apply an SBPL profile to this process, or die trying. Fail-closed, matching
@@ -133,9 +237,9 @@ fn enforce(role: &str, profile: &str) {
 /// safe: only `setrlimit`/`setpriority` syscalls.
 #[cfg(feature = "multi-process")]
 pub fn apply_child_rlimits() -> std::io::Result<()> {
-    // No RLIMIT_AS on macOS (see above): a compromised child's memory growth is
-    // bounded by the machine, not by us. A production build would reach for a
-    // Jetsam/memory-pressure limit or a per-process memory footprint API.
+    // No RLIMIT_AS on macOS (see above), and no other per-process memory cap a
+    // third-party app can self-impose either — a genuine platform gap, documented
+    // in full below (a content process is bounded by the OS's Jetsam instead).
     // A child needs only a handful of fds (its IPC socket + std streams).
     set_rlimit(libc::RLIMIT_NOFILE, 128)?;
     // No core dumps — a crash must not spill page contents (cookies, tokens).
@@ -146,6 +250,29 @@ pub fn apply_child_rlimits() -> std::io::Result<()> {
     set_priority(10)?;
     Ok(())
 }
+
+// ── No per-process memory cap on macOS (a platform gap, not a shortcut) ──
+//
+// The Linux backend bounds a child's *resident* memory with a cgroup `memory.max`
+// and Windows with a job-object memory cap. macOS has no equivalent a *third-party*
+// app can self-impose:
+//
+//   * `RLIMIT_AS` — rejected outright (`EINVAL`); see `apply_child_rlimits`.
+//   * `RLIMIT_DATA` — accepted but ineffective: macOS allocators use `mmap`, which
+//     it does not account.
+//   * `task_set_phys_footprint_limit` / `memorystatus_control` — the kernel's real
+//     memory-ledger limits (what Jetsam enforces), but gated behind root or the
+//     `com.apple.private.memorystatus` **Apple-private** entitlement. Verified on
+//     an M1: `task_set_phys_footprint_limit(mach_task_self, …)` returns
+//     `KERN_NO_ACCESS` unprivileged, and a browser cannot obtain a `com.apple.private.*`
+//     entitlement, so this is not a path that exists for gosub.
+//   * memory-pressure dispatch sources — a *notification* to shed caches, not a cap.
+//
+// So on macOS a content process's memory is bounded by the **OS's Jetsam** (the
+// system reclaims/kills under memory pressure, by process priority) rather than a
+// self-imposed hard cap, with in-process V8 heap limits as the eventual
+// cooperative layer. This mirrors Chromium, which likewise does not OS-hard-cap
+// renderer memory on macOS. Nothing to install here.
 
 /// No network namespaces on macOS: a renderer's network is denied inside its
 /// Seatbelt profile instead (see [`lock_down_renderer`]), applied once the
